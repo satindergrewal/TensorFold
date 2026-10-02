@@ -121,8 +121,8 @@ def shared_suh(suh_g: torch.Tensor, suh_u: torch.Tensor) -> torch.Tensor | None:
 def words(trellis: torch.Tensor) -> torch.Tensor:
     """A trellis (int16 [..., 64], 4 bits) as the kernels read it: int32 [..., 32], the same bytes."""
 
-    if trellis.dtype != torch.int16 or trellis.shape[-1] != 64:
-        raise ValueError("only 4-bit EXL3 trellises (int16 [..., 64]) are supported")
+    if trellis.dtype != torch.int16 or trellis.shape[-1] not in (48, 64):
+        raise ValueError("only 3-bit or 4-bit EXL3 trellises (int16 [..., 48] / [..., 64]) are supported")
     return trellis.contiguous().view(torch.int32)
 
 
