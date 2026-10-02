@@ -366,19 +366,33 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
             slot.copy_(x)
         return out
 
-    def moe_exl3(p: str) -> Exl3Experts:
-        parts = {}
-        for proj in ("gate_proj", "up_proj", "down_proj"):
-            ts, us, vs = [], [], []
+    def moe_exl3(p: str):
+        from tensorfold.cuda.exl3 import experts as x3
+        base = PREFIX + p
+        widths, per = set(), []
+        for e in range(cfg.experts):
+            t = {proj: rd.get(base + f"experts.{e}.{proj}.trellis") for proj in ("gate_proj", "up_proj", "down_proj")}
+            widths.update(t[proj].shape[-1] for proj in t)
+            per.append(t)
+        if len(widths) == 1:                     # uniform rate: the stacked path
+            parts = {}
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                ts = [exl3_words(per[e][proj]) for e in range(cfg.experts)]
+                us = [rd.get(base + f"experts.{e}.{proj}.suh") for e in range(cfg.experts)]
+                vs = [rd.get(base + f"experts.{e}.{proj}.svh") for e in range(cfg.experts)]
+                parts[proj] = (torch.stack(ts).to(dev), torch.stack(us).to(dev), torch.stack(vs).to(dev))
+            (gt, sg, vg), (ut, su, vu), (dt, sd, vd) = parts["gate_proj"], parts["up_proj"], parts["down_proj"]
+            return Exl3Experts(gt, ut, dt, sg, su, vg, vu, sd, vd, cfg.experts, int(vg.shape[1]), int(vd.shape[1]))
+        # mixed rates (MiaAi-Lab k3/k4 per-tensor): per-expert widths through the x3 ABI
+        def triples(proj):
+            out = []
             for e in range(cfg.experts):
-                name = PREFIX + p + f"experts.{e}.{proj}."
-                ts.append(exl3_words(rd.get(name + "trellis")))
-                us.append(rd.get(name + "suh"))
-                vs.append(rd.get(name + "svh"))
-            parts[proj] = (torch.stack(ts).to(dev), torch.stack(us).to(dev), torch.stack(vs).to(dev))
-            del ts, us, vs
-        (gt, sg, vg), (ut, su, vu), (dt, sd, vd) = parts["gate_proj"], parts["up_proj"], parts["down_proj"]
-        return Exl3Experts(gt, ut, dt, sg, su, vg, vu, sd, vd, cfg.experts, int(vg.shape[1]), int(vd.shape[1]))
+                t = per[e][proj]
+                out.append((t.to(dev), rd.get(base + f"experts.{e}.{proj}.suh").to(dev),
+                            rd.get(base + f"experts.{e}.{proj}.svh").to(dev)))
+            return out
+        print(f"[tensorfold] moe {p}: mixed trellis widths {sorted(widths)} - per-expert-width path", flush=True)
+        return x3.prepare(triples("gate_proj"), triples("up_proj"), triples("down_proj"), "mcg", device=dev)
 
     def moe(i: int) -> MoEW:
         p = f"layers.{i}.mlp."
