@@ -84,18 +84,57 @@ class Engine:
 
     def __init__(self, w: Weights, *, capacity: int = 2560, max_rows: int = 8, prefill_rows: int = PREFILL_ROWS,
                  graphs: bool = False, graph_rows: tuple[int, ...] = (1, 2, 3, 4), long_context: bool = False,
-                 taps: tuple[int, ...] = ()) -> None:
+                 taps: tuple[int, ...] = (), grid: int = 0, split=None, mtp_rows: int | None = None,
+                 streams: int = 1, pool_rows: int | None = None, kv: str | None = None) -> None:
+        """``kv``: the DSA caches' format (``kv8``; default TF_GLM_KV, bf16 unless set: fp8 halves the latent cache and
+        the indexer's pooled keys); ``grid``: prompt chunks start on multiples of it (TF_GLM_PROMPT_GRID; 0:
+        anywhere); ``split``: a ``hcsplit.SplitSettings`` (TF_GLM_HC_SPLIT, TF_GLM_PREFILL_OVERLAP) for prompt
+        chunks, None or off: unsplit; ``mtp_rows``: rows of an MTP step (its absorb chunks; default ``max_rows``):
+        draft chains take one row a step, so the MTP buffers need not be as wide as the verify windows; ``streams``:
+        stream slots (``forward.Slots``) and ``pool_rows``: tokens of the shared cache pool (``forward.Caches``,
+        default ``capacity``) for concurrent streams (``multi``). ``st`` is the state the single-stream paths run on: ``home`` (slot 0, the pool's first
+        ``capacity`` tokens), the one the CUDA graphs were captured on, unless ``use`` points it at another."""
+
+        if grid and prefill_rows % grid:
+            raise ValueError(f"prompt chunks of {prefill_rows} rows do not tile a {grid}-row grid")
         self.w = w
+        self.grid = grid
         w.meta["long_context"] = long_context
+        from . import l2pf
+
+        pf = l2pf.Settings.from_env()                        # TF_GLM_L2PF: installed before any graph capture
+        if pf.on and torch.cuda.is_available() and w.meta.get("l2pf") is None:
+            w.meta["l2pf"] = l2pf.Prefetch(w, pf)
+            if w.rank == 0:
+                print(f"[tensorfold] {w.meta['l2pf'].summary()}", flush=True)
         self.rows, self.prefill_rows = max_rows, prefill_rows
+        if any(l.kind == "kda" for l in w.layers):           # the wide KDA chain's scratch, before any capture
+            from . import kda as kda_mod
+
+            kda_mod.reserve(max(max_rows, prefill_rows), w.cfg.lin_heads // w.world, w.device)
         self.buf = Buffers(w, max_rows, capacity)
         self.pbuf = Buffers(w, prefill_rows, capacity, prefill=True)
         if taps:
             self.buf.set_taps(tuple(taps), w.cfg.hidden)         # before any graph capture
             self.pbuf.set_taps(tuple(taps), w.cfg.hidden)
-        self.mbuf = Buffers(w, max_rows, capacity) if w.mtp is not None else None
-        self.st = State(w, capacity, max_rows)
+        if split is not None and split.split:
+            from .hcsplit import HcSplit
+
+            self.pbuf.split = HcSplit(w, self.pbuf, split)
+        self.mbuf = Buffers(w, min(mtp_rows or max_rows, max_rows), capacity) if w.mtp is not None else None
+        from .forward import Caches, Slots, index_ring
+
+        # the indexer's key and gate rings, one a slot, hold the widest window (a prompt chunk, an MTP absorb chunk, a
+        # verify window, a stream's rows of a batched window) and the 3 rows before it
+        from . import kv8
+
+        self.caches = Caches(w, pool_rows or capacity, streams=streams,
+                             ring=index_ring(pool_rows or capacity, max(max_rows, prefill_rows)),
+                             kv=kv8.kv_kind() if kv is None else kv)
+        self.slots = Slots(w, streams, max_rows)
+        self.home = self.st = State(w, capacity, max_rows, caches=self.caches, slots=self.slots)
         self.last_hidden: torch.Tensor | None = None
+        self.head: torch.Tensor | None = None       # the last prompt's end logits row (``prefill``'s keep_head)
         self.constraint = self.window = None            # a request's grammar, and the next sample's rows under it
         self.draft_n = w.head.n
         self.graphs = None
@@ -103,23 +142,42 @@ class Engine:
         if graphs:
             from .graphs import Graphs
 
-            self.graphs = Graphs(self, graph_rows, graph_rows)
+            mtp_graphs = tuple(r for r in graph_rows if self.mbuf is None or r <= self.mbuf.rows)
+            self.graphs = Graphs(self, tuple(r for r in graph_rows if r <= max_rows), mtp_graphs)
             self.reset()
 
     def reset(self) -> None:
         self.st.reset()
 
+    def use(self, st: State) -> State:
+        """Run the single-stream paths (prefill, forward, commit, snapshots) on ``st``; returns the previous state."""
+
+        prev, self.st = self.st, st
+        return prev
+
+    def graphed(self, st: State | None = None) -> bool:
+        """Whether the captured graphs run ``st`` (default the current state): the same slot and extent base as the
+        state they were captured on (and the pool's views, not a clone's)."""
+
+        st = self.st if st is None else st
+        return (self.graphs is not None and st.caches is self.caches and st.slots is self.slots
+                and st.graph_key == self.home.graph_key)
+
     def forward(self, tokens: Sequence[int]) -> torch.Tensor:
-        """A step's forward (a CUDA graph when one was captured for its shape): logits [R, V/world]."""
+        """A step's forward (a CUDA graph when one was captured for its shape and state): logits [R, V/world]."""
 
         R = stage(self.w, self.st, self.buf, tokens)
         dense = self.st.pos + R <= self.w.cfg.dense_limit
         g, kind = None, "main"
-        if self.graphs is not None and dense:
+        if not self.graphed():
+            pass
+        elif self.graphs is not None and dense:
             g = self.graphs.main.get((R, self.st.parity))
         elif self.graphs is not None and self.st.pos >= self.w.cfg.dense_limit and self.st.index is not None:
             # every row past the dense limit: the sparse graph for this pool bucket (same kernels as eager)
-            bucket = pool_bucket(self.st.pos, R, self.st.index[0][2].shape[0] - 2)
+            # the pool buckets the graphs were captured for: the home view's (a stream at home with a smaller
+            # extent scores pools past its own too, all past its visible ones: -inf, the same selection)
+            bucket = pool_bucket(self.st.pos, R, self.home.index[0][2].shape[0] - 2)
             g, kind = self.graphs.sparse.get((R, self.st.parity, bucket)), "sparse"
         if g is not None:
             self.replays[kind] += 1
@@ -134,11 +192,13 @@ class Engine:
         n = mtp_stage(self.w, self.st, self.mbuf, next_tokens, hidden)
         dense = self.st.mtp_len + n <= self.w.cfg.dense_limit
         g, kind = None, "mtp"
-        if self.graphs is not None and not self.mbuf.zero_first and dense:
+        if not self.graphed():
+            pass
+        elif self.graphs is not None and not self.mbuf.zero_first and dense:
             g = self.graphs.mtp.get(n)
         elif (self.graphs is not None and not self.mbuf.zero_first and self.st.index is not None
               and self.st.mtp_len >= self.w.cfg.dense_limit):
-            bucket = pool_bucket(self.st.mtp_len, n, self.st.index[-1][2].shape[0] - 2)
+            bucket = pool_bucket(self.st.mtp_len, n, self.home.index[-1][2].shape[0] - 2)
             g, kind = self.graphs.sparse_mtp.get((n, bucket)), "sparse_mtp"
         if g is not None:
             self.replays[kind] += 1
@@ -242,16 +302,59 @@ class Snapshot:
     rows: list | None = None      # the attention rows of ids, saved when another conversation took the live caches
     nbytes: int = 0
     drafter_rows: list | None = None  # a ring drafter's window rows before drafter_end, copied when taken
+    tail: list | None = None      # the indexer rings' rows of the pools still filling at ids' end (``_ring_tail``)
+    # the head's logits row at ids' end (this rank's vocabulary slice, before any grammar mask), kept with a prompt's
+    # own end state: a request of exactly these ids resumes here and samples its first token from it, prefilling
+    # nothing (``prefill``); None for states short of a prompt's end (which no head ran for)
+    head: torch.Tensor | None = None
+
+
+def _ring_tail(st, n: int, m: int) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """(slots, rows) of the indexer's key and gate rings a snapshot of n tokens (m in the MTP head) needs besides the
+    pools: the tokens of each layer's pool still filling (n % 4 of them, the last ones), which later tokens' windows
+    overwrite in the ring (``forward.index_ring``). slots: ring rows (positions mod the ring); rows: [2, k, 128]
+    (keys, gates), cloned."""
+    index, kc = getattr(st, "index", None) or [], getattr(st, "kc", [])
+    out = []
+
+    def take(trio, end):
+        ik, ig, _ = trio
+        slots = torch.arange(end - end % 4, end, device=ik.device) % ik.shape[0]
+        out.append((slots, torch.stack((ik[slots], ig[slots]))))
+
+    for trio in index[:len(kc)]:
+        if n % 4:
+            take(trio, n)
+    if m > 0 and m % 4 and len(index) > len(kc):
+        take(index[-1], m)
+    return out
+
+
+def put_ring_tail(st, snap: Snapshot) -> None:
+    """A kept snapshot's ring tail (``_ring_tail``) into ``st``'s rings (restore, and a multi-stream stream taking
+    over a kept prompt in any slot)."""
+    index, kc = getattr(st, "index", None) or [], getattr(st, "kc", [])
+    idx = list(index[:len(kc)]) if len(snap.ids) % 4 else []
+    if snap.mtp_len > 0 and snap.mtp_len % 4 and len(index) > len(kc):
+        idx.append(index[-1])
+    tail = snap.tail or []
+    if len(tail) != len(idx):
+        raise ValueError("a snapshot's indexer ring rows do not match the caches they go back to")
+    for (ik, ig, _), (slots, rows) in zip(idx, tail):
+        ik.index_copy_(0, slots % ik.shape[0], rows[0])
+        ig.index_copy_(0, slots % ig.shape[0], rows[1])
 
 
 def take_snapshot(e: Engine, ids: Sequence[int], pending: torch.Tensor | None, *, mtp: bool,
                   drafter=None) -> Snapshot:
-    """A ring drafter's window rows are copied now (``_ring_window``): its next rows overwrite them in the ring."""
+    """A ring drafter's window rows are copied now (``_ring_window``): its next rows overwrite them in the ring; so
+    are the indexer rings' rows of the pools still filling (``_ring_tail``)."""
     st = e.st
     rec = st.rec[st.cur[0]].clone() if st.cur else st.rec[0].clone()
+    mtp_len = st.mtp_len - st.mtp_drafted if mtp and pending is not None else -1
     snap = Snapshot(list(ids), rec, st.conv.clone(), pending.clone() if pending is not None else None,
-                    st.mtp_len - st.mtp_drafted if mtp and pending is not None else -1,
-                    drafter.context_end if drafter is not None else -1)
+                    mtp_len, drafter.context_end if drafter is not None else -1,
+                    tail=_ring_tail(st, len(ids), max(mtp_len, 0)))
     if drafter is not None and getattr(drafter, "ring", 0) and snap.drafter_end == len(snap.ids):
         snap.drafter_rows = _ring_window(drafter, len(snap.ids))
     return snap
@@ -279,50 +382,76 @@ def _put_ring_window(drafter, n: int, rows: list[torch.Tensor]) -> None:
 
 
 def _row_views(st, n: int, m: int) -> list[torch.Tensor]:
-    """Views of the attention rows a snapshot of n tokens (m in the MTP head) depends on: latents or keys and values, indexer keys, gates and pools."""
+    """Views of the attention rows a snapshot of n tokens (m in the MTP head) depends on: latents or keys and values,
+    and the indexer's pooled keys (its per-token keys and gates live in rings: the snapshot's ``tail``)."""
     views = [kc[:n] for kc in st.kc] + [vc[:n] for vc in st.vc if vc is not None]
     idx = st.index or []
     main_idx = idx[:len(st.kc)]
-    for ik, ig, pk in main_idx:
-        views += [ik[:n], ig[:n], pk[:n // 4 + 1]]
+    for _, _, pk in main_idx:
+        views.append(pk[:n // 4 + 1])
     if m > 0 and hasattr(st, "mtp_kc"):
         views.append(st.mtp_kc[:m])
         if getattr(st, "mtp_vc", None) is not None:
             views.append(st.mtp_vc[:m])
         if len(idx) > len(st.kc):
-            ik, ig, pk = idx[-1]
-            views += [ik[:m], ig[:m], pk[:m // 4 + 1]]
+            views.append(idx[-1][2][:m // 4 + 1])
     return views
 
 
-def save_rows(e: Engine, snap: Snapshot) -> None:
-    """Copy a snapshot's attention rows out of the live caches before another conversation overwrites them; DFlash2 caches are not kept."""
-    views = _row_views(e.st, len(snap.ids), max(snap.mtp_len, 0))
+def _drafter_views(drafter, n: int) -> list[torch.Tensor]:
+    """DFlash2's context rows a snapshot of n tokens depends on: its sliding window's keys and values before n (every
+    later query sits at n or past it, and masks older rows), per draft layer."""
+    lo = max(0, n - drafter.window - 1)
+    return [c[:, lo:n] for c in drafter.kc] + [c[:, lo:n] for c in drafter.vc]
+
+
+def _saved_views(e: Engine, snap: Snapshot, drafter=None) -> list[torch.Tensor]:
+    """The rows ``save_rows`` copies: the attention rows, and with ``drafter`` (whose context the snapshot ends at)
+    DFlash2's window rows."""
+    n = len(snap.ids)
+    views = _row_views(e.st, n, max(snap.mtp_len, 0))
+    if drafter is not None and snap.drafter_end == n and not getattr(drafter, "ring", 0):   # a ring's: drafter_rows
+        views += _drafter_views(drafter, n)
+    return views
+
+
+def save_rows(e: Engine, snap: Snapshot, drafter=None) -> None:
+    """Copy a snapshot's attention rows out of the live caches before another conversation overwrites them; DFlash2's
+    context goes with them only given ``drafter`` (TF_GLM_SHARED_PREFIX), otherwise the snapshot no longer fits it."""
+    views = _saved_views(e, snap, drafter)
     snap.rows = [v.clone() for v in views]
     snap.nbytes = sum(r.numel() * r.element_size() for r in snap.rows)
-    snap.drafter_end = -1
-    snap.drafter_rows = None
+    if drafter is None or snap.drafter_end != len(snap.ids):
+        snap.drafter_end = -1
+        snap.drafter_rows = None
 
 
-def row_bytes(e: Engine, snap: Snapshot) -> int:
+def row_bytes(e: Engine, snap: Snapshot, drafter=None) -> int:
     """What ``save_rows`` would copy for this snapshot."""
-    return sum(v.numel() * v.element_size() for v in _row_views(e.st, len(snap.ids), max(snap.mtp_len, 0)))
+    return sum(v.numel() * v.element_size() for v in _saved_views(e, snap, drafter))
 
 
 def snapshot_bytes(snap: Snapshot) -> int:
-    """A kept snapshot's device bytes: KDA states, conv windows, pending MTP rows, a ring window, saved rows."""
+    """Device memory a kept snapshot holds: its KDA states, conv windows, pending MTP rows, a ring drafter's window,
+    the indexer rings' tail and any saved rows."""
     held = [snap.rec, snap.conv] + ([snap.pending] if snap.pending is not None else []) + (snap.drafter_rows or [])
+    held += [snap.head] if snap.head is not None else []
+    held += [t for pair in (snap.tail or []) for t in pair]
     return sum(t.numel() * t.element_size() for t in held) + (snap.nbytes if snap.rows is not None else 0)
 
 
-def load_rows(e: Engine, snap: Snapshot) -> None:
-    """Put a saved snapshot's attention rows back into the live caches."""
-    for dst, src in zip(_row_views(e.st, len(snap.ids), max(snap.mtp_len, 0)), snap.rows):
+def load_rows(e: Engine, snap: Snapshot, drafter=None) -> None:
+    """Put a saved snapshot's attention rows (and DFlash2's, when it saved them: the same ``drafter``) back."""
+    views = _saved_views(e, snap, drafter)
+    if len(views) != len(snap.rows):
+        raise ValueError("a saved snapshot's rows do not match the caches they go back to")
+    for dst, src in zip(views, snap.rows):
         dst.copy_(src)
 
 
 def restore(e: Engine, snap: Snapshot, drafter=None) -> None:
     st = e.st
+    put_ring_tail(st, snap)
     if st.cur:
         st.rec[st.cur[0]].copy_(snap.rec)
     st.conv.copy_(snap.conv)
@@ -339,74 +468,94 @@ def restore(e: Engine, snap: Snapshot, drafter=None) -> None:
 
 
 # -- prefill ----------------------------------------------------------------------------------------------------
+def whole(snap: Snapshot | None, prompt: Sequence[int]) -> bool:
+    """Whether ``snap`` is a state of exactly ``prompt`` that kept its head's logits row (a replay resumes there)."""
+
+    return snap is not None and snap.head is not None and len(snap.ids) == len(prompt)
+
+
 @torch.no_grad()
 def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp: bool = True, drafter=None,
-            resume: Snapshot | None = None, keep_at: int | None = None, keep=None) -> int:
-    """Commit the prompt in chunks and sample its first token; a resumed prompt ends in a fresh prefill's state."""
+            resume: Snapshot | None = None, feed=None, sample: bool = True, keep_head: bool = False) -> int | None:
+    """Commit the prompt in chunks and sample its first token; a resumed prompt ends in a fresh prefill's state; ``feed``: an image prompt's feature rows (``engine.VisionFeed``); ``sample=False``: commit only (no head, no first token, None), leaving the state a prompt of this length leaves before its sample.
+
+    ``resume`` may also be a state of the whole prompt that kept its head's logits row (``whole``, a replay): the
+    state goes back and the first token is sampled from that row, nothing prefilled. ``keep_head``: the head's
+    logits row of the prompt's end, as sampled from (before a grammar's mask), is left in ``e.head`` for a snapshot."""
 
     if not prompt:
         raise ValueError("prefill requires at least one token")
     w, st, b = e.w, e.st, e.pbuf
     use_mtp = mtp and w.mtp is not None
     begin = 0
+    replay = sample and whole(resume, prompt)
+    e.head = None
     if resume is None:
         e.reset()
         if drafter is not None:
             drafter.reset()
     else:
         begin = len(resume.ids)
-        if begin >= len(prompt) or list(prompt[:begin]) != resume.ids:
-            raise ValueError("a resumed prefill needs a snapshot of a strict prefix of the prompt")
+        if e.grid and begin % e.grid:
+            raise ValueError(f"a resumed prefill starts on the {e.grid}-row grid, not at {begin}")
+        if (begin >= len(prompt) and not replay) or list(prompt[:begin]) != resume.ids:
+            raise ValueError("a resumed prefill needs a snapshot of a strict prefix of the prompt (or of the whole "
+                             "prompt with its head's logits row)")
         if (use_mtp and resume.mtp_len < 0) or (drafter is not None and resume.drafter_end != begin):
             raise ValueError("this snapshot's draft caches do not fit the request")
         restore(e, resume, drafter)
-        if use_mtp:
+        if use_mtp and replay:
+            # the prompt's last hidden row waits for the first token, as a fresh prefill leaves it (the MTP cache
+            # holds every row before it: mtp_len n - 1)
+            e.last_hidden = resume.pending[-1:].clone()
+        elif use_mtp:
             k = resume.pending.shape[0]
             _absorb_rows(e, resume.pending, list(prompt[begin - k + 1:begin + 1]))
-    from .forward import Cut
-
-    if keep_at is not None and (keep is None or not max(1, begin) <= keep_at <= len(prompt)):
-        raise ValueError("a kept prefix needs a callback and a point in the prompt's prefill")
-    kept = resume if keep_at == begin else None
     last = None
-    prof.active = True
-    for start in range(begin, len(prompt), e.prefill_rows):
-        chunk = list(prompt[start:start + e.prefill_rows])
-        R = len(chunk)
-        point = keep_at - start if keep_at is not None else 0
-        cut = Cut(point, torch.empty_like(st.rec[0]), st.conv.clone()) if 0 < point < R else None
-        last = compute(w, st, b, stage(w, st, b, chunk), nch=chunks_for(st, R), host_pos=st.pos, cut=cut).clone()
-        e.last_hidden = b.fnormed[R - 1:R].clone()
-        if 0 < point <= R:
-            rec = cut.rec if cut is not None else st.rec[st.cur[0] if st.cur else 0].clone()
-            conv = cut.conv if cut is not None else st.conv.clone()
-            kept = Snapshot(list(prompt[:keep_at]), rec, conv,
-                            b.fnormed[point - 1:point].clone() if use_mtp else None,
-                            keep_at - 1 if use_mtp else -1, keep_at if drafter is not None else -1)
-        if drafter is not None:
-            drafter.add_taps(e.tap_rows(R, b))
-            if 0 < point <= R and getattr(drafter, "ring", 0):
-                # a ring keeps the kept point's window unless this chunk wrote past it by more than the ring's slack
-                if R - point < drafter.ring - drafter.window:
-                    kept.drafter_rows = _ring_window(drafter, keep_at)
-                else:
-                    kept.drafter_end = -1
-        if use_mtp:
-            nxt = list(prompt[start + 1:start + R + 1])
-            if nxt:
-                with prof.timed("mtp absorb"):
-                    _absorb_rows(e, b.fnormed[:len(nxt)], nxt)
-        with prof.timed("commit"):
-            commit(w, st, b, R, R)
-    if kept is not None:
-        keep(kept)
-    prof.active = False
-    prof.report(len(prompt) - begin)
+    if replay:
+        last = resume.head.clone()                       # a grammar's mask below writes into the rows it samples
+    else:
+        prof.active = True
+        for start in range(begin, len(prompt), e.prefill_rows):
+            last = prefill_chunk(e, prompt, start, min(e.prefill_rows, len(prompt) - start), drafter=drafter,
+                                 feed=feed, mtp=use_mtp, head=sample)
+        prof.active = False
+        prof.report(len(prompt) - begin)
+    if not sample:
+        return None
+    if keep_head:
+        e.head = last.clone()
     if e.constraint is not None:                         # the first token's row, under the reply's grammar
         e.window = e.constraint.window([0], [-1])
     first = e.sample(last, [len(prompt)], sampling)[0]
     e.follow([first])
     return first
+
+
+def prefill_chunk(e: Engine, prompt: Sequence[int], start: int, R: int, *, drafter=None, feed=None,
+                  mtp: bool = False, head: bool = True) -> torch.Tensor | None:
+    """Commit prompt rows start .. start + R (at e.st.pos == start): the chunk's forward, DFlash2's taps, the MTP
+    head's rows (``mtp``: the next tokens are the prompt's), the commit; a copy of the head's logits of its last
+    row, taken before anything else reuses the buffers, with ``head``, else None. ``prefill`` runs a prompt as these;
+    so do concurrent streams' prompt steps (``multi``), one chunk at a time."""
+
+    w, st, b = e.w, e.st, e.pbuf
+    chunk = list(prompt[start:start + R])
+    inject = feed.chunk(start, R) if feed is not None else None
+    out = compute(w, st, b, stage(w, st, b, chunk), nch=chunks_for(st, R), host_pos=st.pos, inject=inject,
+                  head=head)
+    out = out.clone() if head else None
+    e.last_hidden = b.fnormed[R - 1:R].clone()
+    if drafter is not None:
+        drafter.add_taps(e.tap_rows(R, b))
+    if mtp:
+        nxt = list(prompt[start + 1:start + R + 1])
+        if nxt:
+            with prof.timed("mtp absorb"):
+                _absorb_rows(e, b.fnormed[:len(nxt)], nxt)
+    with prof.timed("commit"):
+        commit(w, st, b, R, R)
+    return out
 
 
 def _absorb_rows(e: Engine, hidden: torch.Tensor, next_tokens: Sequence[int]) -> None:
@@ -425,11 +574,16 @@ class DecodeResult:
     rounds: int
     drafted: int = 0
     accepted: int = 0
+    # seconds by stage: "forward" the verify windows' GPU time (CUDA events), "sample" from a window's launch to its
+    # tokens (waiting for the window included: no sync of its own), "draft" and "commit" host time
     stages: dict[str, float] = field(default_factory=dict)
     depths: list[int] = field(default_factory=list)
     keeps: list[int] = field(default_factory=list)
-    arms: str = ""                          # auto_decode: the drafter of each round, "m" (MTP) or "f" (DFlash2)
+    arms: str = ""                          # auto_decode: each round's drafter, "m" (MTP), "f" (DFlash2) or "c" (copy)
     pending: torch.Tensor | None = None     # auto_decode: MTP input rows of committed positions not absorbed yet
+    copy_rounds: int = 0                    # rounds whose drafts were copied from the context (``copy_drafts``)
+    copy_drafted: int = 0
+    copy_accepted: int = 0
 
     @property
     def tokens_per_second(self) -> float:
@@ -440,6 +594,55 @@ def _sync(w: Weights) -> None:
     torch.cuda.synchronize()
 
 
+class _Clock:
+    """A verify window's GPU time between two CUDA events, read after the round's sample has waited for the window
+    anyway (so timing adds no host-device sync); wall time where there is no GPU (the CPU tests' fake engines)."""
+
+    def __init__(self) -> None:
+        self.cuda = torch.cuda.is_available()
+        if self.cuda:
+            self.a = torch.cuda.Event(enable_timing=True)
+            self.b = torch.cuda.Event(enable_timing=True)
+        self.t = self.dt = 0.0
+
+    def start(self) -> None:
+        if self.cuda:
+            self.a.record()
+        else:
+            self.t = time.perf_counter()
+
+    def stop(self) -> None:
+        if self.cuda:
+            self.b.record()
+        else:
+            self.dt = time.perf_counter() - self.t
+
+    def seconds(self) -> float:
+        """Only after something has waited for the work queued before ``stop`` (the sample's device-to-host copy)."""
+        return self.a.elapsed_time(self.b) / 1e3 if self.cuda else self.dt
+
+
+class _Late:
+    """``on_tokens`` one round late: a round's tokens go to the caller once the next verify window is queued on the
+    GPU (``flush`` right after ``Engine.forward``), so the server's work on them (detokenizing, stop strings, the
+    stream write) runs while the GPU verifies instead of between rounds, where the GPU would wait for it. The loops
+    never read on_tokens' result (both ranks decode to the end), so only when the tokens arrive changes: one round
+    later, all of them before the loop returns (``flush`` again at its end)."""
+
+    def __init__(self, on_tokens) -> None:
+        self.fn, self.held = on_tokens, None
+
+    def __call__(self, tokens) -> None:
+        if self.fn is not None:
+            self.flush()
+            self.held = list(tokens)
+
+    def flush(self) -> None:
+        if self.held is not None:
+            held, self.held = self.held, None
+            self.fn(held)
+
+
 @torch.no_grad()
 def serial_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *,
                   stop_eos: bool = False, on_tokens=None) -> DecodeResult:
@@ -448,36 +651,48 @@ def serial_decode(e: Engine, pending: int, count: int, sampling: Sampling | None
     w, st, b = e.w, e.st, e.buf
     out = [pending]
     stages = dict(forward=0.0, sample=0.0, commit=0.0)
+    clock, late = _Clock(), _Late(on_tokens)
     _sync(w)
     start = time.perf_counter()
     while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
-        t0 = time.perf_counter()
+        clock.start()
         logits = e.forward(e.verify_window([out[-1]]))
-        torch.cuda.synchronize()
+        clock.stop()
+        late.flush()                        # the last step's token, while this step runs
         t1 = time.perf_counter()
         tok = e.sample(logits[:1], [st.pos + 1], sampling)[0]
         e.follow([tok])
         t2 = time.perf_counter()
         commit(w, st, b, 1, 1)
         t3 = time.perf_counter()
-        stages["forward"] += t1 - t0
+        stages["forward"] += clock.seconds()
         stages["sample"] += t2 - t1
         stages["commit"] += t3 - t2
         out.append(tok)
-        if on_tokens is not None:
-            on_tokens([tok])
+        late([tok])
+    late.flush()
     _sync(w)
     return DecodeResult(out, time.perf_counter() - start, len(out) - 1, stages=stages)
 
 
 class DepthPolicy:
-    """Choose a fixed draft count or adapt it to running acceptance."""
+    """Choose a fixed draft count or adapt it to running acceptance. DFlash2 stop rules within a round: the product of
+    the chain's confidences holds ``confidence``; with ``beta`` > 0 those confidences are noise-aware
+    (``dflash2.noisy_confidence``), and with ``round_ms`` too (ms of a round of k drafts, k = 0..) the chain is cut
+    where E[tokens] / ms is largest instead. MTP chains ignore ``beta`` and ``round_ms``."""
 
     def __init__(self, most: int = 3, fixed: bool = False, low: float = 0.8, high: float = 0.9,
-                 confidence: float = 0.0) -> None:
+                 confidence: float = 0.0, beta: float = 0.0, round_ms: tuple[float, ...] | None = None) -> None:
         self.most, self.fixed, self.low, self.high = most, fixed, low, high
         self.confidence = confidence
+        self.beta, self.round_ms = beta, round_ms
         self.rate = 0.8
+
+    @property
+    def chain_rule(self) -> dict:
+        """Drafter.propose's keyword arguments for the noise-aware rules (none for the others)."""
+
+        return {"beta": self.beta, "round_ms": self.round_ms} if self.beta > 0 else {}
 
     def next(self, drafted: int, accepted: int) -> int:
         if self.fixed:
@@ -487,31 +702,45 @@ class DepthPolicy:
         return max(1, min(self.most, 1 if self.rate < self.low else 2 if self.rate < self.high else 3))
 
 
+def copy_room(copies, count: int, out: list[int]) -> int:
+    """Copy drafts a round may propose: the rows still wanted past the pending token (0 without copy drafts)."""
+
+    return 0 if copies is None else count - len(out) - 1
+
+
 @torch.no_grad()
 def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *, policy: DepthPolicy | None = None,
-               stop_eos: bool = False, on_tokens=None) -> DecodeResult:
-    """Verify pending and MTP draft rows through the first mismatch, starting with every prompt position except the last in the MTP cache."""
+               stop_eos: bool = False, on_tokens=None, copies=None) -> DecodeResult:
+    """Verify pending and MTP draft rows through the first mismatch, starting with every prompt position except the last in the MTP cache; ``copies``: a ``copy_drafts.CopyDrafts`` of prompt and pending token, whose proposals replace the MTP chain (the kept rows are still absorbed)."""
 
     w, st, b = e.w, e.st, e.buf
     policy = policy or DepthPolicy()
     out = [pending]
     stages = dict(draft=0.0, forward=0.0, sample=0.0, commit=0.0)
     rounds = drafted = accepted = 0
+    c_rounds = c_drafted = c_accepted = 0
     depths: list[int] = []
     keeps: list[int] = []
+    clock, late = _Clock(), _Late(on_tokens)
     _sync(w)
     start = time.perf_counter()
     t0 = time.perf_counter()
-    depth = min(policy.next(0, 0), count - len(out))
-    drafts = draft(e, e.last_hidden, [pending], st.pos + 1, depth, sampling, policy.confidence) if depth > 0 else []
+    copied = copies.propose(copy_room(copies, count, out)) if copies is not None else []
+    if copied:
+        absorb(e, e.last_hidden, [pending])
+        drafts = copied
+    else:
+        depth = min(policy.next(0, 0), count - len(out))
+        drafts = draft(e, e.last_hidden, [pending], st.pos + 1, depth, sampling, policy.confidence) if depth > 0 else []
     stages["draft"] += time.perf_counter() - t0
     while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
-        t0 = time.perf_counter()
         tokens = e.verify_window([out[-1]] + drafts)
         drafts = tokens[1:]
         R = len(tokens)
+        clock.start()
         logits = e.forward(tokens)
-        torch.cuda.synchronize()
+        clock.stop()
+        late.flush()                        # the last round's tokens, while this window runs
         t1 = time.perf_counter()
         sampled = e.sample(logits[:R], [st.pos + 1 + r for r in range(R)], sampling)
         keep = 1
@@ -525,50 +754,71 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
         rounds += 1
         drafted += len(drafts)
         accepted += keep - 1
+        if copied:
+            c_rounds, c_drafted, c_accepted = c_rounds + 1, c_drafted + len(drafts), c_accepted + keep - 1
         depths.append(len(drafts))
         keeps.append(keep)
         e.follow(sampled[:keep])
         out.extend(sampled[:keep])
-        if on_tokens is not None:
-            on_tokens(sampled[:keep][:max(0, count - (len(out) - keep))])
-        stages["forward"] += t1 - t0
+        if copies is not None:
+            copies.extend(sampled[:keep])
+        late(sampled[:keep][:max(0, count - (len(out) - keep))])
+        stages["forward"] += clock.seconds()
         stages["sample"] += t2 - t1
         stages["commit"] += t3 - t2
         if len(out) >= count or (stop_eos and out[-1] in w.cfg.eos):
             break
         t4 = time.perf_counter()
-        depth = min(policy.next(len(drafts), keep - 1), count - len(out))
-        drafts = (draft(e, e.main_hidden(slice(0, keep)), sampled[:keep], st.pos + 1, depth, sampling,
-                        policy.confidence) if depth > 0 else [])
+        was_copy = bool(copied)
+        copied = copies.propose(copy_room(copies, count, out)) if copies is not None else []
+        if copied:                          # the MTP head still takes the kept rows; it drafts nothing this round
+            absorb(e, e.main_hidden(slice(0, keep)), sampled[:keep])
+            drafts = copied
+        else:                               # a copied round's acceptance does not move the MTP depth
+            depth = min(policy.next(*((0, 0) if was_copy else (len(drafts), keep - 1))), count - len(out))
+            drafts = (draft(e, e.main_hidden(slice(0, keep)), sampled[:keep], st.pos + 1, depth, sampling,
+                            policy.confidence) if depth > 0 else [])
         stages["draft"] += time.perf_counter() - t4
+    late.flush()
     _sync(w)
-    return DecodeResult(out[:count], time.perf_counter() - start, rounds, drafted, accepted, stages, depths, keeps)
+    return DecodeResult(out[:count], time.perf_counter() - start, rounds, drafted, accepted, stages, depths, keeps,
+                        copy_rounds=c_rounds, copy_drafted=c_drafted, copy_accepted=c_accepted)
 
 
 @torch.no_grad()
 def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling | None, *,
-                  policy: DepthPolicy | None = None, stop_eos: bool = False, on_tokens=None) -> DecodeResult:
-    """Verify pending and DFlash2 draft rows through the first mismatch and absorb kept taps, starting from prefill's drafter state."""
+                  policy: DepthPolicy | None = None, stop_eos: bool = False, on_tokens=None,
+                  copies=None) -> DecodeResult:
+    """Verify pending and DFlash2 draft rows through the first mismatch and absorb kept taps, starting from prefill's drafter state; ``copies``: a ``copy_drafts.CopyDrafts`` of prompt and pending token, whose proposals replace the round's DFlash2 block (the kept taps are still absorbed)."""
 
     w, st, b = e.w, e.st, e.buf
     policy = policy or DepthPolicy(3, fixed=True)
     out = [pending]
     stages = dict(draft=0.0, forward=0.0, sample=0.0, commit=0.0)
     rounds = drafted = accepted = 0
+    c_rounds = c_drafted = c_accepted = 0
     depths: list[int] = []
     keeps: list[int] = []
+    clock, late = _Clock(), _Late(on_tokens)
     _sync(w)
     start = time.perf_counter()
     depth = min(policy.next(0, 0), count - len(out))
     while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
         t0 = time.perf_counter()
-        drafts = drafter.propose(out[-1], depth, sampling, policy.confidence) if depth > 0 else []
+        copied = copies.propose(copy_room(copies, count, out)) if copies is not None else []
+        if copied:
+            drafts = copied
+        else:
+            drafts = (drafter.propose(out[-1], depth, sampling, policy.confidence, **policy.chain_rule)
+                      if depth > 0 else [])
         t1 = time.perf_counter()
         tokens = e.verify_window([out[-1]] + drafts)
         drafts = tokens[1:]
         R = len(tokens)
+        clock.start()
         logits = e.forward(tokens)
-        torch.cuda.synchronize()
+        clock.stop()
+        late.flush()                        # the last round's tokens, while this window runs
         t2 = time.perf_counter()
         sampled = e.sample(logits[:R], [st.pos + 1 + r for r in range(R)], sampling)
         keep = 1
@@ -584,16 +834,22 @@ def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampli
         rounds += 1
         drafted += len(drafts)
         accepted += keep - 1
+        if copied:
+            c_rounds, c_drafted, c_accepted = c_rounds + 1, c_drafted + len(drafts), c_accepted + keep - 1
         depths.append(len(drafts))
         keeps.append(keep)
         e.follow(sampled[:keep])
         out.extend(sampled[:keep])
-        if on_tokens is not None:
-            on_tokens(sampled[:keep][:max(0, count - (len(out) - keep))])
+        if copies is not None:
+            copies.extend(sampled[:keep])
+        late(sampled[:keep][:max(0, count - (len(out) - keep))])
         stages["draft"] += (t1 - t0) + (t5 - t4)
-        stages["forward"] += t2 - t1
+        stages["forward"] += clock.seconds()
         stages["sample"] += t3 - t2
         stages["commit"] += t4 - t3
-        depth = min(policy.next(len(drafts), keep - 1), count - len(out))
+        # a copied round's acceptance does not move DFlash2's depth
+        depth = min(policy.next(*((0, 0) if copied else (len(drafts), keep - 1))), count - len(out))
+    late.flush()
     _sync(w)
-    return DecodeResult(out[:count], time.perf_counter() - start, rounds, drafted, accepted, stages, depths, keeps)
+    return DecodeResult(out[:count], time.perf_counter() - start, rounds, drafted, accepted, stages, depths, keeps,
+                        copy_rounds=c_rounds, copy_drafted=c_drafted, copy_accepted=c_accepted)

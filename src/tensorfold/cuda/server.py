@@ -24,9 +24,14 @@ from tensorfold.server.tools import active_tool_specs, tool_choice_requires_call
 
 from tensorfold.cuda import health
 from tensorfold.cuda.chat_template import ChatTemplate
-from tensorfold.cuda.reply_text import StopStrings, StreamDecoder, hide_tool_calls, parse_tool_calls
+from tensorfold.cuda.reply_text import (THINK_CALL_HOLD, GlmCallStreamer, StopStrings, StreamDecoder, ThinkSplit,
+                                        hide_tool_calls, parse_tool_calls)
 from tensorfold.cuda.turns import Turns, Yield
 from tensorfold.server.text import is_title_request, reasoning_count, split_thinking
+
+# While a GLM tool call is written it is held until whole (a call the reply ends inside is never sent); an idle client
+# (upstream #114: one that drops a reply sending nothing) gets an empty delta this often meanwhile
+CALL_KEEPALIVE_S = 2.0
 
 
 # -- requests --------------------------------------------------------------------------------
@@ -222,16 +227,65 @@ class App:
                                        self.sampling_for(body, rendered.tokens), ignore_eos=ignore_eos, stop=stop,
                                        vision=rendered.vision, grammar=compiled, think_budget=budget)
             text = render(body["messages"])
+            prompt = self.tok.encode(text, add_special_tokens=False).ids
+        elif isinstance(body.get("prompt"), list):       # token ids (vLLM's and OpenAI's form): served as given
+            prompt = self.token_ids(body["prompt"])
         else:
             text = body.get("prompt")
             if not isinstance(text, str):
-                raise RequestError("prompt must be a string")
-        prompt = self.tok.encode(text, add_special_tokens=False).ids
+                raise RequestError("prompt must be a string or a list of token ids")
+            prompt = self.tok.encode(text, add_special_tokens=_flag(body, "add_special_tokens", False)).ids
         if not prompt:
             raise RequestError("rendered prompt is empty")
         # sampling is resolved here, so a malformed control is refused before a stream opens
         return PreparedRequest(prompt, max_tokens, tools, thinking, self.sampling_for(body, prompt),
                                ignore_eos=ignore_eos, stop=stop, grammar=compiled, think_budget=budget)
+
+    def token_ids(self, value: Any, field: str = "prompt") -> list[int]:
+        """Token ids as a request gives them (a list, or a list holding one list); RequestError outside the vocabulary."""
+
+        if isinstance(value, list) and len(value) == 1 and isinstance(value[0], list):
+            value = value[0]
+        if not isinstance(value, list) or any(type(t) is not int for t in value):
+            raise RequestError(f"{field} must be a list of integer token ids (one prompt a request)")
+        size = getattr(self.tok, "get_vocab_size", None)
+        vocab = size(with_added_tokens=True) if size is not None else None
+        if any(t < 0 or (vocab is not None and t >= vocab) for t in value):
+            top = "" if vocab is None else f" to {vocab - 1}"
+            raise RequestError(f"{field} token ids must be in the vocabulary's range 0{top}")
+        return list(value)
+
+    def tokenize(self, body: dict[str, Any]) -> dict[str, Any]:
+        """vLLM's ``/tokenize``: a prompt's ids (``add_special_tokens`` as vLLM, default true), or ``messages``' as the
+        chat route renders them (``add_generation_prompt``, default true)."""
+
+        if not isinstance(body, dict):
+            raise RequestError("the request body must be a JSON object")
+        if "messages" in body:
+            fields = dict(body)
+            if "add_generation_prompt" in body:
+                kwargs = body.get("chat_template_kwargs")
+                kwargs = {} if kwargs is None else kwargs
+                if not isinstance(kwargs, dict):
+                    raise RequestError("chat_template_kwargs must be a JSON object or null")
+                fields["chat_template_kwargs"] = {**kwargs,
+                                                  "add_generation_prompt": _flag(body, "add_generation_prompt", True)}
+            ids = self._prepare(fields, True).prompt
+        else:
+            text = body.get("prompt")
+            if not isinstance(text, str):
+                raise RequestError("prompt must be a string (or send messages)")
+            ids = self.tok.encode(text, add_special_tokens=_flag(body, "add_special_tokens", True)).ids
+        limit = self._context_limit()
+        return {"count": len(ids), "max_model_len": limit if limit is not None else self.native_context_window,
+                "tokens": [int(t) for t in ids]}
+
+    def detokenize(self, body: dict[str, Any]) -> dict[str, Any]:
+        """vLLM's ``/detokenize``: the text of ``tokens``, special tokens included."""
+
+        if not isinstance(body, dict):
+            raise RequestError("the request body must be a JSON object")
+        return {"prompt": self.tok.decode(self.token_ids(body.get("tokens"), "tokens"), skip_special_tokens=False)}
 
     def check(self, body: dict[str, Any], *, prepared: PreparedRequest | None = None) -> str | None:
         """Why the request cannot run, or None; rendered before a stream's headers are sent."""
@@ -309,23 +363,41 @@ class App:
         stopped = {"client": False, "stop": False}
         failed: list[Exception] = []
         stream = StreamDecoder(self.tok, ends)
-        # calls stream as argument deltas while written (as on the Mac); one-call requests keep the end parser
-        calls_stream = ToolCallStreamer(tools) if tools and not policy.single else None
+        # a streamed reply's GLM calls go out while they are written (a long file write would otherwise send nothing
+        # for minutes, past the idle cut of clients such as LiteLLM and Node's fetch); one call a reply waits
+        glm_calls = bool(tools) and self._glm_calls()
+        calls_stream = GlmCallStreamer(tools) if glm_calls and body.get("stream") and not policy.single else None
+        quiet_since = [time.monotonic()]     # the last delta sent while a call is held (CALL_KEEPALIVE_S)
+        # other families' calls stream as argument deltas while written (as on the Mac); one-call requests keep the
+        # end parser
+        xml_stream = ToolCallStreamer(tools) if tools and not glm_calls and not policy.single else None
         answer_raw = [""]
+        # GLM's calls written inside the think block: calls when the reply ends on them (``ThinkSplit``)
+        think = (ThinkSplit(THINK_CALL_HOLD if calls_stream is not None else None) if glm_calls and chat and thinking
+                 else None)
 
-        def visible(finished: bool) -> tuple[str, str]:
+        def split(raw: str, finished: bool) -> tuple[str, str]:
+            if not (chat and thinking):
+                return "", raw
+            return think(raw, finished) if think is not None else split_thinking(raw, finished=finished)
+
+        def call_text(raw: str) -> str:
+            """The text the call streamer reads: the answer, or a long call taken from the think block; "" before."""
+
+            if think is None:
+                return raw
+            return raw[think.stream_from:] if think.stream_from is not None else ""
+
+        def visible(finished: bool) -> tuple[str, str, str]:
             raw = stream.final() if finished else stream.text
             # stop strings match the generated text, reasoning included, before it is split (as on the Mac)
             raw = stops.visible(raw, partial=not finished) if stops.strings else raw
-            if chat and thinking:
-                reasoning, answer = split_thinking(raw, finished=finished)
-            else:
-                reasoning, answer = "", raw
+            reasoning, answer = split(raw, finished)
             answer_raw[0] = answer
             if tools:
                 answer = (policy.content(answer, finished=finished) if policy.single
                           else hide_tool_calls(answer, finished=finished))
-            return reasoning, answer
+            return reasoning, answer, raw
 
         serving: list[Any] = [None]
 
@@ -346,7 +418,7 @@ class App:
                 else:
                     out.extend(new)
                 stream.add(new)
-                reasoning, answer = visible(False)
+                reasoning, answer, raw = visible(False)
                 delta: dict[str, Any] = {}
                 if len(reasoning) > sent["reasoning"]:
                     delta["reasoning_content"] = reasoning[sent["reasoning"]:]
@@ -354,10 +426,18 @@ class App:
                 if len(answer) > sent["content"]:
                     delta["content"] = answer[sent["content"]:]
                     sent["content"] = len(answer)
-                if delta and not emit(delta):
+                parts = [delta] if delta else []
+                if calls_stream is not None:
+                    parts += calls_stream.feed(call_text(raw))
+                    if parts:
+                        quiet_since[0] = time.monotonic()
+                    elif calls_stream.open and time.monotonic() - quiet_since[0] >= CALL_KEEPALIVE_S:
+                        parts.append({})          # a call held until whole: an empty delta keeps idle clients waiting
+                        quiet_since[0] = time.monotonic()
+                if not all(emit(part) for part in parts):
                     stopped["client"] = True
-                if calls_stream is not None and not stopped["client"]:
-                    for call_delta in calls_stream.feed(answer_raw[0]):   # never the reasoning
+                if xml_stream is not None and not stopped["client"]:
+                    for call_delta in xml_stream.feed(answer_raw[0]):     # never the reasoning
                         if not emit(call_delta):
                             stopped["client"] = True
                             break
@@ -408,11 +488,15 @@ class App:
                 end = None if think_end is None or think_end in ids[len(prompt):] else think_end
                 extra["constraint"] = self._grammars().constraint(compiled, think_end=end, spec=spec)
             if prepared.vision is not None:          # a gate's continuation keeps the images, positions extended
-                from tensorfold.vision.qwen_processing import continued
-
                 same = list(ids) == list(prepared.vision.token_ids)
-                extra["vision"] = prepared.vision if same else continued(prepared.vision, ids,
-                                                                       self.vision.frontend.config)
+                if same:
+                    extra["vision"] = prepared.vision
+                elif hasattr(prepared.vision, "continued"):     # a frontend that extends its own prompts
+                    extra["vision"] = prepared.vision.continued(ids)
+                else:
+                    from tensorfold.vision.qwen_processing import continued
+
+                    extra["vision"] = continued(prepared.vision, ids, self.vision.frontend.config)
             stats = self.engine.generate(ids, count, sampling, feed, **extra)
             if not cached:
                 cached.append(int((stats or {}).get("cached") or 0))
@@ -438,29 +522,44 @@ class App:
         if stopped["client"]:                                        # as the Mac server: nothing more is written
             raise RequestCancelled("the client left during the reply")
         stats = {**(stats or {}), "token_sha": token_sha(out)}
-        reasoning, answer = visible(True)
+        reasoning, answer, raw = visible(True)
         final: dict[str, Any] = {}
         if len(reasoning) > sent["reasoning"]:
             final["reasoning_content"] = reasoning[sent["reasoning"]:]
         text = stops.visible(self.tok.decode([t for t in out if t not in ends], skip_special_tokens=False))
-        raw_answer = split_thinking(text, finished=True)[1] if chat and thinking else text
+        raw_answer = split(text, True)[1]
         content, calls = parse_tool_calls(raw_answer, tools, max_calls=policy.max_calls) if tools else (answer, None)
         content = policy.content(content) if tools else content
+        call_deltas, streamed = [], 0
+        # the calls streamed as sent, then any the streamer did not follow; calls held in the think block to the end
+        # (never streamed) are the end parser's, sent whole
+        if calls_stream is not None and (think is None or think.stream_from is not None):
+            call_deltas = calls_stream.feed(call_text(raw))
+            streamed = calls_stream.sent
+            calls = [*calls_stream.calls[:streamed], *calls_stream.rest(tools)] or None
+        cut = calls_stream is not None and calls_stream.open        # a call the reply ended inside: never sent
+        if cut:                                 # nor its markup as content
+            content = answer.strip()
+        elif tools and (at := content.rfind("<tool_call>")) >= 0 and "</tool_call>" not in content[at:]:
+            content, cut = content[:at].rstrip(), True     # the same for the end parser: an unclosed call is cut text
         tail = content[sent["content"]:] if content.startswith(answer[:sent["content"]]) else ""
         if tail:
             final["content"] = tail
-        finish = "tool_calls" if calls else ("stop" if stopped["stop"] or (out and out[-1] in ends) else "length")
+        finish = "tool_calls" if calls and not cut else ("stop" if stopped["stop"] or (out and out[-1] in ends)
+                                                         else "length")
         if body.get("return_token_ids"):              # the reply's ids in the "tensorfold" block, for exactness checks
             stats = {**(stats or {}), "token_ids": [int(t) for t in out]}
         logprobs = (self._probability_decoder.format(probabilities.emitted(out), ends)
                     if probabilities is not None else None)
         # the calls already sent as deltas; the handler sends the rest (a call the streamer could not follow)
-        streamed = calls_stream.index + 1 if calls_stream is not None and calls_stream.streamed else 0
-        return {"final": final, "calls": calls, "finish": finish, "content": content, "reasoning": reasoning,
+        if xml_stream is not None and xml_stream.streamed:
+            streamed = xml_stream.index + 1
+        return {"final": final, "calls": calls, "call_deltas": call_deltas, "calls_streamed": streamed,
+                "finish": finish, "content": content, "reasoning": reasoning,
                 **({"logprobs": logprobs} if logprobs is not None else {}),
                 "prompt_tokens": len(prompt), "completion_tokens": len(out), "cached_tokens": (cached or [0])[0],
                 "reasoning_tokens": reasoning_count(out, self.tok.token_to_id("</think>") if chat and thinking else None),
-                "stats": stats, "calls_streamed": streamed}
+                "stats": stats}
 
     def _turns(self) -> Turns:
         """The engine's turns (one request at a time, background ones last), made on first use."""
@@ -477,6 +576,14 @@ class App:
         if prepared.grammar is None:
             close += self.tok.encode("\n\n", add_special_tokens=False).ids
         return ThinkBudget(prepared.think_budget, close, think_end)
+
+    def _glm_calls(self) -> bool:
+        """Whether this model writes GLM's ``<arg_key>``/``<arg_value>`` calls (streamed while they are written): its
+        tokenizer has those marks as tokens."""
+
+        lookup = getattr(self.tok, "token_to_id", None)
+        return lookup is not None and all(lookup(mark) is not None for mark in ("<tool_call>", "<arg_key>",
+                                                                                "</arg_value>"))
 
     def _call_gate(self, prompt: list[int], tools: list[dict[str, Any]]) -> CallGate:
         """The gate a required tool call needs, from this template's call markup and the rendered prompt."""
@@ -507,6 +614,13 @@ class App:
         return CallGate.after_prompt(prompt, self.tok.token_to_id(opener), blank, think_open=think[0],
                                      think_end=think[1], text=text, lead=lead or "", names=names, tail=tail or "",
                                      encode=lambda t: list(self.tok.encode(t, add_special_tokens=False).ids))
+
+
+def _flag(body: dict[str, Any], name: str, default: bool) -> bool:
+    value = body.get(name, default)
+    if not isinstance(value, bool):
+        raise RequestError(f"{name} must be a boolean")
+    return value
 
 
 def token_sha(tokens: list[int]) -> str:

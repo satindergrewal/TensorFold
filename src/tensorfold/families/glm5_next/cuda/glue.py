@@ -159,15 +159,67 @@ def _hc_finish(X, PART, BASE, SCALE, NW, OUT, XS, POST, COMB, eps_norm, hc_eps,
     tl.store(XS + r * (D // 64) + tl.arange(0, BLOCK // 64), g)
 
 
+@triton.jit
+def _hc_partial_mma(X, FN, PART, R, WIDE: tl.constexpr, NB: tl.constexpr, BM: tl.constexpr, BK: tl.constexpr):
+    """Prompt rows, program (row block, K block): _hc_partial's 24 dots on the tensor cores (one fp32 chain over
+    ascending k tiles, a row's bits independent of the other rows) and its sum of squares, in PART's layout."""
+
+    rm = tl.program_id(0) * BM + tl.arange(0, BM)
+    b = tl.program_id(1)
+    KB: tl.constexpr = WIDE // NB
+    m = tl.arange(0, 32)
+    k = tl.arange(0, BK)
+    ok = rm < R
+    acc = tl.zeros((BM, 32), dtype=tl.float32)
+    ss = tl.zeros((BM,), dtype=tl.float32)
+    for t in range(KB // BK):
+        base = b * KB + t * BK
+        x = tl.load(X + rm[:, None] * WIDE + base + k[None, :], mask=ok[:, None], other=0.0)
+        w = tl.load(FN + m[None, :] * WIDE + base + k[:, None], mask=m[None, :] < 24, other=0.0)
+        acc = tl.dot(x, w, acc)
+        xf = x.to(tl.float32)
+        ss += tl.sum(xf * xf, axis=1)
+    tl.store(PART + (rm[:, None] * NB + b) * 32 + m[None, :], acc, mask=ok[:, None] & (m[None, :] < 24))
+    tl.store(PART + (rm * NB + b) * 32 + 24, ss, mask=ok)
+
+
+HC_MMA = __import__("os").environ.get("TF_GLM_HC_MMA", "1") != "0"    # prompt rows' mixing dots on the tensor cores
+
+
+def hc_dec() -> bool:
+    """TF_GLM_HC_DEC (default on): decode rows' mixing dots in hc.cu, 48 blocks a row instead of 16, _hc_partial's
+    bits; 0: _hc_partial."""
+    return __import__("os").environ.get("TF_GLM_HC_DEC", "1") != "0"
+
+
+@__import__("functools").lru_cache(maxsize=1)
+def _hc_ext():
+    from pathlib import Path
+
+    from tensorfold.cuda.build import load
+
+    here = Path(__file__).parent
+    return load(name="tensorfold_glm_hc_v2", sources=[str(here / "hc.cpp"), str(here / "hc.cu")],
+                extra_cuda_cflags=["-O3"], verbose=False)
+
+
 def hc_pre(x: torch.Tensor, fn: torch.Tensor, base: torch.Tensor, scale: torch.Tensor, norm_w: torch.Tensor,
            out: torch.Tensor, xs: torch.Tensor, post: torch.Tensor, comb: torch.Tensor, part: torch.Tensor,
-           eps: float, hc_eps: float, iters: int) -> None:
-    """x [R, S*D] bf16 streams -> out [R, D] (normed collapsed row) + xs, and post [R, S], comb [R, S, S]."""
+           eps: float, hc_eps: float, iters: int, *, prompt: bool = False) -> None:
+    """x [R, S*D] bf16 streams -> out [R, D] (normed collapsed row) + xs, and post [R, S], comb [R, S, S];
+    ``prompt``: a prompt chunk's rows, their mixing dots on the tensor cores (other bits than decode rows')."""
 
     rows, wide = x.shape
     d = norm_w.shape[0]
     s = wide // d
-    _hc_partial[(rows, HC_BLOCKS)](x, fn, part, WIDE=wide, NB=HC_BLOCKS, SUB=128, num_warps=4)
+    if prompt and HC_MMA and x.is_contiguous():
+        _hc_partial_mma[(triton.cdiv(rows, 64), HC_BLOCKS)](x, fn, part, rows, WIDE=wide, NB=HC_BLOCKS, BM=64, BK=64,
+                                                            num_warps=4, num_stages=3)
+    elif (hc_dec() and wide == 16384 and fn.shape[0] == 24 and HC_BLOCKS == 16 and x.is_contiguous()
+          and fn.is_contiguous() and part.is_contiguous()):
+        _hc_ext().hc_partial(x, fn, part, rows)                  # _hc_partial's bits on 48 blocks a row
+    else:
+        _hc_partial[(rows, HC_BLOCKS)](x, fn, part, WIDE=wide, NB=HC_BLOCKS, SUB=128, num_warps=4)
     _hc_finish[(rows,)](x, part, base, scale, norm_w, out, xs, post, comb, eps, hc_eps, D=d, S=s, NB=HC_BLOCKS,
                         ITERS=iters, BLOCK=d, num_warps=8)
 
@@ -208,6 +260,24 @@ def hc_post(x: torch.Tensor, xout: torch.Tensor, gathered: torch.Tensor, post: t
     block = min(1024, d)
     _hc_post[(rows, d // block)](x, xout, gathered, post, comb, rows * d, D=d, S=s, WORLD=world, BLOCK=block,
                                  num_warps=4)
+
+
+def hc_post_pair(x: torch.Tensor, xout: torch.Tensor, g0: torch.Tensor, g1: torch.Tensor, post: torch.Tensor,
+                 comb: torch.Tensor) -> None:
+    """``hc_post`` of two ranks' fp32 partials [R, D] held apart (rank 0's ``g0``, rank 1's ``g1``): the same kernel
+    with rank 1's rows read at their distance from rank 0's (element offset, may be negative), so the sum (rank 0
+    first) and every bit are hc_post's (TF_GLM_HC_SPLIT)."""
+
+    rows, d = g0.shape
+    if (g1.shape != g0.shape or g0.dtype != torch.float32 or g1.dtype != torch.float32
+            or not (g0.is_contiguous() and g1.is_contiguous())):
+        raise ValueError("hc_post_pair: two contiguous fp32 partials of one shape")
+    if not rows:
+        return
+    s = x.shape[1] // d
+    block = min(1024, d)
+    rs = (g1.data_ptr() - g0.data_ptr()) // g0.element_size()
+    _hc_post[(rows, d // block)](x, xout, g0, post, comb, rs, D=d, S=s, WORLD=2, BLOCK=block, num_warps=4)
 
 
 @triton.jit
@@ -407,3 +477,28 @@ def combine(y: torch.Tensor, wts: torch.Tensor, out: torch.Tensor) -> None:
     rows, d = out.shape
     block = min(1024, d)
     _combine[(rows, d // block)](y, wts, out, D=d, SLOTS=wts.shape[1], BLOCK=block, num_warps=4)
+
+
+@triton.jit
+def _combine_sy(Y, SY, WTS, OUT, D: tl.constexpr, SLOTS: tl.constexpr, BLOCK: tl.constexpr):
+    """``_combine`` with the shared expert's row read from SY [R, D] fp32 instead of Y's last slot: the same terms
+    (w_k y_k, the shared one times its weight 1) added in the same slot order, so the same bits."""
+
+    r = tl.program_id(0)
+    c = tl.program_id(1)
+    d = c * BLOCK + tl.arange(0, BLOCK)
+    acc = tl.zeros((BLOCK,), dtype=tl.float32)
+    for k in tl.static_range(SLOTS - 1):
+        acc = acc + tl.load(Y + (r * SLOTS + k) * D + d).to(tl.float32) * tl.load(WTS + r * SLOTS + k)
+    acc = acc + tl.load(SY + r * D + d).to(tl.float32) * tl.load(WTS + r * SLOTS + SLOTS - 1)
+    tl.store(OUT + r * D + d, acc)
+
+
+def combine_shared(y: torch.Tensor, sy: torch.Tensor, wts: torch.Tensor, out: torch.Tensor) -> None:
+    """combine(y with its last slot replaced by sy): y [R, slots, D] (the last slot not read), sy [R, D] fp32."""
+
+    rows, d = out.shape
+    if y.dtype != torch.float32 or sy.dtype != torch.float32 or not (y.is_contiguous() and sy.is_contiguous()):
+        raise ValueError("combine_shared: contiguous fp32 expert rows")
+    block = min(1024, d)
+    _combine_sy[(rows, d // block)](y, sy, wts, out, D=d, SLOTS=wts.shape[1], BLOCK=block, num_warps=4)

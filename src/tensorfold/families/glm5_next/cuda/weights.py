@@ -13,7 +13,8 @@ from tensorfold.cuda import experts as grouped
 
 from .exl3_mm import Exl3Experts, words as exl3_words
 from . import latent
-from .qmm import B16, Q4, as_i32, make_b16, make_q4, quantize4, stack_b16, stack_q4
+from .qmm import (B16, F8, Q4, as_i32, dense_kind, draft_quantize4, kvb_kind, make_b16, make_f8, make_q4, stack_b16,
+                  stack_f8, stack_q4)
 
 PREFIX = "model.language_model."
 
@@ -152,12 +153,12 @@ class DSAW:
     q_norm: torch.Tensor
     kv_norm: torch.Tensor
     q_b: Q4
-    kv_k: Q4                  # key rows of kv_b for the local heads
-    kv_v: Q4                  # value rows
+    kv_k: Q4 | None           # key rows of kv_b for the local heads (TF_GLM_LATENT=0 only)
+    kv_v: Q4 | None           # value rows (TF_GLM_LATENT=0 only)
     o: Q4
     heads: int
     index: IndexW | None = None
-    absorb: object = None     # latent.AbsorbW: kv_b split per head, for attention on the latent cache
+    absorb: object = None     # latent.AbsorbW / AbsorbF8 / AbsorbQ4: kv_b split per head, for the latent cache
 
 
 @dataclass
@@ -204,7 +205,7 @@ class Weights:
     embed: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
     layers: list[LayerW]
     norm: torch.Tensor
-    head: Q4 | B16
+    head: Q4 | B16 | F8
     mtp: MTPW | None
     rank: int
     world: int
@@ -226,7 +227,8 @@ class Weights:
             if isinstance(t, torch.Tensor) and t.data_ptr() not in seen:
                 seen.add(t.data_ptr())
                 total += t.numel() * t.element_size()
-            elif isinstance(t, (Q4, B16, grouped.Experts, Exl3Experts, HCW, KDAW, DSAW, MLPW, MoEW, LayerW, MTPW, IndexW)):
+            elif isinstance(t, (Q4, B16, F8, grouped.Experts, Exl3Experts, HCW, KDAW, DSAW, MLPW, MoEW, LayerW, MTPW,
+                                IndexW, latent.AbsorbW, latent.AbsorbQ4, latent.AbsorbF8)):
                 for v in vars(t).values():
                     add(v)
             elif isinstance(t, (list, tuple)):
@@ -269,12 +271,24 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
     def trip(name: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return (as_i32(t(name + ".weight")), t(name + ".scales"), t(name + ".biases"))
 
-    def q4(name: str) -> Q4 | B16:
-        return make_b16(t(name + ".weight")) if exl3 else make_q4(*trip(name))
+    # TF_GLM_DENSE=fp8: the BF16 matrices as FP8 with block scales (lossy, half the bytes a decode round reads)
+    fp8 = exl3 and dense_kind() in ("fp8", "q4")
+    dense, dense_stack = (make_f8, stack_f8) if fp8 else (make_b16, stack_b16)
+    # TF_GLM_DENSE=q4: the projections in 4 bits (MSE-searched groups of 64), the head and kv_b in FP8
+    if exl3 and dense_kind() == "q4":
+        from .qmm import make_dense_q4, stack_dense_q4
 
-    def stack(names: list[str]) -> Q4 | B16:
+        big, big_stack = make_dense_q4, stack_dense_q4
+    else:
+        big, big_stack = dense, dense_stack
+    kvb = kvb_kind() if exl3 else "bf16"         # an MLX checkpoint's kv_b is 4-bit as stored
+
+    def q4(name: str) -> Q4 | B16 | F8:
+        return big(t(name + ".weight")) if exl3 else make_q4(*trip(name))
+
+    def stack(names: list[str]) -> Q4 | B16 | F8:
         if exl3:
-            return stack_b16([t(n + ".weight") for n in names])
+            return big_stack([t(n + ".weight") for n in names])
         return stack_q4([trip(n) for n in names])
 
     def hc(i: int, site: str) -> HCW:
@@ -293,18 +307,22 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
         proj = stack([p + "q_a_proj", p + "kv_a_proj_with_mqa"])
         rows = torch.arange(HL * 512, device=dev).view(HL, 512)
         krows, vrows = rows[:, :cfg.qk_dim].reshape(-1), rows[:, cfg.qk_dim:].reshape(-1)
+        # the latent path reads kv_b only through ``absorb``: the per-head key and value matrices (kv_k, kv_v) exist
+        # only without it (TF_GLM_LATENT=0), so they take no memory beside it
+        kv_k = kv_v = None
         if exl3:
             w = t(p + "kv_b_proj.weight")
-            kv_k, kv_v = make_b16(w[krows]), make_b16(w[vrows])
-            full_k, full_v = (lambda: w[krows].float()), (lambda: w[vrows].float())
+            if not latent.ENABLED:
+                kv_k, kv_v = dense(w[krows]), dense(w[vrows])
         else:
             w, s, b = trip(p + "kv_b_proj")
-            kv_k = make_q4(w[krows], s[krows], b[krows])
-            kv_v = make_q4(w[vrows], s[vrows], b[vrows])
+            if not latent.ENABLED:
+                kv_k = make_q4(w[krows], s[krows], b[krows])
+                kv_v = make_q4(w[vrows], s[vrows], b[vrows])
         if not latent.ENABLED:
             absorb = None
-        elif exl3:
-            absorb = latent.AbsorbW.from_rows(full_k(), full_v(), HL)
+        elif exl3:                        # TF_GLM_KVB: bf16 as stored, or fp8 / q4 (lossy, half / a quarter the bytes)
+            absorb = latent.from_bf16(w[krows], w[vrows], HL, kvb)
         elif cfg.group_size == 64:        # the checkpoint's own 4-bit rows, read as they are stored
             absorb = latent.AbsorbQ4((w[krows], s[krows], b[krows]), (w[vrows], s[vrows], b[vrows]), HL)
         else:
@@ -417,9 +435,10 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
         vl = cfg.vocab // world
         draft_head = None
         if exl3:
-            head = make_b16(rd.get("lm_head.weight")[rank * vl:(rank + 1) * vl].to(dev))
-            # Draft steps use the quantized head; verification keeps the original head.
-            draft_head = quantize4(head.weight)
+            raw = rd.get("lm_head.weight")[rank * vl:(rank + 1) * vl].to(dev)
+            head = dense(raw)
+            # Draft steps use a 4-bit copy (TF_GLM_DRAFT_QUANT: minmax or mse ranges); verification keeps the head.
+            draft_head = draft_quantize4(raw)
         else:
             hw, hs, hb = (rd.get("lm_head." + x) for x in ("weight", "scales", "biases"))
             head = make_q4(as_i32(hw[rank * vl:(rank + 1) * vl]).to(dev), hs[rank * vl:(rank + 1) * vl].to(dev),

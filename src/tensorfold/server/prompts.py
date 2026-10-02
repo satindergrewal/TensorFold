@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import threading
 from typing import Any
 
-from tensorfold.server.errors import CapacityError, RequestError
+from tensorfold.server.errors import CapacityError, RequestError, refusal
 from tensorfold.server.messages import _normalize_tool_call_arguments, normalize_messages
 
 
@@ -18,7 +18,7 @@ class RenderedPrompt:
 
 def has_images(messages):
     return any(isinstance(m, dict) and isinstance(m.get('content'), list)
-               and any(isinstance(p, dict) and p.get('type') == 'image_url' for p in m['content'])
+               and any(isinstance(p, dict) and p.get('type') in ('image_url', 'video_url') for p in m['content'])
                for m in messages or [])
 
 
@@ -40,21 +40,41 @@ def image_slot():
 
 
 def prepare_images(frontend, messages, render, *, context_limit=None):
-    from tensorfold.vision.images import ImageInputError, load_images, split_images
+    from tensorfold.vision.images import DEFAULT_LIMITS, ImageInputError, load_images, split_images
 
     if frontend is None:
         raise RequestError('image input requires a supported vision checkpoint served with --vision')
     allow_urls = bool(getattr(frontend, 'allow_urls', False))
+    videos = bool(getattr(frontend, 'videos', False))       # a frontend that encodes video frames too
+    # a frontend's own limits (GLM: up to 50 pictures and 4 clips a request); the shared ones otherwise
+    limits = getattr(frontend, 'image_limits', None) or DEFAULT_LIMITS
     try:
-        template, sources = split_images(messages, allow_urls=allow_urls)
+        template, sources = split_images(messages, limits=limits, allow_urls=allow_urls, allow_videos=videos,
+                                         max_videos=getattr(frontend, 'max_videos', None))
     except (ImageInputError, ValueError) as exc:
         raise RequestError(str(exc)) from exc
     slot = image_slot()
     try:
-        images = load_images(sources, allow_urls=allow_urls)
-        prepared = frontend.prepare(render(template), images, max_prompt_tokens=context_limit)
+        from tensorfold.vision.images import ImageSource
+
+        pictures = [s for s in sources if isinstance(s, ImageSource)]
+        if hasattr(frontend, 'load_images'):              # a frontend that fits each picture as it decodes it
+            images = frontend.load_images(pictures)
+        else:
+            images = load_images(pictures, limits=limits, allow_urls=allow_urls)
+        clips = [s for s in sources if not isinstance(s, ImageSource)]
+        if clips:
+            if hasattr(frontend, 'load_videos'):             # a frontend with its own frame sampling
+                clips = frontend.load_videos(clips)
+            else:
+                from tensorfold.vision.videos import load_videos
+
+                clips = load_videos(clips, frontend.video_size, allow_urls=allow_urls)
+            prepared = frontend.prepare(render(template), images, videos=clips, max_prompt_tokens=context_limit)
+        else:
+            prepared = frontend.prepare(render(template), images, max_prompt_tokens=context_limit)
     except (ImageInputError, ValueError, ImportError) as exc:
-        raise RequestError(str(exc)) from exc
+        raise refusal(str(exc)) from exc               # a prompt past the window: context_length_exceeded
     finally:
         slot.release()
     return RenderedPrompt(list(prepared.token_ids), vision=prepared)

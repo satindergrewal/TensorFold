@@ -1,4 +1,5 @@
-"""NCCL all-gather on the current stream so CUDA graphs capture it; a rank-order sum after it keeps ranks bit-equal."""
+"""NCCL all-gather (and paired send/receive) on the current stream so CUDA graphs capture it; a rank-order sum after
+it keeps ranks bit-equal."""
 
 from __future__ import annotations
 
@@ -47,6 +48,11 @@ class NCCL:
         lib.ncclCommInitRank.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_int, _UniqueId, ctypes.c_int]
         lib.ncclAllGather.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p,
                                       ctypes.c_void_p]
+        for name in ("ncclSend", "ncclRecv"):
+            getattr(lib, name).argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int,
+                                           ctypes.c_void_p, ctypes.c_void_p]
+        lib.ncclGroupStart.argtypes = []
+        lib.ncclGroupEnd.argtypes = []
         self.store = TCPStore(master, port, world, rank == 0, timeout=timedelta(seconds=600))
         uid = _UniqueId()
         if rank == 0:
@@ -96,6 +102,25 @@ class NCCL:
                                    "a lock names the lock there)")
             print(f"[tensorfold] rank {self.rank} finished {label}; waiting for rank {missing} ({waited:.0f} s)",
                   flush=True)
+
+    def exchange(self, sends: list[torch.Tensor], recvs: list[torch.Tensor], peer: int) -> None:
+        """One NCCL group on the current stream: every ``sends[i]`` to ``peer`` and ``recvs[i]`` from it (contiguous
+        tensors; the peer's matching call has the same count, sizes and dtypes in the same order)."""
+
+        if len(sends) != len(recvs) or peer == self.rank or not 0 <= peer < self.world:
+            raise ValueError("exchange: one receive per send, from another rank")
+        for s, r in zip(sends, recvs):
+            if s.numel() != r.numel() or s.dtype != r.dtype or not (s.is_contiguous() and r.is_contiguous()):
+                raise ValueError("exchange: each send and receive must be contiguous and alike in size and dtype")
+        stream = torch.cuda.current_stream().cuda_stream
+        self._check(self.lib.ncclGroupStart())
+        try:
+            for s, r in zip(sends, recvs):
+                if s.numel():
+                    self._check(self.lib.ncclSend(s.data_ptr(), s.numel(), _DTYPES[s.dtype], peer, self.comm, stream))
+                    self._check(self.lib.ncclRecv(r.data_ptr(), r.numel(), _DTYPES[r.dtype], peer, self.comm, stream))
+        finally:
+            self._check(self.lib.ncclGroupEnd())
 
     def barrier(self) -> None:
         x = torch.zeros((1,), dtype=torch.float32, device="cuda")

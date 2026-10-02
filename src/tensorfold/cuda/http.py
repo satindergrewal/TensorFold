@@ -18,6 +18,9 @@ if TYPE_CHECKING:
     from tensorfold.cuda.server import App
 
 
+_TOKENIZER_ROUTES = ("/tokenize", "/v1/tokenize", "/detokenize", "/v1/detokenize")
+
+
 def usage_of(result: dict[str, Any]) -> dict[str, Any]:
     """A reply's usage as the Mac server reports it, the prompt tokens found cached included."""
 
@@ -69,8 +72,19 @@ def make_handler(app: App):
             if route in ("/metrics", "/v1/metrics"):
                 return metrics.send(self, app)
             if self.path.rstrip("/") in ("/v1/models", "/models"):
-                self._json(200, {"object": "list", "data": [{"id": model_id, "object": "model", "owned_by": "tensorfold"}
-                                                            for model_id in app.model_ids]})
+                created = int(time.time())
+                snap = health.of(app).snapshot(app)
+                permission = [{"id": f"modelperm-{model_id}", "object": "model_permission", "created": created,
+                               "allow_create_engine": False, "allow_sampling": True, "allow_logprobs": True,
+                               "allow_search_indices": False, "allow_view": True, "allow_fine_tuning": False,
+                               "organization": "*", "group": None, "is_blocking": False}
+                              for model_id in app.model_ids]
+                self._json(200, {"object": "list", "data": [{"id": model_id, "object": "model", "created": created,
+                                                             "owned_by": "tensorfold",
+                                                             "root": str(app.model_dir or "/model"), "parent": None,
+                                                             "max_model_len": int(snap.get("context_length") or 0),
+                                                             "permission": [perm]}
+                                                            for model_id, perm in zip(app.model_ids, permission)]})
             elif self.path.rstrip("/") in ("/health", "/v1/health"):
                 self._json(200, health.of(app).snapshot(app))
             elif responses.route(self.path):
@@ -85,22 +99,34 @@ def make_handler(app: App):
             if responses.route(self.path) == "":         # a Response: this handler's chat completion, translated
                 return responses.post(self, app)
             chat = self.path.rstrip("/").endswith("/chat/completions")
-            if not chat and not self.path.rstrip("/").endswith("/completions"):
+            tokenizer = self.path.rstrip("/") in _TOKENIZER_ROUTES
+            if not chat and not tokenizer and not self.path.rstrip("/").endswith("/completions"):
                 return self._json(404, {"error": "not found"})
             try:
                 length = int(self.headers.get("Content-Length", 0))
-                if not 0 <= length <= 32 * 1024**2:
+                if not 0 <= length <= 96 * 1024**2:          # up to 50 pictures or 4 clips as data URLs
                     self.close_connection = True             # the unread body must not reach the next request
-                    return self._json(400, {"error": {"message": "request body exceeds the 32 MiB limit",
+                    return self._json(400, {"error": {"message": "request body exceeds the 96 MiB limit",
                                                       "type": "invalid_request_error"}})
                 body = json.loads(self.rfile.read(length) or b"{}")
             except (json.JSONDecodeError, UnicodeDecodeError):
                 return self._json(400, {"error": {"message": "the request body is not JSON", "type": "invalid_request_error"}})
+            if tokenizer:                                   # vLLM's /tokenize and /detokenize
+                try:
+                    reply = (app.detokenize(body) if self.path.rstrip("/").endswith("/detokenize")
+                             else app.tokenize(body))
+                except RequestError as exc:
+                    return self._json(400, {"error": {"message": str(exc), "type": "invalid_request_error"}})
+                except Exception as exc:
+                    _log_error(exc)
+                    return self._json(400, {"error": {"message": _error_message(exc)}})
+                return self._json(200, reply)
+            field = "messages" if chat else "prompt"            # the field an error's code names (OpenAI's param)
             try:
                 prepared = app.prepare(body, chat)
             except RequestError as exc:
                 return self._json(503 if isinstance(exc, CapacityError) else 400,
-                                  {"error": error_body(exc)})
+                                  {"error": error_body(exc, field)})
             except Exception as exc:        # any other failure to read the request is refused too, as on MLX
                 _log_error(exc)
                 return self._json(400, {"error": {"message": _error_message(exc)}})
@@ -142,12 +168,14 @@ def make_handler(app: App):
                     self.close_connection = True
                     return
                 except RequestError as exc:
-                    return self._stream_error(error_body(exc))
+                    return self._stream_error(error_body(exc, field))
                 except Exception as exc:
                     _log_error(exc)
                     return self._stream_error({"message": _error_message(exc), "type": "server_error"})
                 if result["final"]:
                     emit(result["final"])
+                for delta in result.get("call_deltas") or ():      # the end of calls streamed as they were written
+                    emit(delta)
                 if result["calls"]:
                     for i, call in enumerate(result["calls"]):
                         if i < result.get("calls_streamed", 0):      # sent as deltas already
@@ -172,7 +200,7 @@ def make_handler(app: App):
                 return
             except RequestError as exc:
                 return self._json(503 if isinstance(exc, CapacityError) else 400,
-                                  {"error": error_body(exc)})
+                                  {"error": error_body(exc, field)})
             except Exception as exc:
                 _log_error(exc)
                 try:

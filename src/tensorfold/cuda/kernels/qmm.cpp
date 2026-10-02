@@ -4,6 +4,8 @@
 bool qmm_clusters(int, bool);
 void qmm_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
               at::Tensor&, const at::Tensor&, int, int, int, int, bool, bool);
+void qmm_cfg_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                  at::Tensor&, const at::Tensor&, int, int, bool, int);
 void qmm_prefill_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, int,
                       int, bool, int);
 void qmm_prefill8w_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, int,
@@ -42,6 +44,36 @@ void qmm(const at::Tensor& x, const at::Tensor& xs, const at::Tensor& w, const a
     }
     qmm_cuda(x, xs, w, scales, biases, out, p, static_cast<int>(n), static_cast<int>(sk), static_cast<int>(gs),
              static_cast<int>(bm), f32, reduce);
+}
+
+// ``qmm`` for decode rows (M <= 16, groups of 64, K slices reduced) on tile config ``cfg`` (same bits, other speed).
+void qmm_cfg(const at::Tensor& x, const at::Tensor& xs, const at::Tensor& w, const at::Tensor& scales,
+             const at::Tensor& biases, at::Tensor& out, const c10::optional<at::Tensor>& part, int64_t n, int64_t sk,
+             bool f32, int64_t cfg) {
+    TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kBFloat16 && x.dim() == 2 && x.size(0) >= 1 &&
+                x.size(0) <= 16 && x.stride(1) == 1 && x.stride(0) >= x.size(1), "x: (M <= 16, K) bf16");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0 && (x.size(0) == 1 || x.stride(0) % 8 == 0),
+                "x rows must start on 16-byte boundaries");
+    const int64_t m = x.size(0), k = x.size(1), kg = k / 64, npad = (n + 127) / 128 * 128;
+    TORCH_CHECK(k % 64 == 0 && sk >= 1 && kg % sk == 0, "K splits into whole groups a slice");
+    TORCH_CHECK(xs.is_cuda() && xs.is_contiguous() && xs.scalar_type() == at::kFloat && xs.size(0) == m &&
+                xs.size(1) == kg, "xs: (M, K / 64) fp32");
+    TORCH_CHECK(w.is_cuda() && w.is_contiguous() && w.scalar_type() == at::kInt && w.numel() == npad * k / 8,
+                "packed weight does not match n and K");
+    TORCH_CHECK(scales.stride(1) == 1 && biases.stride(1) == 1 && scales.stride(0) >= npad &&
+                biases.stride(0) == scales.stride(0) && scales.scalar_type() == at::kBFloat16 &&
+                biases.scalar_type() == at::kBFloat16 && scales.size(0) == kg && scales.size(1) == npad,
+                "scales and biases: (K / 64, n padded to 128) bf16");
+    TORCH_CHECK(out.is_cuda() && out.is_contiguous() && out.size(0) == m && out.size(1) == n &&
+                out.scalar_type() == (f32 ? at::kFloat : at::kBFloat16), "out: (M, n)");
+    c10::cuda::CUDAGuard guard(x.device());
+    at::Tensor p;
+    if (sk > 1 && !qmm_clusters(static_cast<int>(sk), true)) {
+        p = part.has_value() ? *part : at::empty({sk, m, n}, x.options().dtype(at::kFloat));
+        TORCH_CHECK(p.is_contiguous() && p.scalar_type() == at::kFloat && p.numel() >= sk * m * n, "part");
+    }
+    qmm_cfg_cuda(x, xs, w, scales, biases, out, p, static_cast<int>(n), static_cast<int>(sk), f32,
+                 static_cast<int>(cfg));
 }
 
 // Prefill: x (M, K) bf16 times a packed 4-bit weight with each weight rounded once to bf16, one fp32 chain over K.
@@ -115,6 +147,7 @@ void qmm_prefill8w(const at::Tensor& x8, const at::Tensor& a, const at::Tensor& 
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("qmm", &qmm);
+    m.def("qmm_cfg", &qmm_cfg);
     m.def("qmm_prefill", &qmm_prefill);
     m.def("qmm_prefill8", &qmm_prefill8);
     m.def("qmm_prefill8w", &qmm_prefill8w);

@@ -56,9 +56,15 @@ __global__ void __launch_bounds__(WM * WN * 32) qmm_kernel(
         unsigned char* pw = p + T::X;
         constexpr int TILE_BYTES = 64 * GS / 2;           // one stored 64-column tile's group block
         for (int c = tid; c < T::W / 16; c += T::THREADS) {
-            const int t = c / (TILE_BYTES / 16), off = c % (TILE_BYTES / 16);
-            const size_t tile = static_cast<size_t>(n0 / 64 + t) * KG + g;
-            cp16(pw + c * 16, reinterpret_cast<const unsigned char*>(w) + tile * TILE_BYTES + off * 16);
+            if constexpr (BN >= 64) {
+                const int t = c / (TILE_BYTES / 16), off = c % (TILE_BYTES / 16);
+                const size_t tile = static_cast<size_t>(n0 / 64 + t) * KG + g;
+                cp16(pw + c * 16, reinterpret_cast<const unsigned char*>(w) + tile * TILE_BYTES + off * 16);
+            } else {                                      // part of a stored tile: its n8 tiles are contiguous
+                const size_t tile = static_cast<size_t>(n0 / 64) * KG + g;
+                cp16(pw + c * 16, reinterpret_cast<const unsigned char*>(w) + tile * TILE_BYTES + (n0 % 64) * GS / 2 +
+                                  c * 16);
+            }
         }
         unsigned char* ps = pw + T::W;
         for (int c = tid; c < 2 * (T::S / 16); c += T::THREADS) {
@@ -292,11 +298,58 @@ void dispatch(int bm, const at::Tensor& x, const at::Tensor& xs, const at::Tenso
     }
 }
 
+// Decode rows (a 16-row tile) on other column tiles, warps and stage counts: every output's chain (groups in order
+// within its K slice, slices added in order) is qmm_kernel's, so every choice gives the same bits.
+template <bool F32, bool CLUSTER>
+void dispatch_cfg(int cfg, const at::Tensor& x, const at::Tensor& xs, const at::Tensor& w, const at::Tensor& s,
+                  const at::Tensor& b, at::Tensor& out, const at::Tensor& part, int N, int SK) {
+    switch (cfg) {
+        case 0: launch<64, 16, 64, 1, 4, 4, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
+        case 1: launch<64, 16, 128, 1, 4, 4, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
+        case 2: launch<64, 16, 128, 1, 8, 4, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
+        case 3: launch<64, 16, 64, 1, 4, 8, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
+        case 4: launch<64, 16, 128, 1, 4, 6, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
+        case 5: launch<64, 16, 64, 1, 2, 6, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
+        case 6: launch<64, 16, 128, 1, 8, 6, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
+        case 7: launch<64, 16, 64, 1, 4, 6, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
+        case 8: launch<64, 16, 64, 1, 4, 4, F32, CLUSTER, true>(x, xs, w, s, b, out, part, N, SK); break;
+        case 9: launch<64, 16, 128, 1, 4, 6, F32, CLUSTER, true>(x, xs, w, s, b, out, part, N, SK); break;
+        case 10: launch<64, 16, 64, 1, 2, 8, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
+        case 11: launch<64, 16, 128, 1, 2, 6, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
+        case 12: launch<64, 16, 32, 1, 4, 4, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
+        case 13: launch<64, 16, 32, 1, 2, 6, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
+        case 14: launch<64, 16, 32, 1, 4, 8, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
+        case 15: launch<64, 16, 32, 1, 1, 6, F32, CLUSTER>(x, xs, w, s, b, out, part, N, SK); break;
+        default: TORCH_CHECK(false, "qmm_cfg: tile config 0-15");
+    }
+}
+
 } // namespace
 
 // Clusters hold up to 8 K slices (the portable size) from sm_90; more, unreduced slices or older GPUs use the buffer.
 bool qmm_clusters(int SK, bool reduce) {
     return SK > 1 && SK <= 8 && reduce && at::cuda::getCurrentDeviceProperties()->major >= 9;
+}
+
+// ``qmm_cuda`` for decode rows (M <= 16, groups of 64, K slices reduced) on tile config ``cfg``.
+void qmm_cfg_cuda(const at::Tensor& x, const at::Tensor& xs, const at::Tensor& w, const at::Tensor& scales,
+                  const at::Tensor& biases, at::Tensor& out, const at::Tensor& part, int N, int SK, bool f32, int cfg) {
+    const int M = x.size(0);
+    TORCH_CHECK(M <= 16, "qmm_cfg: decode rows (up to 16)");
+    const bool cluster = qmm_clusters(SK, true);
+    if (f32) { if (cluster) dispatch_cfg<true, true>(cfg, x, xs, w, scales, biases, out, part, N, SK);
+               else dispatch_cfg<true, false>(cfg, x, xs, w, scales, biases, out, part, N, SK); }
+    else { if (cluster) dispatch_cfg<false, true>(cfg, x, xs, w, scales, biases, out, part, N, SK);
+           else dispatch_cfg<false, false>(cfg, x, xs, w, scales, biases, out, part, N, SK); }
+    if (SK > 1 && !cluster) {
+        const long long total = static_cast<long long>(M) * N;
+        const int threads = 256;
+        const int blocks = static_cast<int>((total + threads - 1) / threads);
+        auto stream = at::cuda::getCurrentCUDAStream();
+        if (f32) reduce_kernel<true><<<blocks, threads, 0, stream>>>(part.data_ptr<float>(), out.data_ptr(), total, SK);
+        else reduce_kernel<false><<<blocks, threads, 0, stream>>>(part.data_ptr<float>(), out.data_ptr(), total, SK);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
 }
 
 void qmm_cuda(const at::Tensor& x, const at::Tensor& xs, const at::Tensor& w, const at::Tensor& scales,

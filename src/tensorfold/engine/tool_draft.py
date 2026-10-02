@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any, Sequence
 
-from tensorfold.tool_parameters import decode_parameter, parameter_schemas, typed_parameter
+from tensorfold.tool_parameters import decode_parameter, nullable_text, parameter_schemas, typed_parameter
 
 _OPEN = "<tool_call>"
 _END = "\x00end"  # placeholder: after a closed call the draft is the end-of-turn token
@@ -252,6 +252,7 @@ class ToolCallStreamer:
         self.schemas = parameter_schemas(tools)
         self.current_schema = {}
         self.typed = False
+        self.maybe_null = False     # a nullable text value that may still be ``null``: held in value_buffer
         self.value_buffer = ""
         self.known = {name.lower(): name for name in tool_schema(tools)}
         self.pos = 0
@@ -307,9 +308,10 @@ class ToolCallStreamer:
                 if m is not None:
                     self.value_schema = self.current_schema.get(m.group(1).strip(), {})
                     self.typed = typed_parameter(self.value_schema)
+                    self.maybe_null = not self.typed and nullable_text(self.value_schema)
                     self.value_buffer = ""
-                    out.append(self._args(("," if self.args_open else "{")
-                                          + self._esc_key(m.group(1).strip()) + (':' if self.typed else ':"')))
+                    out.append(self._args(("," if self.args_open else "{") + self._esc_key(m.group(1).strip())
+                                          + (':' if self.typed or self.maybe_null else ':"')))
                     self.args_open = True
                     self.pos += m.end()
                     self.state = "value"
@@ -339,11 +341,16 @@ class ToolCallStreamer:
                     self.held = piece[len(keep):]
                 if self.typed:
                     self.value_buffer += keep
+                elif self.maybe_null:
+                    self.value_buffer += keep
+                    if not "null".startswith(self.value_buffer):    # text after all: the held part first
+                        out.append(self._args('"' + self._esc(self.value_buffer)))
+                        self.value_buffer, self.maybe_null = "", False
                 elif keep:
                     out.append(self._args(self._esc(keep)))
                 if end < 0:
                     break
-                if self.typed:
+                if self.typed or self.maybe_null:
                     import json
                     out.append(self._args(json.dumps(decode_parameter(self.value_buffer, self.value_schema), ensure_ascii=False)))
                 else:

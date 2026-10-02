@@ -21,18 +21,48 @@ from .weights import Weights
 EDGE = 0.6        # the selector's edge score weight in a chain pick
 NOISE = 0.7       # the target's keyed noise weight when sampling
 NO_LIMIT = 1e30
+# the noise-aware stop rules' temperature B (fnc<N>:<p>, fcost<N>:noisy): draft_sim's NoisyPredictor beta, fitted by
+# log loss (``fit_beta``, its grid) on the 9 teacher-forced dumps of 2026-09-30 (7 sampled prose, 2 greedy code):
+# 2.0 on all of them, on the sampled ones alone and on the greedy ones alone (a finer grid: 1.8, log loss -0.2%)
+NOISY_BETA = 2.0
+
+
+def noisy_confidence(score: np.ndarray, noise: np.ndarray | None, j: int, beta: float) -> float:
+    """softmax((score + g) / beta) at the pick j, g the target's keyed Gumbel draws for the candidates (None: greedy,
+    softmax(score / beta)): the chance the target's keyed sample is the pick when its scaled logits are the drafter's
+    plus iid Gumbel(beta) errors. draft_sim's ``noisy_prob`` feature, the same float64 operations in the same order."""
+
+    z = score + noise if noise is not None else score
+    z = z / beta
+    e = np.exp(z - z.max())
+    return float(e[j] / e.sum())
+
+
+def best_depth(q, round_ms) -> int:
+    """The k (0..len(q)) maximizing E[tokens | k drafts] / round_ms[k], q the drafts' conditional acceptances
+    (``draft_sim.best_depth`` with round_ms[k] = its Costs.round_ms(k, 1, True))."""
+
+    alive = np.concatenate([[1.0], np.cumprod(np.asarray(q, dtype=np.float64))])
+    expect = np.cumsum(alive)
+    ms = np.asarray(round_ms[:len(q) + 1], dtype=np.float64)
+    return int(np.argmax(expect / ms))
 
 
 @triton.jit
 def _dconv_kernel(X, DYN, BASE, RES, OUT, D: tl.constexpr, G: tl.constexpr, GS: tl.constexpr,
-                  BRANCH: tl.constexpr, HAS_RES: tl.constexpr, BLOCK: tl.constexpr):
-    """Two-tap grouped dynamic convolution over the block (row r mixes rows r and r - 1), plus the residual."""
+                  BRANCH: tl.constexpr, HAS_RES: tl.constexpr, BLOCK: tl.constexpr, SEG: tl.constexpr = 0):
+    """Two-tap grouped dynamic convolution over the block (row r mixes rows r and r - 1), plus the residual; SEG > 0:
+    the rows are blocks of SEG rows side by side (``dflash2_multi``), each block's first row mixing no row before."""
 
     row = tl.program_id(0)
     c = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     ok = c < D
     x = tl.load(X + row * D + c, mask=ok, other=0.0).to(tl.float32)
-    prev = tl.load(X + (row - 1) * D + c, mask=ok & (row > 0), other=0.0).to(tl.float32)
+    if SEG > 0:
+        has_prev = row % SEG != 0
+    else:
+        has_prev = row > 0
+    prev = tl.load(X + (row - 1) * D + c, mask=ok & has_prev, other=0.0).to(tl.float32)
     grp = c // GS
     d0 = tl.load(DYN + ((row * 2 + BRANCH) * 2) * G + grp, mask=ok, other=0.0).to(tl.float32)
     d1 = tl.load(DYN + ((row * 2 + BRANCH) * 2 + 1) * G + grp, mask=ok, other=0.0).to(tl.float32)
@@ -132,25 +162,40 @@ def _dattn_kernel(Q, K, V, OUT, POS, window, scale, N: tl.constexpr, G: tl.const
 
 
 def _dconv(x: torch.Tensor, dyn: torch.Tensor, base: torch.Tensor, branch: int, group_size: int,
-           residual: torch.Tensor | None = None) -> torch.Tensor:
+           residual: torch.Tensor | None = None, seg: int = 0) -> torch.Tensor:
     rows, d = x.shape
     x = x.contiguous()
     out = torch.empty_like(x)
     block = 1024
     _dconv_kernel[(rows, triton.cdiv(d, block))](x, dyn.contiguous(), base, residual if residual is not None else x,
                                                  out, D=d, G=d // group_size, GS=group_size, BRANCH=branch,
-                                                 HAS_RES=residual is not None, BLOCK=block, num_warps=4)
+                                                 HAS_RES=residual is not None, BLOCK=block, SEG=seg, num_warps=4)
     return out
 
 
 def _quantize4(w: torch.Tensor) -> qmm.Q4:
-    """bf16 (N, K) -> MLX-style affine 4-bit in groups of 64 along K, tiled (``qmm.quantize4``)."""
+    """bf16 (N, K) -> MLX-style affine 4-bit in groups of 64 along K, tiled: min / max ranges (``qmm.quantize4``) or,
+    with TF_GLM_DRAFT_QUANT=mse, least-squares clipped ones (``qmm.quantize4_mse``). Drafts only: replies keep."""
 
-    return qmm.quantize4(w)
+    return qmm.draft_quantize4(w)
 
 
 def _mm(x: torch.Tensor, w: qmm.Q4, xs: torch.Tensor | None = None, *, f32: bool = False) -> torch.Tensor:
     return qmm.matmul(x, w, xs, f32=f32)
+
+
+def merge_candidates(g: torch.Tensor, proj: torch.Tensor, k: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """A block pass's host rows -> (ids [depth, k], logits, projected rows): ``g`` [ranks, depth, 2 * k] (each rank's
+    top-k values, then ids as fp32 bits), merged by value then id over the ranks; ``proj`` [depth, selector rank]."""
+
+    values = torch.cat([g[r, :, :k] for r in range(g.shape[0])], dim=1).numpy().astype(np.float64)
+    tokens = torch.cat([g[r, :, k:].contiguous().view(torch.int32) for r in range(g.shape[0])],
+                       dim=1).numpy().astype(np.int64)
+    if g.shape[0] > 1:
+        order = np.lexsort((tokens, -values), axis=-1)[:, :k]
+        values = np.take_along_axis(values, order, axis=1)
+        tokens = np.take_along_axis(tokens, order, axis=1)
+    return tokens, values, proj.numpy().astype(np.float64)          # astype copies: nothing keeps the host buffer
 
 
 @dataclass
@@ -174,8 +219,10 @@ class Drafter:
     """Draft one sequence from position-indexed context using device lengths and static buffers shared by eager execution and CUDA graphs."""
 
     def __init__(self, draft_dir: str | Path, w: Weights, *, block: int | None = None, capacity: int = 2560,
-                 ring: bool = False) -> None:
-        """``ring`` (TF_GLM_DRAFT_RING): the context in a ring of the window and block, the same drafts."""
+                 tap_rows: int = 0, ring: bool = False) -> None:
+        """``tap_rows``: context updates up to this many rows (a verify window's kept rows) replay captured graphs too
+        (the block's own size always does). ``ring`` (TF_GLM_DRAFT_RING): the context in a ring of the window and
+        block, the same drafts."""
 
         path = Path(draft_dir)
         cfg = json.loads((path / "config.json").read_text())
@@ -267,11 +314,20 @@ class Drafter:
         self.ids_host = torch.zeros((1,), dtype=torch.int32, pin_memory=torch.cuda.is_available())
         self.ar = torch.arange(max(64, n), device=dev)
         self.tap_in = torch.zeros((64, len(self.tap_layers) * self.D), dtype=torch.bfloat16, device=dev)
-        self.packed: torch.Tensor | None = None       # [world, block - 1, 2 * top_k] after a pass
-        self.proj: torch.Tensor | None = None         # [block - 1, selector rank] fp32
+        # a pass's candidates (every rank's [block - 1, 2 * top_k], values then ids as fp32 bits) and projected rows
+        # [block - 1, selector rank] fp32 in one device buffer, read back by one pinned copy (``candidates``)
+        self.gathered = self.world if self.world > 1 and w.comm is not None else 1
+        self.cand_n = self.gathered * (n - 1) * 2 * self.top_k
+        cuda = torch.cuda.is_available()
+        self.cand = torch.zeros((self.cand_n + (n - 1) * self.hproj.shape[0],), dtype=torch.float32, device=dev)
+        self.cand_host = torch.zeros(self.cand.shape, dtype=torch.float32, pin_memory=cuda)
+        self.cand_ready = torch.cuda.Event() if cuda else None
+        self.packed = self.cand[:self.cand_n].view(self.gathered, n - 1, 2 * self.top_k)
+        self.proj = self.cand[self.cand_n:].view(n - 1, self.hproj.shape[0])
         self.pool = None
         self.block_graph = None
         self.tap_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self.tap_rows = min(max(self.block, int(tap_rows)), self.tap_in.shape[0])
 
     def nbytes(self) -> int:
         total = sum(q.nbytes() for L in self.layers for q in (L.a_kp, L.m_kp, L.qkv, L.kv, L.o, L.gu, L.down))
@@ -389,23 +445,21 @@ class Drafter:
         vals, local = torch.topk(logits.float(), self.top_k, dim=-1)
         gids = (local + self.w.vocab_offset).to(torch.int32)
         packed = torch.cat([vals, gids.view(torch.float32)], dim=1).contiguous()
-        if self.world > 1 and self.w.comm is not None:
-            got = torch.empty((self.world * packed.numel(),), dtype=torch.float32, device=self.dev)
-            self.w.comm.all_gather(packed.view(-1), got)
-            self.packed = got.view(self.world, n - 1, 2 * self.top_k)
+        if self.gathered > 1:
+            self.w.comm.all_gather(packed.view(-1), self.cand[:self.cand_n])
         else:
-            self.packed = packed.view(1, n - 1, 2 * self.top_k)
-        self.proj = F.linear(h, self.hproj).float()
+            self.cand[:self.cand_n].copy_(packed.view(-1))
+        self.proj.copy_(F.linear(h, self.hproj).float())
 
     @torch.no_grad()
     def capture(self) -> None:
-        """CUDA graphs for the block pass and for context updates of 1..block rows (both ranks together)."""
+        """CUDA graphs for the block pass and for context updates of 1..tap_rows rows (both ranks together)."""
 
         self.pool = torch.cuda.graph_pool_handle()
         self.reset()
         self.tap_in.zero_()
         self.ids[0] = 0
-        for n in range(1, self.block + 1):
+        for n in range(1, self.tap_rows + 1):
             for _ in range(2):
                 self._taps_compute(n)
             torch.cuda.synchronize()
@@ -434,20 +488,27 @@ class Drafter:
             self.block_graph.replay()
         else:
             self._block_compute()
-        g = self.packed[:, :depth].cpu()
-        k = self.top_k
-        values = torch.cat([g[r, :, :k] for r in range(g.shape[0])], dim=1).numpy().astype(np.float64)
-        tokens = torch.cat([g[r, :, k:].contiguous().view(torch.int32) for r in range(g.shape[0])],
-                           dim=1).numpy().astype(np.int64)
-        if g.shape[0] > 1:
-            order = np.lexsort((tokens, -values), axis=-1)[:, :k]
-            values = np.take_along_axis(values, order, axis=1)
-            tokens = np.take_along_axis(tokens, order, axis=1)
-        return tokens, values, self.proj[:depth].cpu().numpy().astype(np.float64)
+        # one pinned copy of candidates and projected rows (two .cpu() calls were two syncs and two pageable copies)
+        if self.cand_ready is not None:
+            self.cand_host.copy_(self.cand, non_blocking=True)
+            self.cand_ready.record()
+            self.cand_ready.synchronize()
+        else:
+            self.cand_host.copy_(self.cand)
+        g = self.cand_host[:self.cand_n].view(self.gathered, self.block - 1, 2 * self.top_k)[:, :depth]
+        proj = self.cand_host[self.cand_n:].view(self.block - 1, -1)[:depth]
+        return merge_candidates(g, proj, self.top_k)
 
     def chain(self, tokens: np.ndarray, values: np.ndarray, proj: np.ndarray, anchor: int, first: int,
-              sampling: Sampling | None, confidence: float = 0.0) -> list[int]:
-        """Choose candidates with selector edges and target keyed noise; stop below cumulative confidence, always keeping the first draft."""
+              sampling: Sampling | None, confidence: float = 0.0, *, beta: float = 0.0,
+              round_ms: tuple[float, ...] | None = None, confs: list | None = None) -> list[int]:
+        """Choose candidates with selector edges and target keyed noise; stop below cumulative confidence, always
+        keeping the first draft. ``beta`` > 0: the confidences are noise-aware (``noisy_confidence``); with
+        ``round_ms`` (ms of a round of k drafts, k = 0..) the chain is walked whole and cut at ``best_depth`` of
+        them instead (``confidence`` unused). Only where the chain stops changes: the picks are the same. ``confs``
+        (a list): the chain is walked whole and each pick's confidence (noise-aware with ``beta``, else the
+        softmax share of its score) appended to it, for a caller that cuts the chains itself (``multi``'s joint
+        allocation)."""
 
         depth = tokens.shape[0]
         sampled = sampling is not None and sampling.temperature > 0
@@ -455,27 +516,50 @@ class Drafter:
         noise = None
         if sampled:
             noise = -np.log(-np.log(uniform_rows(sampling.seed, first + np.arange(depth), tokens)))
+        noisy = beta > 0
         out: list[int] = []
+        conf: list[float] = []
         prev, chain = anchor, 1.0
         for d in range(depth):
             edge = self.succ[tokens[d]].astype(np.float64) @ (self.pred[prev].astype(np.float64) * proj[d])
             score = (values[d] + EDGE * edge) / temp
             pick = score + NOISE * noise[d] if noise is not None else score
             j = int(np.argmax(pick))
-            if confidence > 0:
+            if confs is not None:
+                if noisy:
+                    confs.append(noisy_confidence(score, noise[d] if noise is not None else None, j, beta))
+                else:
+                    p = np.exp(score - score.max())
+                    confs.append(float(p[j] / p.sum()))
+            elif noisy:
+                c = noisy_confidence(score, noise[d] if noise is not None else None, j, beta)
+                if round_ms is not None:
+                    conf.append(c)
+                else:
+                    chain *= c
+                    if d > 0 and chain < confidence:
+                        break
+            elif confidence > 0:
                 p = np.exp(score - score.max())
                 chain *= float(p[j] / p.sum())
                 if d > 0 and chain < confidence:
                     break
             prev = int(tokens[d, j])
             out.append(prev)
+        if noisy and round_ms is not None and confs is None:
+            out = out[:best_depth(conf, round_ms)]
         return out
 
-    def propose(self, pending: int, depth: int, sampling: Sampling | None, confidence: float = 0.0) -> list[int]:
-        """Up to ``depth`` drafts for the positions after the pending token (which sits at context_end)."""
+    def propose(self, pending: int, depth: int, sampling: Sampling | None, confidence: float = 0.0, *,
+                beta: float = 0.0, round_ms: tuple[float, ...] | None = None) -> list[int]:
+        """Up to ``depth`` drafts for the positions after the pending token (which sits at context_end); ``beta``,
+        ``round_ms``: the noise-aware stop rules (``chain``)."""
 
         depth = min(depth, self.block - 1)
         if depth < 1 or self.context_end == 0:
             return []
         tokens, values, proj = self.candidates(pending, depth)
+        if beta > 0:
+            return self.chain(tokens, values, proj, pending, self.context_end + 1, sampling, confidence, beta=beta,
+                              round_ms=round_ms)
         return self.chain(tokens, values, proj, pending, self.context_end + 1, sampling, confidence)

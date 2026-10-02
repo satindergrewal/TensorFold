@@ -20,7 +20,7 @@ def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_experts_v7", sources=[str(here / "experts.cpp"), str(here / "experts.cu"),
+    return load(name="tensorfold_experts_v8", sources=[str(here / "experts.cpp"), str(here / "experts.cu"),
                                                         str(here / "experts_prefill.cu"), str(here / "experts_pack.cu")],
                 extra_cuda_cflags=["-O3"], verbose=False)
 
@@ -102,10 +102,10 @@ class Plan:
     """Scratch grouping pairs by expert: members, items (expert, first, count), counts [items, distinct experts]."""
 
     def __init__(self, rows: int, slots: int, experts: int, device: torch.device | str, *,
-                 prefill: bool = False) -> None:
+                 prefill: bool = False, tile: int | None = None) -> None:
         pairs = rows * slots
         self.rows, self.slots, self.experts, self.prefill = rows, slots, experts, prefill
-        self.tile = PREFILL_TILE if prefill else TILE     # ``route`` sets a prompt plan's to its consumer's
+        self.tile = tile or (PREFILL_TILE if prefill else TILE)   # ``route`` sets a prompt plan's to its consumer's
         self.members = torch.zeros((pairs,), dtype=torch.int32, device=device)
         self.items = torch.zeros((max_items(pairs, experts, TILE), 3), dtype=torch.int32, device=device)
         self.counts = torch.zeros((2,), dtype=torch.int32, device=device)

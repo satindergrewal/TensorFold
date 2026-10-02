@@ -2,22 +2,51 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Callable
 
 from tensorfold.cuda.server import App, PreparedRequest, RequestError
-from tensorfold.families.glm5_next.prompts import thinking_off
+from tensorfold.server.errors import CONTEXT_LIMIT
+from tensorfold.families.glm5_next.cuda.kept_reasoning import KeptReasoning
+from tensorfold.families.glm5_next.prompts import agent_history, thinking_off
 
 
 class ThinkingOffTemplate:
-    """The checkpoint template as GLM-5.3's thinking-off template renders it (``prompts.thinking_off``)."""
+    """The checkpoint's chat template, rendered as GLM-5.3's thinking-off template renders it when thinking is off
+    (``prompts.thinking_off``, as the Mac's tokenizer renders it), an agent's history made renderable first
+    (``prompts.agent_history``), with the reasoning of tool-calling steps the client dropped put back (``kept``,
+    ``kept_reasoning.KeptReasoning``; None: off)."""
 
-    def __init__(self, inner) -> None:
+    def __init__(self, inner, kept: KeptReasoning | None = None) -> None:
         self.inner = inner
         self.efforts = getattr(inner, "efforts", frozenset())
+        self.kept = kept
 
-    def render(self, messages, *, tools, enable_thinking, extra=None) -> str:
-        text = self.inner.render(messages, tools=tools, enable_thinking=enable_thinking, extra=extra)
+    def render(self, messages, *, tools, enable_thinking, extra=None, allow_images: bool = False) -> str:
+        if self.kept is not None:
+            messages = self.kept.restore(messages)
+        text = self.inner.render(agent_history(messages), tools=tools, enable_thinking=enable_thinking, extra=extra,
+                                 allow_images=allow_images)
         return text if enable_thinking else thinking_off(text)
+
+
+# the checkpoint's template answers a picture or clip with this reminder; with --vision it writes GLM's markers instead
+# (Glm5NextProcessor's layout), and every text-only prompt renders as before
+_NO_MEDIA = ('{{- "<reminder>You are unable to process this " ~ media_type ~ " because you don\'t have multi-modal '
+             'input ability. Try different methods.</reminder>" }}')
+_MEDIA = ("{%- if media_type == 'image' -%}<|begin_of_image|><|image|><|end_of_image|>"
+          "{%- elif media_type == 'video' -%}<|begin_of_video|><|video|><|end_of_video|>"
+          "{%- else -%}" + _NO_MEDIA + "{%- endif -%}")
+
+
+def media_template(inner, model_dir) -> None:
+    """Swap the checkpoint template's no-media reminder for GLM's image and video markers."""
+
+    source = (model_dir / "chat_template.jinja").read_text()
+    if source.count(_NO_MEDIA) != 1:
+        raise ValueError("--vision: this checkpoint's chat template has no media branch TensorFold knows how to "
+                         "extend (GLM-5.3 Flash's chat_template.jinja)")
+    inner.template = inner.template.environment.from_string(source.replace(_NO_MEDIA, _MEDIA))
 
 
 class GlmApp(App):
@@ -25,7 +54,9 @@ class GlmApp(App):
 
     def __init__(self, engine, model_dir, served: str, **kwargs: Any) -> None:
         super().__init__(engine, model_dir, served, **kwargs)
-        self.template = ThinkingOffTemplate(self.template)
+        if self.vision is not None:
+            media_template(self.template, Path(model_dir))
+        self.template = ThinkingOffTemplate(self.template, KeptReasoning.from_env())
 
     def check(self, body: dict[str, Any], *, prepared: PreparedRequest | None = None) -> str | None:
         """Validate the rendered prompt plus max_tokens against the engine context limit before streaming."""
@@ -45,12 +76,19 @@ class GlmApp(App):
         if need <= limit:
             return super().check(body, prepared=prepared)
         detail = f"{prompt} prompt tokens plus max_tokens {int(asked)}" if asked else f"a {prompt}-token prompt"
-        return (f"this request needs a {need}-token context ({detail}), and this server was started for {limit}: "
-                f"shorten the prompt or reply{self._restart(need, ' both ranks')}")
+        # v0.6.0 (68c6e35, Apache-2.0): OpenAI's wording, so prepare refuses it as context_length_exceeded
+        return (f"{CONTEXT_LIMIT} {limit} tokens: this request needs a {need}-token context ({detail}), which exceeds "
+                f"the context window this server was started for; shorten the prompt or reply"
+                f"{self._restart(need, ' both ranks')}")
 
     def run(self, body: dict[str, Any], chat: bool, emit: Callable[[dict[str, Any]], bool], *,
             prepared: PreparedRequest | None = None, cancelled: Callable[[], bool] | None = None) -> dict[str, Any]:
         model = str(body.get("model") or "")
         self.engine.request.policy = body.get("tf_policy") or (model.split("@", 1)[1] if "@" in model else None)
         self.engine.request.stop_eos = not bool(body.get("ignore_eos", False))
-        return super().run(body, chat, emit, prepared=prepared, cancelled=cancelled)
+        result = super().run(body, chat, emit, prepared=prepared, cancelled=cancelled)
+        kept = getattr(self.template, "kept", None)
+        if chat and kept is not None and result.get("calls") and result.get("finish") == "tool_calls":
+            # the calls' reasoning, for a client that will not send it back
+            kept.remember(body.get("messages"), result["calls"], result.get("reasoning"))
+        return result

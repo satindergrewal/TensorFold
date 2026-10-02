@@ -8,7 +8,7 @@ import torch
 
 from tensorfold.engine.exact_sampling import Sampling
 
-from .decode import DecodeResult, DepthPolicy, Engine, _sync, absorb, draft
+from .decode import DecodeResult, DepthPolicy, Engine, _Clock, _Late, _sync, absorb, copy_room, draft
 from .forward import commit
 
 
@@ -68,8 +68,11 @@ class DrafterChoice:
 @torch.no_grad()
 def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling | None, *,
                 choice: DrafterChoice | None,
-                m_policy: DepthPolicy, f_policy: DepthPolicy, stop_eos: bool = False, on_tokens=None) -> DecodeResult:
-    """Drafted decoding with ``choice`` picking each round's drafter; drafts only propose, so it equals serial."""
+                m_policy: DepthPolicy, f_policy: DepthPolicy, stop_eos: bool = False, on_tokens=None,
+                copies=None) -> DecodeResult:
+    """Drafted decoding with ``choice`` picking each round's drafter; drafts only propose, so it equals serial.
+    ``copies`` (``copy_drafts.CopyDrafts``): a round whose context repeats earlier text drafts the continuation ("c")
+    and runs neither drafter, whose backlogs grow; the choice neither picks nor records it."""
 
     w, st, b = e.w, e.st, e.buf
     cap = 256                               # backlog rows a drafter may owe before it absorbs them anyway
@@ -86,14 +89,20 @@ def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling
     depths: list[int] = []
     keeps: list[int] = []
     arms: list[str] = []
-    last = {"m": (0, 0), "f": (0, 0)}
+    last = {"m": (0, 0), "f": (0, 0), "c": (0, 0)}
+    c_rounds = c_drafted = c_accepted = 0
+    clock, late = _Clock(), _Late(on_tokens)
     _sync(w)
     start = time.perf_counter()
     while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
-        arm = choice.pick() if choice is not None else "m"
         room = count - len(out)
         t0 = time.perf_counter()
-        if arm == "m":
+        copied = copies.propose(copy_room(copies, count, out)) if copies is not None else []
+        arm = "c" if copied else choice.pick() if choice is not None else "m"
+        if copied:
+            backlog = steps = 0
+            drafts = copied
+        elif arm == "m":
             backlog = len(m_next)
             depth = max(1, min(m_policy.next(*last["m"]), room))
             drafts = draft(e, m_rows[:backlog], m_next, st.pos + 1, depth, sampling, m_policy.confidence)
@@ -111,8 +120,10 @@ def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling
         tokens = e.verify_window([out[-1]] + drafts)
         drafts = tokens[1:]
         R = len(tokens)
+        clock.start()
         logits = e.forward(tokens)
-        torch.cuda.synchronize()
+        clock.stop()
+        late.flush()                        # the last round's tokens, while this window runs
         t2 = time.perf_counter()
         sampled = e.sample(logits[:R], [st.pos + 1 + r for r in range(R)], sampling)
         keep = 1
@@ -136,26 +147,30 @@ def auto_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampling
             f_taps[n_f:n_f + keep].copy_(e.tap_rows(keep))
             n_f += keep
         t5 = time.perf_counter()
-        if choice is not None:
+        if choice is not None and arm != "c":
             choice.record(arm, R, steps, backlog, keep)
         last[arm] = (len(drafts), keep - 1)
         rounds += 1
         drafted += len(drafts)
         accepted += keep - 1
+        if copied:
+            c_rounds, c_drafted, c_accepted = c_rounds + 1, c_drafted + len(drafts), c_accepted + keep - 1
         depths.append(len(drafts))
         keeps.append(keep)
         arms.append(arm)
         e.follow(sampled[:keep])
         out.extend(sampled[:keep])
-        if on_tokens is not None:
-            on_tokens(sampled[:keep][:max(0, count - (len(out) - keep))])
+        if copies is not None:
+            copies.extend(sampled[:keep])
+        late(sampled[:keep][:max(0, count - (len(out) - keep))])
         stages["draft"] += (t1 - t0) + (t5 - t4)
-        stages["forward"] += t2 - t1
+        stages["forward"] += clock.seconds()
         stages["sample"] += t3 - t2
         stages["commit"] += t4 - t3
+    late.flush()
     _sync(w)
     seconds = time.perf_counter() - start
     if drafter is not None and n_f:
         drafter.add_taps(f_taps[:n_f])          # DFlash2's context ends where the committed rows end
     return DecodeResult(out[:count], seconds, rounds, drafted, accepted, stages, depths, keeps, "".join(arms),
-                        m_rows[:len(m_next)])
+                        m_rows[:len(m_next)], c_rounds, c_drafted, c_accepted)
