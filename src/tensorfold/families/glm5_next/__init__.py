@@ -43,7 +43,14 @@ def check(model_dir: str | Path) -> None:
     if want == "float32" and sys.platform != "darwin":
         raise ValueError("tensorfold_activation_dtype float32 is the Mac engine; the CUDA engine stays bf16")
     method = quant_method(config)
-    if method == "exl3":
+    found_q = config.get("quantization_config") or config.get("quantization") or {}
+    if (method == "exl3" and found_q.get("mixed") is True and found_q.get("codebook") == "mcg"
+            and found_q.get("allowed_bits") in ([3, 4], ["3", "4"])):
+        # MiaAi-Lab's mixed k3/k4 per-tensor encode: the trellis tensors carry
+        # their own widths (k3 -> [..., 48], k4 -> [..., 64]) and the CUDA
+        # loader reads them per expert, so only the family essentials gate.
+        print("[tensorfold] EXL3 mixed k3/k4 per-tensor checkpoint (per-expert trellis widths) - experimental", flush=True)
+    elif method == "exl3":
         # the CUDA engine's layout; the Mac engine refuses it before this through QUANT_METHODS (require_readable)
         found = config.get("quantization_config") or config.get("quantization") or {}
         got = {k: found.get(k) for k in EXL3_VARIANT}

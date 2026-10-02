@@ -93,7 +93,10 @@ class Config:
             index_topk=int(t.get("index_topk", 2048)), kpool=int(t.get("index_kpool", 4)),
             limit=float(t.get("swiglu_limit", 10.0)), kinds=kinds, mlp_kinds=mlp_kinds, eos=eos,
             mtp_layers=int(t.get("num_nextn_predict_layers", 0)), group_size=int(quant.get("group_size", 64)),
-            bits=int(quant.get("bits", 4)), quant=str(quant.get("quant_method") or "mlx").lower(),
+            # mixed encodes (MiaAi-Lab k3/k4 per-tensor) declare a non-int bits marker;
+            # the trellis tensors carry their own widths, so geometry takes the safe ceiling
+            bits=(int(quant["bits"]) if str(quant.get("bits", 4)).isdigit() else 4),
+            quant=str(quant.get("quant_method") or "mlx").lower(),
         )
 
     @property
