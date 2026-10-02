@@ -774,10 +774,12 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int, done: tuple[int, in
             from tensorfold.cuda.exl3 import experts as x3experts
             if isinstance(m.experts, x3experts.Exl3RoutedExperts):
                 # mixed k3/k4 rates: per-expert widths, the weighted combine fused into the down epilogue
-                if getattr(layer.moe, "x3_scratch", None) is None:
-                    layer.moe.x3_scratch = x3experts.Scratch(m.experts, 2048, c.top_k)
+                import os as _os
+                if getattr(w, "x3_scratch", None) is None:
+                    rows = int(_os.environ.get("TF_GLM_X3_ROWS", "1024"))
+                    w.x3_scratch = x3experts.Scratch(m.experts, rows, c.top_k)
                 out = x3experts.routed(b.normed[:R], b.pick[:R], b.wts[:R], m.experts,
-                                       layer.moe.x3_scratch, None, R, c.limit)
+                                       w.x3_scratch, None, R, c.limit)
                 b.ey[:R, :c.hidden] = out.to(b.ey.dtype)
             else:
                 exl3_mm.routed(b.normed[:R], b.pick, b.plan, m.experts, b.exl3, b.ey.view(-1, c.hidden), R, c.limit)
