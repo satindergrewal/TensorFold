@@ -14,7 +14,7 @@ from typing import Any
 
 from tensorfold import __version__
 
-REPO = "ashhart/TensorFold"
+REPO = "satindergrewal/TensorFold"
 RELEASES_API = f"https://api.github.com/repos/{REPO}/releases/latest"
 REPO_URL = f"https://github.com/{REPO}.git"
 CACHE = Path.home() / ".cache" / "tensorfold" / "update-check.json"

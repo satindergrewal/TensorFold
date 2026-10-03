@@ -776,11 +776,14 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int, done: tuple[int, in
                 # mixed k3/k4 rates: per-expert widths, the weighted combine fused into the down epilogue
                 import os as _os
                 if getattr(w, "x3_scratch", None) is None:
-                    rows = int(_os.environ.get("TF_GLM_X3_ROWS", "1024"))
-                    w.x3_scratch = x3experts.Scratch(m.experts, rows, c.top_k)
-                y = x3experts.routed(b.normed[:R], b.pick[:R], None, m.experts,
-                                     w.x3_scratch, None, R, c.limit)
-                b.ey.view(-1, c.hidden)[:R * c.top_k] = y.to(b.ey.dtype)
+                    w.x3_scratch = x3experts.Scratch(m.experts, int(_os.environ.get("TF_GLM_X3_ROWS", "1024")), c.top_k)
+                # the group launch needs R * slots * 4 B of dynamic smem: > 1024 rows busts the 48 KB default,
+                # so the routed pass runs in scratch-sized slices (the 4bpw path has no such launch)
+                for _lo in range(0, R, w.x3_scratch.rows):
+                    _hi = min(_lo + w.x3_scratch.rows, R)
+                    y = x3experts.routed(b.normed[_lo:_hi], b.pick[_lo:_hi, :c.top_k].contiguous(), None, m.experts,
+                                         w.x3_scratch, None, _hi - _lo, c.limit)
+                    b.ey[_lo:_hi, :c.top_k, :] = y.view(_hi - _lo, c.top_k, -1).to(b.ey.dtype)
             else:
                 exl3_mm.routed(b.normed[:R], b.pick, b.plan, m.experts, b.exl3, b.ey.view(-1, c.hidden), R, c.limit)
 
