@@ -911,7 +911,48 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int, done: tuple[int, in
             done = (0, R)
         with prof.timed("moe: routed (exl3)"):
             from tensorfold.cuda.exl3 import experts as x3experts
-            if isinstance(m.experts, x3experts.Exl3RoutedExperts):
+            from .exl3_pair import PairedExperts, _pick_group
+            if isinstance(m.experts, PairedExperts):
+                # mixed k3/k4: the width-48 experts on the universal path (first - its slice loop
+                # assigns every routed slot, foreign slots holding stale bytes), then the width-64
+                # experts through the tuned kernels (they overwrite exactly their own slots)
+                pe = m.experts
+                if pe.slow is not None:
+                    s3 = getattr(w, "x3_scratch", None)
+                    if s3 is None:
+                        import os as _os
+                        s3 = x3experts.Scratch(pe.slow, int(_os.environ.get("TF_GLM_X3_ROWS", "1024")), c.top_k)
+                        w.x3_scratch = s3
+                        w.x3_pick = torch.empty((s3.rows, c.top_k), dtype=torch.int32, device=b.pick.device)
+                    for _lo in range(0, R, s3.rows):
+                        _hi = min(_lo + s3.rows, R)
+                        _n = _hi - _lo
+                        pk = w.x3_pick[:_n]
+                        pk.copy_(_pick_group(b.pick[_lo:_hi, :c.top_k], pe.lut_slow, pe.slow.count))
+                        y = x3experts.routed(b.normed[_lo:_hi], pk, None, pe.slow, s3, None, _n, c.limit)
+                        b.ey[_lo:_hi, :c.top_k, :] = y.view(_n, c.top_k, -1).to(b.ey.dtype)
+                if pe.fast is not None:
+                    from . import exl3_mm
+                    from tensorfold.cuda import experts as grouped
+
+                    s = getattr(b, "pair_s_fast", None)
+                    if s is None:
+                        import os as _os
+
+                        prompt = b.prefill and exl3_mm.prompt_kernels()
+                        ml = c.moe_width // w.world
+                        s = exl3_mm.Scratch(b.rows, c.top_k + 1, c.hidden, ml, b.normed.device, prompt=prompt)
+                        b.pair_s_fast = s
+                        b.pair_pick_fast = torch.empty((b.rows, c.top_k + 1), dtype=torch.int32, device=b.pick.device)
+                        b.pair_plan_fast = grouped.Plan(b.rows, c.top_k + 1, pe.fast.count + 1, b.pick.device,
+                                                        prefill=prompt,
+                                                        tile=exl3_mm.prompt_pass() if prompt else None)
+                    pf = b.pair_pick_fast[:R]
+                    pf.copy_(_pick_group(b.pick[:R], pe.lut_fast, pe.fast.count))
+                    grouped.route(pf, b.pair_plan_fast, b.pair_plan_fast.tile)
+                    exl3_mm.routed(b.normed[:R], pf, b.pair_plan_fast, pe.fast, s,
+                                   b.ey.view(-1, c.hidden), R, c.limit)
+            elif isinstance(m.experts, x3experts.Exl3RoutedExperts):
                 # mixed k3/k4 rates: per-expert widths, the weighted combine fused into the down epilogue.
                 # hot path: the scratch and the contiguous pick buffer are made once and reused every chunk
                 # (the prefill profile showed the per-call allocation + env reads costing real host time).

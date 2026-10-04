@@ -644,7 +644,7 @@ class App:
         logprobs = (self._probability_decoder.format(probabilities.emitted(out), ends)
                     if probabilities is not None else None)
         # the calls already sent as deltas; the handler sends the rest (a call the streamer could not follow)
-        streamed = calls_stream.index + 1 if calls_stream is not None and calls_stream.streamed else 0
+        streamed = calls_stream.sent if calls_stream is not None else 0   # .index/.streamed: an older streamer API
         return {"final": final, "calls": calls, "finish": finish, "content": content, "reasoning": reasoning,
                 "stop_sequence": matched_stop(raw_text, stops.strings),
                 **({"logprobs": logprobs} if logprobs is not None else {}),

@@ -493,14 +493,54 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
             vd = torch.stack([rd.get(base + f"experts.{e}.down_proj.svh") for e in range(cfg.experts)]).to(dev)
             return x3.prepare_stacked(gt, ut, dt, sg, su, vg, vu, sd, vd, "mcg")
 
-        # mixed rates (MiaAi-Lab k3/k4 per-tensor): per-expert widths through the x3 ABI
-        def triples(proj):
-            return [(per[e][proj].to(dev),
-                     rd.get(base + f"experts.{e}.{proj}.suh").to(dev),
-                     rd.get(base + f"experts.{e}.{proj}.svh").to(dev)) for e in range(cfg.experts)]
+        # mixed rates (MiaAi-Lab k3/k4 per-tensor): the width-64 experts stack into the tuned
+        # kernels' object (exl3_mm), the rest keep the universal per-expert path; PairedExperts
+        # (exl3_pair) runs a window over both (the fast group's writes and the slow group's are
+        # disjoint slots, so the two calls need no masking)
+        from . import exl3_mm
+        from .exl3_pair import PairedExperts
 
-        print(f"[tensorfold] moe {p}: mixed trellis widths {sorted(widths)} - per-expert-width path", flush=True)
-        return x3.prepare(triples("gate_proj"), triples("up_proj"), triples("down_proj"), "mcg", device=dev)
+        projs = ("gate_proj", "up_proj", "down_proj")
+        wide = [e for e in range(cfg.experts) if all(per[e][q].shape[-1] == 64 for q in projs)]
+        narrow = [e for e in range(cfg.experts) if e not in set(wide)]
+        print(f"[tensorfold] moe {p}: mixed trellis widths {sorted(widths)} - "
+              f"{len(wide)} experts on the tuned kernels, {len(narrow)} on the universal path", flush=True)
+
+        def scale_stack(proj, part, ids):
+            return torch.stack([rd.get(base + f"experts.{e}.{proj}.{part}") for e in ids]).to(dev)
+
+        fast = None
+        if wide:
+            gt = torch.stack([exl3_words(per[e]["gate_proj"]) for e in wide]).to(dev)
+            ut = torch.stack([exl3_words(per[e]["up_proj"]) for e in wide]).to(dev)
+            dt = torch.stack([exl3_words(per[e]["down_proj"]) for e in wide]).to(dev)
+            D, I = per[wide[0]]["gate_proj"].shape[0] * 16, per[wide[0]]["gate_proj"].shape[1] * 16
+            fast = exl3_mm.Exl3Experts(gt=gt, ut=ut, dt=dt,
+                                       suh_g=scale_stack("gate_proj", "suh", wide),
+                                       suh_u=scale_stack("up_proj", "suh", wide),
+                                       svh_g=scale_stack("gate_proj", "svh", wide),
+                                       svh_u=scale_stack("up_proj", "svh", wide),
+                                       suh_d=scale_stack("down_proj", "suh", wide),
+                                       svh_d=scale_stack("down_proj", "svh", wide),
+                                       count=len(wide), width=I, dims=D)
+        slow = None
+        if narrow:
+            def triples(proj):
+                return [(per[e][proj].to(dev),
+                         rd.get(base + f"experts.{e}.{proj}.suh").to(dev),
+                         rd.get(base + f"experts.{e}.{proj}.svh").to(dev)) for e in narrow]
+            slow = x3.prepare(triples("gate_proj"), triples("up_proj"), triples("down_proj"), "mcg", device=dev)
+
+        lut_fast = torch.full((cfg.experts + 1,), -1, dtype=torch.int32)
+        lut_slow = torch.full((cfg.experts + 1,), -1, dtype=torch.int32)
+        for local, e in enumerate(wide):
+            lut_fast[e] = local
+        for local, e in enumerate(narrow):
+            lut_slow[e] = local
+        D = per[0]["gate_proj"].shape[0] * 16
+        I = per[0]["gate_proj"].shape[1] * 16
+        return PairedExperts(fast=fast, slow=slow, lut_fast=lut_fast.to(dev), lut_slow=lut_slow.to(dev),
+                             count=cfg.experts, width=I, dims=D)
 
     def moe(i: int) -> MoEW:
         p = f"layers.{i}.mlp."
