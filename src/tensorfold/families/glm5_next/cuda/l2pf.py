@@ -134,6 +134,16 @@ def tensors(obj: Any) -> list[torch.Tensor]:
 ONE_WAVE = 192             # qmm programs resident at once on GB10 (4 CTAs an SM x 48 SMs)
 
 
+def one_wave() -> int:
+    """ONE_WAVE, or a launch table's ``l2pf`` entry "all" (TF_GLM_TUNE; e.g. 4 x the SMs of the serving GPU). Only
+    which bytes are prefetched changes: the same bits."""
+
+    from . import tune
+
+    t = tune.pick("l2pf", "all")
+    return int(t["one_wave"]) if t else ONE_WAVE
+
+
 def q4_heads(q, left: int) -> list[tuple[int, int]]:
     """A 4-bit matrix (``qmm.Q4``: words [N/64, K/64, 8, 32, 2], one contiguous chunk of K * 32 / SK bytes a
     (64-column tile, K slice), what one decode program streams): the first ``left / chunks`` bytes of EVERY chunk, so
@@ -149,7 +159,7 @@ def q4_heads(q, left: int) -> list[tuple[int, int]]:
         return []
     chunks = -(-int(q.n) // qmm.BN) * qmm.split_k(int(q.n), int(q.k))
     total = w.numel() * w.element_size()
-    if chunks <= 0 or chunks > ONE_WAVE or total % chunks:
+    if chunks <= 0 or chunks > one_wave() or total % chunks:
         return []
     size = total // chunks
     per = min(size, left // chunks) // ALIGN * ALIGN

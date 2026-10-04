@@ -28,6 +28,7 @@ Multi-stream mode drafts with DFlash2 only: MTP policies are remapped to DFlash2
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -49,6 +50,8 @@ from .multi_tune import MultiSettings, RoundProfile, allocate, reach_of, sample_
 from .pool import ALIGN, Pool, align_up
 from .segments import window_rows
 from .verify import BatchedVerify, Segment, SerialVerify, Verified
+
+_NULL = contextlib.nullcontext()                    # TF_GLM_SEGPROF off, or not a profiled round's span
 
 ADMIT, EVICT, MOVE, GROW, FILL, ROUND, FINISH, IDLE, SLOT, MFILL = range(1, 11)
 OPS = {ADMIT: "ADMIT", EVICT: "EVICT", MOVE: "MOVE", GROW: "GROW", FILL: "FILL", ROUND: "ROUND", FINISH: "FINISH",
@@ -383,14 +386,20 @@ class MultiDecoder:
         self.grouped = {"chunks": 0, "pieces": 0, "rows": 0}           # rank 0's multi-prompt chunks, for /health
         self.drafts = drafts
         if self.drafts is None and engine.drafter is not None:
+            from . import dflash2_fast
             from .dflash2_multi import MultiDrafter
 
-            self.drafts = MultiDrafter(engine.drafter, streams=streams)
+            fast = dflash2_fast.settings()               # TF_GLM_DRAFT_FAST=1: the fused block pass (drafts only)
+            self.drafts = (dflash2_fast.fast_drafter(engine.drafter, streams, fast, window=MAX_WINDOW) if fast.on
+                           else MultiDrafter(engine.drafter, streams=streams))
             graphs = os.environ.get("TF_GLM_MULTI_DRAFT_GRAPHS", "1") != "0" if draft_graphs is None else draft_graphs
             if graphs and torch.cuda.is_available():
                 self.drafts.capture()
         if verify is None:
             if verify_kind() == "batched":
+                from . import segprof
+
+                segprof.setup(self.rank)                  # TF_GLM_SEGPROF: before the capture (its profiled graphs)
                 taps = engine.drafter.tap_layers if engine.drafter is not None else ()
                 verify = BatchedVerify(e, taps=taps, rows=MAX_WINDOW)
                 # TF_GLM_MULTI_GRAPHS=0: eager windows (the same bits); by default a graph a window size
@@ -406,6 +415,10 @@ class MultiDecoder:
             self.profiles = {False: RoundProfile(self.tune.profile, label="batched"),
                              True: RoundProfile(self.tune.profile, label="lone stream, one-stream graphs")}
         self.profile = None                              # the current round's (``profiles``), or None
+        for p in (self.profiles or {}).values():
+            p.counters = self._replay_counts
+        if self.profiles is not None and hasattr(self.drafts, "timing"):
+            self.drafts.timing = True                    # the profile's "propose GPU ms"
         self.solo_verify = SerialVerify(e, taps=self.drafts is not None)
         graphs = getattr(e, "graphs", None)
         self.lone_rows = max((r for r, _ in getattr(graphs, "main", {})), default=0)
@@ -514,6 +527,25 @@ class MultiDecoder:
         comm.all_gather(length, got)
         allv = torch.empty((2 * n,), dtype=torch.int32, device=dev)
         comm.all_gather(vals[:n], allv)
+
+    def _replay_counts(self) -> dict:
+        """TF_GLM_MULTI_PROFILE: cumulative CUDA graph replays and eager runs of the batched verify windows, the
+        one-stream engine's steps (lone rounds, prompt heads) and the drafter's block passes and tap updates."""
+
+        out = {}
+        v = getattr(self.verify, "replays", None)
+        if isinstance(v, dict):
+            out["verify graph"], out["verify eager"] = v.get("graph", 0), v.get("eager", 0)
+        solo = getattr(self.e, "replays", None)
+        if isinstance(solo, dict):
+            out["solo graph"] = sum(n for k, n in solo.items() if k != "eager")
+            out["solo eager"] = solo.get("eager", 0)
+        d = getattr(self.drafts, "replays", None)
+        if isinstance(d, dict):
+            out.update(d)
+        if getattr(self.drafts, "timing", False):
+            out["propose GPU ms"] = float(self.drafts.pass_ms)
+        return out
 
     def _time_rows(self, reps: int = 5) -> list[float]:
         """TF_GLM_MULTI_DEPTH=joint: the batched window's ms for 1 .. MAX_WINDOW rows (its graphs, fastest of
@@ -1328,6 +1360,8 @@ class MultiDecoder:
                 raise RuntimeError(f"rank {self.rank}: a lone round's stream is not at the graphs' home")
             if len(segments[0].tokens) <= self.lone_rows:
                 verify = self.solo_verify
+        # TF_GLM_MULTI_GRAPH_STEP (wide.py): a batched window between two captured widths padded to the next one
+        pads = self._pad(segments, lanes) if verify is self.verify else []
         if prof is not None:
             prof.gpu_start()
         v = forward_streams(verify, segments)
@@ -1339,7 +1373,11 @@ class MultiDecoder:
             if l.window is not None:
                 l.constraint.mask(logits, l.window, self.w.vocab_offset)
             parts.append((logits, [l.st.pos + 1 + r for r in range(len(seg.tokens))], l.s.sampling))
-        sampled = sample_packed(self.w, parts) if tune.sampler == "packed" else sample_streams(self.w, parts)
+        from . import segprof
+
+        sp = segprof.ACTIVE if verify is self.verify else None    # TF_GLM_SEGPROF: a profiled round's spans
+        with sp.span("sampler") if sp is not None else _NULL:
+            sampled = sample_packed(self.w, parts) if tune.sampler == "packed" else sample_streams(self.w, parts)
         if prof is not None:
             prof.mark("sample")
         keeps = []
@@ -1352,7 +1390,8 @@ class MultiDecoder:
             keeps.append(keep)
         if prof is not None:
             prof.mark("accept")
-        verify.commit(segments, keeps)
+        with sp.span("commit") if sp is not None else _NULL:
+            verify.commit(segments, keeps)
         if prof is not None:
             prof.mark("commit")
         if self.drafts is not None:
@@ -1361,28 +1400,55 @@ class MultiDecoder:
                 self.drafts.commit(items)
         if prof is not None:
             prof.mark("taps")
-        for l, seg, rows, keep, was_copy in zip(lanes, segments, sampled, keeps, copied):
+        for k, (l, seg, rows, keep, was_copy) in enumerate(zip(lanes, segments, sampled, keeps, copied)):
             s = l.s
             new = rows[:keep]
             if l.constraint is not None:
                 l.constraint.advance(new)
             if l.copies is not None:
                 l.copies.extend(new)
-            ndrafts = len(seg.tokens) - 1
-            s.counted(len(seg.tokens))                     # Stream.take counts the accepted drafts
+            pad = pads[k] if pads else 0                   # padding rows (wide.py) are not the drafters'
+            ndrafts = len(seg.tokens) - 1 - pad
+            kept = min(keep - 1, ndrafts)
+            s.counted(len(seg.tokens) - pad)               # Stream.take counts the accepted drafts
             if was_copy:
                 l.copy_rounds += 1
                 l.copy_drafted += ndrafts
-                l.copy_accepted += keep - 1
+                l.copy_accepted += kept
             room = s.count - len(s.out)
             s.take(new[:max(0, room)], self._ends(l))
             if l.policy is not None:
-                l.depth = min(l.policy.next(*((0, 0) if was_copy else (ndrafts, keep - 1))),
+                l.depth = min(l.policy.next(*((0, 0) if was_copy else (ndrafts, kept))),
                               max(0, s.count - len(s.out)))
+        wants = getattr(self.drafts, "wants_ahead", None)
+        if wants is not None and tune.depth != "joint" and wants():
+            self._draft_ahead(lanes)                       # TF_GLM_DRAFT_FAST_AHEAD (dflash2_fast)
         if prof is not None:
             prof.mark("emit")
             prof.end(len(lanes), sum(len(g.tokens) for g in segments), sum(keeps),
                      sum(len(g.tokens) - 1 for g in segments))
+        if sp is not None:
+            sp.collect()                          # the round's events (after the sampler's sync), rank 0 reads them
+
+    def _pad(self, segments: list[Segment], lanes: list[Lane]) -> list[int]:
+        """Both ranks, TF_GLM_MULTI_GRAPH_STEP (``wide``): the batched window padded in place to the next captured
+        width with extra draft rows (a stream's last token repeated; streams without a grammar, within their room);
+        the rows added to each segment, or [] (none needed, every width captured, or the width out of reach: the
+        window then runs as it is)."""
+
+        from . import wide
+
+        v = self.verify
+        if not isinstance(v, BatchedVerify) or not v.widths or len(v.widths) == v.widths[-1]:
+            return []
+        dense = self.w.cfg.dense_limit
+
+        def room(seg) -> int:
+            st = seg.st
+            top = st.capacity if st.index is not None else min(st.capacity, dense)
+            return top - st.pos - len(seg.tokens)
+
+        return wide.pad(segments, [l.constraint is None for l in lanes], room, v.widths)
 
     def _joint(self, lanes: list[Lane], drafts: list[list[int]], asks: list) -> None:
         """TF_GLM_MULTI_DEPTH=joint: every asking stream's chain walked to its depth in one block pass, then the
@@ -1407,6 +1473,32 @@ class MultiDecoder:
             drafts[k] = drafts[k][:n]
 
     # -- ends ----------------------------------------------------------------------------------------------------------------
+    def _draft_ahead(self, lanes: list[Lane]) -> None:
+        """Both ranks, at a round's end: the next round's DFlash2 requests of these lanes, as ``_round`` builds them
+        (copy drafts first), handed to the drafter, which launches their pass now when TF_GLM_DRAFT_FAST_AHEAD is on
+        (it then runs while the host emits, plans and sends the next round). Drafts only: nothing here can change a
+        reply, and every rank builds the same requests from the state they share."""
+
+        from .decode import copy_room
+        from .dflash2_multi import DraftRequest
+
+        reqs = []
+        for l in lanes:
+            # Not ``l.s.done``: rank 0 alone sets it for a stop string or a client that left (``Stream.emit``), and
+            # a request list that differs between the ranks misaligns the pass's collectives (every rank then waits
+            # forever). A stream's own end (its count: depth 0; an end token) is the same on every rank. Rank 0's
+            # stopped stream leaves on every rank with the next plan; its draft here is only unused work.
+            s = l.s
+            if not l.dflash or l.depth <= 0 or (s.out and s.out[-1] in self._ends(l)):
+                continue
+            if l.copies is not None and l.copies.propose(copy_room(l.copies, l.s.count, l.s.out)):
+                continue
+            conf = l.policy.confidence
+            if self.tune.depth == "scale":
+                conf = scaled_confidence(conf, len(lanes), self.tune.alpha)
+            reqs.append(DraftRequest(self._ctx(l), l.s.out[-1], l.depth, l.s.sampling, conf, **l.policy.chain_rule))
+        self.drafts.ahead(reqs)
+
     def finish(self, done: list[Stream]) -> None:
         """Rank 0: finished (or cancelled) streams leave on both ranks; an idle rank 1 is told to wait for the bell."""
 

@@ -11,6 +11,11 @@ import torch
 
 from tensorfold.cuda import experts as grouped
 
+from . import tune
+
+# a rank's expert widths the decode kernel (``dec``) takes: two ranks' 1024, four ranks' 512, three ranks' 768 / 640
+# (its down projection's K / 64 k steps a warp: 16, 8, 12, 10); others run the grouped kernel (the same bits)
+DEC_WIDTHS = (1024, 768, 640, 512)
 # Gate/up and down tile counts, warps, and K splits stay fixed across row counts to preserve each row's bits.
 GATEUP_CFG = (8, 4, 4)
 DOWN_CFG = (8, 4, 1)
@@ -73,8 +78,68 @@ def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_glm_exl3_v19", sources=[str(here / "exl3.cpp"), str(here / "exl3.cu")],
+    return load(name="tensorfold_glm_exl3_v21", sources=[str(here / "exl3.cpp"), str(here / "exl3.cu")],
                 extra_cuda_cflags=["-O3"], verbose=False)
+
+
+def dec_config(kind: str, K: int, N: int, R: int) -> dict:
+    """The decode kernel's launch for gate/up (``kind`` "gu": K = D, N = NI) or down ("dn": K = NI, N = D) at R rows:
+    the environment's (TF_GLM_EXL3_LOADS / _FUSE / _XROW, one warp along N), then a launch table's entry for the shape
+    and rows (TF_GLM_TUNE, ``tune``). Every value gives the same bits (``dec_kernel``'s notes)."""
+
+    _, fuse, xrow = dec_settings()
+    if kind == "gu":
+        cfg = {"ld": dec_loads(), "wn": 1, "fuse": 2 if fuse & 2 else 0, "xrow": int(xrow)}
+    elif kind == "dn":
+        cfg = {"ld": dec_loads(), "wn": 1, "fuse": 1 if fuse & 1 else 0}
+    else:
+        raise ValueError(f"dec_config: gu or dn, not {kind!r}")
+    t = tune.pick("exl3_dec_" + kind, tune.shape(K, N), R)
+    if t:
+        cfg.update(t)
+    if cfg["wn"] == 4 and cfg["ld"] != 0:            # (tune refuses such an entry; a merge must not reach the kernel)
+        cfg["wn"] = 1
+    return cfg
+
+
+def dec_gateup(x: torch.Tensor, pick: torch.Tensor, plan: grouped.Plan, ex: "Exl3Experts", s: "Scratch", R: int,
+               limit: float, cfg: dict, items: int | None = None) -> None:
+    """Decode windows' gate/up: the input rotation, ``dec`` on gate and up (4 K splits) and the SwiGLU / down
+    rotation epilogue (fused into the last block, or its own kernel) -> s.xd, under launch ``cfg`` (``dec_config``)."""
+
+    ext = _ext()
+    slots, P = s.slots, s.rows * s.slots
+    D, NI = ex.dims, ex.width
+    if items is None:
+        items = grouped.max_items(R * slots, plan.experts)
+    xrow = bool(cfg["xrow"]) and ex.shared_suh is not None
+    if xrow:                                         # one rotated input a row, read by all its pairs' gate and up
+        ext.rot_rows(x, x.stride(0), ex.shared_suh, s.xg, R, D)
+        xg = xu = s.xg
+    else:
+        ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots)
+        xg, xu = s.xg, s.xu
+    fused = 2 if int(cfg["fuse"]) == 2 else 0
+    ext.dec(xg, xu, ex.gt, ex.ut, plan.items, plan.counts, plan.members, s.z, 2, D, NI, P, 4, items, slots,
+            fused, xrow, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, float(limit), s.done, int(cfg["ld"]), int(cfg["wn"]))
+    if not fused:
+        ext.gateup_epilogue(s.z, pick, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, R, P, NI, 4, slots, float(limit))
+
+
+def dec_down(pick: torch.Tensor, plan: grouped.Plan, ex: "Exl3Experts", s: "Scratch", y: torch.Tensor, R: int,
+             cfg: dict, items: int | None = None) -> None:
+    """Decode windows' down projection from s.xd -> y (fp32 [pairs, D]) under launch ``cfg`` (``dec_config``)."""
+
+    ext = _ext()
+    slots, P = s.slots, s.rows * s.slots
+    D, NI = ex.dims, ex.width
+    if items is None:
+        items = grouped.max_items(R * slots, plan.experts)
+    fused = 1 if int(cfg["fuse"]) == 1 else 0
+    ext.dec(s.xd, s.xd, ex.dt, ex.dt, plan.items, plan.counts, plan.members, s.z, 1, NI, D, P, 1, items, slots,
+            fused, False, ex.svh_d, ex.svh_d, ex.svh_d, y, 0.0, s.done, int(cfg["ld"]), int(cfg["wn"]))
+    if not fused:
+        ext.down_epilogue(s.z, pick, ex.svh_d, y, R, P, D, 1, slots)
 
 
 @dataclass
@@ -128,13 +193,23 @@ def words(trellis: torch.Tensor) -> torch.Tensor:
 
 def prompt_pass() -> int:
     """TF_GLM_EXL3_PASS: members a prompt kernel pass takes (64 or 128, the same bits; 128 measured slower on real
-    routing: most passes are small, and its one 16-warp block an SM keeps fewer experts in flight)."""
+    routing: most passes are small, and its one 16-warp block an SM keeps fewer experts in flight). A launch table's
+    ``exl3_prompt`` entry "all" (TF_GLM_TUNE) takes precedence."""
     import os
 
-    value = int(os.environ.get("TF_GLM_EXL3_PASS", "64"))
+    t = tune.pick("exl3_prompt", "all")
+    value = int(t["passm"]) if t else int(os.environ.get("TF_GLM_EXL3_PASS", "64"))
     if value not in (64, 128):
         raise ValueError(f"TF_GLM_EXL3_PASS is 64 or 128, not {value}")
     return value
+
+
+def prompt_stages() -> int:
+    """The prompt kernels' cp.async pipeline depth: 3 (GB10's), or a launch table's ``exl3_prompt`` entry "all"
+    (TF_GLM_TUNE): 2 to 4, loads only, the same bits."""
+
+    t = tune.pick("exl3_prompt", "all")
+    return int(t.get("stages", 3)) if t else 3
 
 
 def prompt_kernels() -> bool:
@@ -167,17 +242,26 @@ class Scratch:
 
     def __init__(self, rows: int, slots: int, dims: int, width: int, device, *, prompt: bool = False) -> None:
         P = rows * slots
-        sk = max(GATEUP_CFG[2], DOWN_CFG[2])
         self.xg = torch.zeros((P, dims), dtype=torch.float16, device=device)
         self.xu = torch.zeros((P, dims), dtype=torch.float16, device=device)
         self.xd = torch.zeros((P, width), dtype=torch.float16, device=device)
-        self.z = torch.zeros((1 if prompt else 2 * sk * P * max(width, dims),), dtype=torch.float32, device=device)
+        # a decode window's fp32 partials: gate/up's [2][splits][P][width] or down's [splits][P][dims] (the decode
+        # and grouped kernels), or the streamed kernel's fine slabs' (exl3_stream.fine_room); scratch only
+        from . import exl3_stream
+
+        zn = 1 if prompt else max(P * max(2 * GATEUP_CFG[2] * width, DOWN_CFG[2] * dims),
+                                  exl3_stream.fine_room(rows, slots, dims, width))
+        self.z = torch.zeros((zn,), dtype=torch.float32, device=device)
         # decode windows' fused gate/up epilogue: a finished-block count per (item, 128 columns), reset by the kernel
         self.done = torch.zeros((1 if prompt else (P + P // grouped.TILE + 1) * max(1, width // 128),),
                                 dtype=torch.int32, device=device)
         self.rows, self.slots = rows, slots
         # a prompt plan's launch order (item_order): room for any plan of up to 1,024 experts in items of >= 16 pairs
         self.order = torch.zeros((P // 16 + 1024 if prompt else 1,), dtype=torch.int32, device=device)
+        # decode windows' streamed kernel (TF_GLM_EXL3_STREAM, exl3_stream): its work queue, counts and flags
+        from . import exl3_stream
+
+        self.stream = None if prompt else exl3_stream.state(rows, slots, dims, device)
 
 
 def routed(x: torch.Tensor, pick: torch.Tensor, plan: grouped.Plan, ex: Exl3Experts, s: Scratch, y: torch.Tensor,
@@ -198,29 +282,15 @@ def routed(x: torch.Tensor, pick: torch.Tensor, plan: grouped.Plan, ex: Exl3Expe
         ext.prompt(xg, xu, ex.gt, ex.ut, ex.dt, plan.items, plan.counts, plan.members, ex.svh_g, ex.svh_u,
                    ex.suh_d, ex.svh_d, s.xd, y, D, NI, ex.count, grouped.max_items(R * slots, plan.experts,
                                                                                    plan.tile), float(limit),
-                   plan.tile, slots, shx, s.order if item_order() else None)
+                   plan.tile, slots, shx, s.order if item_order() else None, prompt_stages())
         return
     if plan.tile != grouped.TILE:
         raise ValueError("the EXL3 kernel takes items of 16 pairs")
     items = grouped.max_items(R * slots, plan.experts)
-    dec, fuse, xrow = dec_settings()
-    if dec and R < PROMPT_ROWS and GATEUP_CFG == (8, 4, 4) and DOWN_CFG == (8, 4, 1) and D == 4096 and NI == 1024:
-        xrow = xrow and ex.shared_suh is not None
-        if xrow:                                     # one rotated input a row, read by all its pairs' gate and up
-            ext.rot_rows(x, x.stride(0), ex.shared_suh, s.xg, R, D)
-            xg = xu = s.xg
-        else:
-            ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots)
-            xg, xu = s.xg, s.xu
-        ld = dec_loads()
-        ext.dec(xg, xu, ex.gt, ex.ut, plan.items, plan.counts, plan.members, s.z, 2, D, NI, P, 4, items, slots,
-                2 if fuse & 2 else 0, xrow, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, float(limit), s.done, ld)
-        if not fuse & 2:
-            ext.gateup_epilogue(s.z, pick, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, R, P, NI, 4, slots, float(limit))
-        ext.dec(s.xd, s.xd, ex.dt, ex.dt, plan.items, plan.counts, plan.members, s.z, 1, NI, D, P, 1, items, slots,
-                1 if fuse & 1 else 0, False, ex.svh_d, ex.svh_d, ex.svh_d, y, 0.0, s.done, ld)
-        if not fuse & 1:
-            ext.down_epilogue(s.z, pick, ex.svh_d, y, R, P, D, 1, slots)
+    dec, _, _ = dec_settings()
+    if dec and R < PROMPT_ROWS and GATEUP_CFG == (8, 4, 4) and DOWN_CFG == (8, 4, 1) and D == 4096 and NI in DEC_WIDTHS:
+        dec_gateup(x, pick, plan, ex, s, R, limit, dec_config("gu", D, NI, R), items)
+        dec_down(pick, plan, ex, s, y, R, dec_config("dn", NI, D, R), items)
         return
     ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots)
     nfirst = R >= PROMPT_ROWS and _nfirst()

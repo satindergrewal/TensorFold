@@ -517,7 +517,13 @@ class GlmEngine:
             # --parallel: every stream slot past the first (KDA states, conv windows, window scratch); the batched
             # verify window's buffers fit the decode rows the estimate sizes (MLA_DECODE_ROWS), its token selection's
             # fp32 scores (MAX_WINDOW rows x a pool of 4 tokens) grow with the pool
-            extra = workspace + (parallel - 1) * (slot_bytes(text) + mla_ring_bytes(text, prefill_rows))
+            extra = workspace + (parallel - 1) * (slot_bytes(text, world, rank=rank) + mla_ring_bytes(text, prefill_rows))
+            if parallel > 1:                 # a wide window's rows past the 64 the decode buffers' estimate holds
+                from . import wide as _wide
+                from .tp import split_sizes as _split, UNITS as _UNITS
+
+                extra += _wide.extra_bytes(text, world, MULTI_WINDOW,
+                                           share=lambda family, n: _split(n, world, _UNITS.get(family, 1))[rank])
             per = 4 * MULTI_WINDOW // 4 if parallel > 1 else 0
             if not extra and not per:
                 return g
@@ -572,6 +578,15 @@ class GlmEngine:
         from . import lanes as lanes_mod                              # patch 0123: TF_GLM_PREFILL_LANES*
 
         mine += lanes_mod.code()
+        from . import draft_skip as draft_skip_mod                    # patch 0124: TF_GLM_DRAFT_PROMPT_SKIP
+
+        mine += draft_skip_mod.code()
+        from . import dflash2_fast                                    # TF_GLM_DRAFT_FAST*: drafts' passes, gathers
+
+        mine += dflash2_fast.code() if parallel > 1 and drafter is not None else [0, 0, 0]
+        from . import wide as wide_mod                                # TF_GLM_MULTI_GRAPH_STEP: captures and pads
+
+        mine += [wide_mod.code()]
         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
         plan = self.capacity_plan
         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
@@ -584,10 +599,18 @@ class GlmEngine:
                                "TF_GLM_DRAFT_QUANT, TF_GLM_SHARED_PREFIX, TF_GLM_DRAFT_RING, TF_GLM_MTP, --parallel, "
                                "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE, "
                                "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV, TF_GLM_INDEX_SPLIT*, "
-                               "TF_GLM_PREFILL_LANES, TF_GLM_LANE_MIN_ROWS): "
+                               "TF_GLM_PREFILL_LANES, TF_GLM_LANE_MIN_ROWS, TF_GLM_KDA_OVERLAP, TF_GLM_DRAFT_PROMPT_SKIP, "
+                               "TF_GLM_DRAFT_FAST*, TF_GLM_MULTI_GRAPH_STEP): "
                                f"rank 0 {both[0][:-1]}, rank 1 {both[1][:-1]}; pull the draft model on both machines "
                                "(or pass --drafter none to both) and give both the same flags")
         self.cache_bytes = min(both[0][-1], both[1][-1]) << 20
+        # launch tables (TF_GLM_TUNE, tune.py): every rank must read the same table file (its tables' checksum)
+        from . import tune as _tune
+
+        tables = [row[0] for row in self._gather_ints([_tune.code()])]
+        if any(t != tables[0] for t in tables):
+            raise RuntimeError(f"the ranks read different launch tables (TF_GLM_TUNE; checksums {tables}): give every "
+                               "rank the same file, or none")
         plan["kept_bytes"] = self.cache_bytes
         for key in ("serving_peak_bytes_estimate", "total_bytes_estimate"):
             plan[key] = plan[key] + self.cache_bytes
@@ -645,6 +668,11 @@ class GlmEngine:
                           "(only shorter ones split)", flush=True)
         if rank == 0 and index_split_settings().on and world > 1:
             print(f"[tensorfold] {index_split_settings().describe()}", flush=True)
+            print(f"[tensorfold] {draft_skip_mod.describe()}", flush=True)
+        if rank == 0 and moe_glue_mod.on():
+            print(f"[tensorfold] {moe_glue_mod.describe()}", flush=True)
+        if rank == 0 and parallel > 1 and self.drafter is not None and dflash2_fast.settings().on:
+            print(f"[tensorfold] {dflash2_fast.settings().describe()}", flush=True)
         if rank == 0 and lanes_mod.LANES > 1:
             print(f"[tensorfold] {lanes_mod.describe()}"
                   + ("" if self.e.pbuf.split is not None else ": not used, it needs TF_GLM_HC_SPLIT=1"), flush=True)

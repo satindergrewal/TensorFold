@@ -49,12 +49,13 @@ void qmm(const at::Tensor& x, const at::Tensor& xs, const at::Tensor& w, const a
              static_cast<int>(bm), f32, reduce);
 }
 
-// ``qmm`` for decode rows (M <= 16, groups of 64, K slices reduced) on tile config ``cfg`` (same bits, other speed).
+// ``qmm`` for decode rows (M <= 64: 16-row tiles side by side above 16, groups of 64, K slices reduced) on tile
+// config ``cfg`` (same bits, other speed).
 void qmm_cfg(const at::Tensor& x, const at::Tensor& xs, const at::Tensor& w, const at::Tensor& scales,
              const at::Tensor& biases, at::Tensor& out, const c10::optional<at::Tensor>& part, int64_t n, int64_t sk,
              bool f32, int64_t cfg) {
     TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kBFloat16 && x.dim() == 2 && x.size(0) >= 1 &&
-                x.size(0) <= 16 && x.stride(1) == 1 && x.stride(0) >= x.size(1), "x: (M <= 16, K) bf16");
+                x.size(0) <= 64 && x.stride(1) == 1 && x.stride(0) >= x.size(1), "x: (M <= 64, K) bf16");
     TORCH_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0 && (x.size(0) == 1 || x.stride(0) % 8 == 0),
                 "x rows must start on 16-byte boundaries");
     const int64_t m = x.size(0), k = x.size(1), kg = k / 64, npad = (n + 127) / 128 * 128;

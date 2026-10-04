@@ -26,13 +26,72 @@ __device__ __forceinline__ void unpack8(const uint4 v, float (&f)[8]) {
 // Block (K block, part, row group): warps 0..7 the dots of mixing rows 8 part .. 8 part + 7 (their weights read once
 // for up to RPB rows), warp 8 of part 0 the squares.
 constexpr int RPB = 4;
+constexpr int D = WIDE / 4;              // a stream's width (4 streams, hc_mult 4)
 
+template <bool SH>
+__device__ __forceinline__ uint4 ld16(const __nv_bfloat16* p) {
+    return SH ? *reinterpret_cast<const uint4*>(p) : __ldg(reinterpret_cast<const uint4*>(p));
+}
+
+// POST (the previous site's hc_post fused in front, decode rows): the block first writes its K block of the NEW
+// streams (stream s = b / 4, columns (b % 4) KB ..) for its rows into shared memory from the old X, that site's
+// gathered partials G [WORLD, rows, D] (rank k at k RS) and its POST / COMB, with the operations Triton 3.7 emits for
+// glue._hc_post on sm_120 (its PTX, every element of a row, read symbolically for 1 to 4 ranks): branch =
+// bf16(((g0 + g1) + g2) + g3); m = x1 c1, then fma(x0, c0, m), except where Triton packs the pair the other way round
+// (3 ranks: column % 8 == 6 - 2 s; 4 ranks: stream 0's even columns): m = x0 c0, then fma(x1, c1, m); then
+// m = fma(x2, c2, m); m = fma(x3, c3, m); v = fma(branch, ps, m); bf16(v). The blocks of part 0 also store their K
+// block of the new streams to XN (each element once); X is not written here (other blocks still read the old
+// streams): glue._hc_finish_copy copies XN to X row by row. fuse.py checks the bits on the GPU before use.
+template <int WORLD>
+__device__ __forceinline__ bool post_swapped(int st, int col) {
+    return (WORLD == 3 && (col & 7) == 6 - 2 * st) || (WORLD == 4 && st == 0 && (col & 1) == 0);
+}
+
+template <bool POST, int WORLD>
 __global__ void __launch_bounds__(288) hc_partial_kernel(const __nv_bfloat16* __restrict__ X,
                                                         const __nv_bfloat16* __restrict__ FN, float* __restrict__ part,
-                                                        int rows) {
+                                                        int rows, const float* __restrict__ G, long long RS,
+                                                        const float* __restrict__ POSTW,
+                                                        const float* __restrict__ COMB,
+                                                        __nv_bfloat16* __restrict__ XN) {
     const int b = blockIdx.x, p = blockIdx.y, r0 = blockIdx.z * RPB;
     const int r1 = min(r0 + RPB, rows);
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    __shared__ __align__(16) __nv_bfloat16 xn[POST ? RPB : 1][POST ? KB : 8];
+    if constexpr (POST) {
+        const int st = b / (D / KB), c0 = (b % (D / KB)) * KB;
+        for (int i = threadIdx.x; i < (r1 - r0) * KB; i += blockDim.x) {
+            const int rr = i / KB, c = i % KB, r = r0 + rr, col = c0 + c;
+            const float* gr = G + (size_t)r * D + col;
+            float acc = gr[0];
+#pragma unroll
+            for (int k = 1; k < WORLD; ++k) acc = __fadd_rn(acc, gr[(size_t)k * RS]);
+            const float branch = __bfloat162float(__float2bfloat16_rn(acc));
+            const __nv_bfloat16* xr = X + (size_t)r * WIDE + col;
+            const float x0 = __bfloat162float(xr[0]), x1 = __bfloat162float(xr[D]);
+            const float x2 = __bfloat162float(xr[2 * D]), x3 = __bfloat162float(xr[3 * D]);
+            const float* cm = COMB + (size_t)r * 16 + st;                  // column st of comb: cm[4 j] = comb[j][st]
+            float mixed;
+            if (post_swapped<WORLD>(st, col)) {
+                mixed = __fmul_rn(x0, cm[0]);
+                mixed = __fmaf_rn(x1, cm[4], mixed);
+            } else {
+                mixed = __fmul_rn(x1, cm[4]);
+                mixed = __fmaf_rn(x0, cm[0], mixed);
+            }
+            mixed = __fmaf_rn(x2, cm[8], mixed);
+            mixed = __fmaf_rn(x3, cm[12], mixed);
+            const __nv_bfloat16 v = __float2bfloat16_rn(__fmaf_rn(branch, POSTW[(size_t)r * 4 + st], mixed));
+            xn[rr][c] = v;
+            if (p == 0) XN[(size_t)r * WIDE + st * D + col] = v;
+        }
+        __syncthreads();
+    }
+    // a row's KB inputs of this K block: the new streams in shared memory (POST) or X
+    auto xrow = [&](int r) -> const __nv_bfloat16* {
+        if constexpr (POST) return &xn[r - r0][0];
+        else return X + (size_t)r * WIDE + b * KB;
+    };
     if (warp < 8) {
         const int m = p * 8 + warp;
         const int h = lane >> 4, l = lane & 15;
@@ -42,10 +101,10 @@ __global__ void __launch_bounds__(288) hc_partial_kernel(const __nv_bfloat16* __
         for (int i = 0; i < 4; ++i)                    // steps 2 i + h, inputs 8 l .. 8 l + 7 of the step
             unpack8(__ldg(reinterpret_cast<const uint4*>(wr + (2 * i + h) * SUB + 8 * l)), wf[i]);
         for (int r = r0; r < r1; ++r) {
-            const __nv_bfloat16* xr = X + (size_t)r * WIDE + b * KB;
+            const __nv_bfloat16* xr = xrow(r);
             uint4 xv[4];
 #pragma unroll
-            for (int i = 0; i < 4; ++i) xv[i] = __ldg(reinterpret_cast<const uint4*>(xr + (2 * i + h) * SUB + 8 * l));
+            for (int i = 0; i < 4; ++i) xv[i] = ld16<POST>(xr + (2 * i + h) * SUB + 8 * l);
             float s[4];
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
@@ -68,7 +127,7 @@ __global__ void __launch_bounds__(288) hc_partial_kernel(const __nv_bfloat16* __
         }
     } else if (p == 0) {
         for (int r = r0; r < r1; ++r) {
-            const __nv_bfloat16* xr = X + (size_t)r * WIDE + b * KB;
+            const __nv_bfloat16* xr = xrow(r);
             float w[4];
 #pragma unroll
             for (int j = 0; j < 4; ++j) {              // the Triton kernel's warp j: input 32 j + lane of each step
@@ -90,8 +149,32 @@ __global__ void __launch_bounds__(288) hc_partial_kernel(const __nv_bfloat16* __
 }  // namespace
 
 void hc_partial_cuda(const at::Tensor& x, const at::Tensor& fn, at::Tensor& part, int64_t rows) {
-    hc_partial_kernel<<<dim3(NB, 3, (unsigned)((rows + RPB - 1) / RPB)), 288, 0, at::cuda::getCurrentCUDAStream()>>>(
+    hc_partial_kernel<false, 1><<<dim3(NB, 3, (unsigned)((rows + RPB - 1) / RPB)), 288, 0,
+                                  at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), reinterpret_cast<const __nv_bfloat16*>(fn.data_ptr()),
-        part.data_ptr<float>(), (int)rows);
+        part.data_ptr<float>(), (int)rows, nullptr, 0, nullptr, nullptr, nullptr);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// hc_partial of the rows hc_post(x, ., g, post, comb) would write, from the old x (not written here); those rows
+// also go to xn.
+void hc_post_partial_cuda(const at::Tensor& x, const at::Tensor& g, int64_t rs, const at::Tensor& post,
+                          const at::Tensor& comb, const at::Tensor& fn, at::Tensor& part, int64_t rows, int64_t world,
+                          at::Tensor& xn) {
+    const dim3 grid(NB, 3, (unsigned)((rows + RPB - 1) / RPB));
+    auto stream = at::cuda::getCurrentCUDAStream();
+    auto xp = reinterpret_cast<const __nv_bfloat16*>(x.data_ptr());
+    auto fp = reinterpret_cast<const __nv_bfloat16*>(fn.data_ptr());
+#define GO(W_)                                                                                                     \
+    hc_partial_kernel<true, W_><<<grid, 288, 0, stream>>>(xp, fp, part.data_ptr<float>(), (int)rows,               \
+                                                          g.data_ptr<float>(), (long long)rs, post.data_ptr<float>(), \
+                                                          comb.data_ptr<float>(),                                     \
+                                                          reinterpret_cast<__nv_bfloat16*>(xn.data_ptr()))
+    if (world == 1) GO(1);
+    else if (world == 2) GO(2);
+    else if (world == 3) GO(3);
+    else if (world == 4) GO(4);
+    else TORCH_CHECK(false, "hc_post_partial: 1 to 4 ranks");
+#undef GO
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

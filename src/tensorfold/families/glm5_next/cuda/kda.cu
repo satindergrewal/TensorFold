@@ -330,10 +330,16 @@ __global__ void __launch_bounds__(WARPS * 32) step_kernel(
     }
 }
 
-// Block (row, head), 128 threads: the gated RMSNorm of the read-out.
+// Block (row, head), 128 threads: the gated RMSNorm of the read-out. XS (optional, decode windows): also the row's
+// 64-input group sums of out, xs [R, H * DV / 64], with the bits of qmm.group_sums as Triton 3.7 compiles it for
+// these rows (16-byte aligned, a row stride of H x 128: tile [16, 64] on two warps, layout sizePerThread [1, 8],
+// threadsPerWarp [4, 8], read from its PTX): eight lanes a group, each adding its 8 consecutive inputs in order
+// (((q0 + q1) + q2) + ... + q7), then butterfly adds over the eight lanes at xor 4, 2, 1. fuse.py checks the bits on
+// the GPU before this path is used (another Triton could lay the tile out otherwise).
 __global__ void __launch_bounds__(128) out_kernel(
         int H, const __nv_bfloat16* __restrict__ y_in, const __nv_bfloat16* __restrict__ G, int g_stride,
-        const __nv_bfloat16* __restrict__ norm_w, float eps, __nv_bfloat16* __restrict__ out) {
+        const __nv_bfloat16* __restrict__ norm_w, float eps, __nv_bfloat16* __restrict__ out,
+        float* __restrict__ xs = nullptr) {
     const int r = blockIdx.x, h = blockIdx.y;
     const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
     __shared__ float rinv;
@@ -349,7 +355,22 @@ __global__ void __launch_bounds__(128) out_kernel(
     const float yn = __bfloat162float(y_in[base + t]) * rinv;
     const float yw = __bfloat162float(norm_w[t]) * yn;
     const float gate = __bfloat162float(G[(size_t)r * g_stride + h * DV + t]);
-    out[(size_t)r * H * DV + h * DV + t] = __float2bfloat16_rn(yw * sigmoidf_(gate));
+    const __nv_bfloat16 o = __float2bfloat16_rn(yw * sigmoidf_(gate));
+    out[(size_t)r * H * DV + h * DV + t] = o;
+    if (xs != nullptr) {
+        __shared__ float ov[DV];
+        ov[t] = __bfloat162float(o);
+        __syncthreads();
+        if (t < (DV / 64) * 8) {                               // lanes 0-15 of warp 0: group t / 8, chunk t % 8
+            const float* q = ov + 64 * (t >> 3) + 8 * (t & 7);
+            float sum = __fadd_rn(q[0], q[1]);
+#pragma unroll
+            for (int j = 2; j < 8; ++j) sum = __fadd_rn(sum, q[j]);
+#pragma unroll
+            for (int off = 4; off; off >>= 1) sum = __fadd_rn(sum, __shfl_xor_sync(0xffffu, sum, off));
+            if ((t & 7) == 0) xs[(size_t)r * H * (DV / 64) + h * (DV / 64) + (t >> 3)] = sum;
+        }
+    }
 }
 
 // Several streams' windows in one launch. A segment table (int32 [nseg, SEG_COLS]: first row, rows, state slot,
@@ -569,12 +590,29 @@ void kda_replay_layers_cuda(const at::Tensor& state_in, int64_t state_stride, co
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+// The step kernels' launch: WARPS warps a block (4 value rows each, DV / 4 / WARPS blocks a head) and
+// TR rows staged at a time. Each warp's arithmetic is the same at every setting (its own 4 value rows of the state, the
+// same per-row order of updates and warp sums, kda.cu built without FMA contraction), so every setting gives the same
+// bits; 4 / 16 is the GB10 choice.
+#define STEP_DISPATCH(warps, tr)                                                                                  \
+    do {                                                                                                          \
+        if ((warps) == 4 && (tr) == 16) { STEP(4, 16); }                                                          \
+        else if ((warps) == 4 && (tr) == 8) { STEP(4, 8); }                                                       \
+        else if ((warps) == 2 && (tr) == 16) { STEP(2, 16); }                                                     \
+        else if ((warps) == 2 && (tr) == 8) { STEP(2, 8); }                                                       \
+        else if ((warps) == 1 && (tr) == 16) { STEP(1, 16); }                                                     \
+        else if ((warps) == 1 && (tr) == 8) { STEP(1, 8); }                                                       \
+        else if ((warps) == 8 && (tr) == 16) { STEP(8, 16); }                                                     \
+        else if ((warps) == 8 && (tr) == 8) { STEP(8, 8); }                                                       \
+        else { TORCH_CHECK(false, "KDA step kernel: 1, 2, 4 or 8 warps and 8 or 16 staged rows"); }               \
+    } while (0)
+
 void kda_chain_wide_cuda(const at::Tensor& P, int64_t p_stride, int64_t b_off, const at::Tensor& A, int64_t a_stride,
                          const at::Tensor& G, int64_t g_stride, const at::Tensor& cs, const at::Tensor& cw,
                          const at::Tensor& state_in, const at::Tensor& a_log, const at::Tensor& dt_bias,
                          const at::Tensor& norm_w, double eps, double lower, int64_t rows, at::Tensor& out,
                          at::Tensor& state_out, at::Tensor& k_save, at::Tensor& v_save, at::Tensor& g_save,
-                         at::Tensor& b_save, at::Tensor& q_tmp, at::Tensor& y_tmp) {
+                         at::Tensor& b_save, at::Tensor& q_tmp, at::Tensor& y_tmp, int64_t warps, int64_t tr) {
     auto stream = at::cuda::getCurrentCUDAStream();
     const int H = (int)a_log.numel();
     const dim3 grid((unsigned)rows, (unsigned)H);
@@ -583,10 +621,12 @@ void kda_chain_wide_cuda(const at::Tensor& P, int64_t p_stride, int64_t b_off, c
         ptr<__nv_bfloat16>(cs), ptr<__nv_bfloat16>(cw), ptr<float>(a_log), ptr<float>(dt_bias), (float)lower,
         ptr<float>(q_tmp), ptr<float>(k_save), ptr<__nv_bfloat16>(v_save), ptr<float>(g_save), ptr<float>(b_save));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    constexpr int WARPS = 4, TR = 16;
-    step_kernel<WARPS, TR><<<dim3((unsigned)H, DV / 4 / WARPS), WARPS * 32, 0, stream>>>(
-        H, ptr<float>(state_in), ptr<float>(q_tmp), ptr<float>(k_save), ptr<__nv_bfloat16>(v_save),
-        ptr<float>(g_save), ptr<float>(b_save), (int)rows, ptr<__nv_bfloat16>(y_tmp), ptr<float>(state_out));
+#define STEP(WARPS, TR)                                                                                           \
+    step_kernel<WARPS, TR><<<dim3((unsigned)H, DV / 4 / WARPS), WARPS * 32, 0, stream>>>(                         \
+        H, ptr<float>(state_in), ptr<float>(q_tmp), ptr<float>(k_save), ptr<__nv_bfloat16>(v_save),               \
+        ptr<float>(g_save), ptr<float>(b_save), (int)rows, ptr<__nv_bfloat16>(y_tmp), ptr<float>(state_out))
+    STEP_DISPATCH(warps, tr);
+#undef STEP
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     out_kernel<<<grid, DV, 0, stream>>>(H, ptr<__nv_bfloat16>(y_tmp), ptr<__nv_bfloat16>(G), (int)g_stride,
                                         ptr<__nv_bfloat16>(norm_w), (float)eps, ptr<__nv_bfloat16>(out));
@@ -600,7 +640,7 @@ void kda_chain_wide_segments_cuda(const at::Tensor& seg, int64_t nseg, const at:
                                   const at::Tensor& a_log, const at::Tensor& dt_bias, const at::Tensor& norm_w,
                                   double eps, double lower, int64_t rows, at::Tensor& out, at::Tensor& k_save,
                                   at::Tensor& v_save, at::Tensor& g_save, at::Tensor& b_save, at::Tensor& q_tmp,
-                                  at::Tensor& y_tmp) {
+                                  at::Tensor& y_tmp, int64_t warps, int64_t tr) {
     auto stream = at::cuda::getCurrentCUDAStream();
     const int H = (int)a_log.numel();
     const dim3 grid((unsigned)rows, (unsigned)H);
@@ -610,25 +650,35 @@ void kda_chain_wide_segments_cuda(const at::Tensor& seg, int64_t nseg, const at:
         ptr<float>(dt_bias), (float)lower, ptr<float>(q_tmp), ptr<float>(k_save), ptr<__nv_bfloat16>(v_save),
         ptr<float>(g_save), ptr<float>(b_save));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    constexpr int WARPS = 4, TR = 16;
-    step_seg_kernel<WARPS, TR><<<dim3((unsigned)(nseg * H), DV / 4 / WARPS), WARPS * 32, 0, stream>>>(
-        H, ptr<int>(seg), ptr<float>(rec), (size_t)slot_stride, (size_t)parity_stride, ptr<float>(q_tmp),
-        ptr<float>(k_save), ptr<__nv_bfloat16>(v_save), ptr<float>(g_save), ptr<float>(b_save),
-        ptr<__nv_bfloat16>(y_tmp));
+#define STEP(WARPS, TR)                                                                                           \
+    step_seg_kernel<WARPS, TR><<<dim3((unsigned)(nseg * H), DV / 4 / WARPS), WARPS * 32, 0, stream>>>(            \
+        H, ptr<int>(seg), ptr<float>(rec), (size_t)slot_stride, (size_t)parity_stride, ptr<float>(q_tmp),         \
+        ptr<float>(k_save), ptr<__nv_bfloat16>(v_save), ptr<float>(g_save), ptr<float>(b_save),                   \
+        ptr<__nv_bfloat16>(y_tmp))
+    STEP_DISPATCH(warps, tr);
+#undef STEP
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     out_kernel<<<grid, DV, 0, stream>>>(H, ptr<__nv_bfloat16>(y_tmp), ptr<__nv_bfloat16>(G), (int)g_stride,
-                                        ptr<__nv_bfloat16>(norm_w), (float)eps, ptr<__nv_bfloat16>(out));
+                                        ptr<__nv_bfloat16>(norm_w), (float)eps, ptr<__nv_bfloat16>(out),
+                                        xs.has_value() ? xs->data_ptr<float>() : nullptr);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void kda_replay_layers_segments_cuda(const at::Tensor& seg, int64_t nseg, at::Tensor& rec, int64_t slot_stride,
                                      int64_t parity_stride, int64_t layer_stride, const at::Tensor& k_save,
                                      const at::Tensor& v_save, const at::Tensor& g_save, const at::Tensor& b_save,
-                                     int64_t kv_stride, int64_t b_stride, int64_t layers, int64_t heads) {
+                                  const at::Tensor& a_log, const at::Tensor& dt_bias, const at::Tensor& norm_w,
+                                  double eps, double lower, int64_t rows, at::Tensor& out, at::Tensor& k_save,
+                                  at::Tensor& v_save, at::Tensor& g_save, at::Tensor& b_save, at::Tensor& q_tmp,
+                                  at::Tensor& y_tmp, int64_t warps, int64_t tr, const c10::optional<at::Tensor>& xs) {
     auto stream = at::cuda::getCurrentCUDAStream();
     replay_layers_seg_kernel<<<(unsigned)(nseg * layers * heads), 1024, 0, stream>>>(
         (int)heads, (int)layers, ptr<int>(seg), ptr<float>(rec), (size_t)slot_stride, (size_t)parity_stride,
         (size_t)layer_stride, ptr<float>(k_save), ptr<__nv_bfloat16>(v_save), ptr<float>(g_save), ptr<float>(b_save),
         (size_t)kv_stride, (size_t)b_stride);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    out_kernel<<<grid, DV, 0, stream>>>(H, ptr<__nv_bfloat16>(y_tmp), ptr<__nv_bfloat16>(G), (int)g_stride,
+                                        ptr<__nv_bfloat16>(norm_w), (float)eps, ptr<__nv_bfloat16>(out),
+                                        xs.has_value() ? xs->data_ptr<float>() : nullptr);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

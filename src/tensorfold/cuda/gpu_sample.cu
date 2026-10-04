@@ -64,6 +64,7 @@ __global__ void __launch_bounds__(THREADS) sample_rows_kernel(const float* __res
     __shared__ int oid[MAXC];
     __shared__ double sc[MAXC];
     __shared__ double score[MAXC];
+    __shared__ double ex[MAXC];                                // exp(scaled - top), for the top_p cut
     __shared__ int bad;
     if (threadIdx.x == 0) bad = (W < 1 || W > MAXC);
     __syncthreads();
@@ -79,10 +80,11 @@ __global__ void __launch_bounds__(THREADS) sample_rows_kernel(const float* __res
     }
     __syncthreads();
     // np.lexsort((ids, -values)): value descending (IEEE order, -0 == +0), then id ascending; ids are distinct
+    int nan_here = 0;
     for (int i = threadIdx.x; i < W; i += blockDim.x) {
         const float v = sv[i];
         const int id = sid[i];
-        if (v != v) bad = 1;                                   // NaN: the host rule decides
+        nan_here |= v != v;                                    // NaN: the host rule decides
         int rank = 0;
         for (int j = 0; j < W; ++j) {
             const float u = sv[j];
@@ -90,29 +92,31 @@ __global__ void __launch_bounds__(THREADS) sample_rows_kernel(const float* __res
         }
         if (rank < W) { ov[rank] = v; oid[rank] = id; }
     }
+    if (__syncthreads_or(nan_here) && threadIdx.x == 0) bad = 1;
     __syncthreads();
     if (mode == 0) {                                           // greedy: the first in that order
         if (threadIdx.x == 0) { out[2 * r] = oid[0]; out[2 * r + 1] = bad ? 0 : 1; }
         return;
     }
     const int k = max(1, min(top_k > 0 ? top_k : W, W));
+    const double top = __ddiv_rn((double)ov[0], temp);         // scaled.max(): the first in the order
     for (int i = threadIdx.x; i < k; i += blockDim.x) {
         const double s = __ddiv_rn((double)ov[i], temp);
         sc[i] = s;
         score[i] = __dsub_rn(s, log(-log(keyed_uniform(seed, position, (long long)oid[i]))));
+        ex[i] = exp(__dsub_rn(s, top));
     }
     __syncthreads();
     if (threadIdx.x != 0) return;
     int certain = !bad;
     int keep = k;
     if (top_p > 0.0 && top_p < 1.0) {                          // (cumsum(probs) < top_p).sum() + 1
-        const double top = sc[0];
         double sum = 0.0;
-        for (int i = 0; i < k; ++i) sum += exp(sc[i] - top);
+        for (int i = 0; i < k; ++i) sum += ex[i];
         double cum = 0.0;
         int below = 0;
         for (int i = 0; i < k; ++i) {
-            cum += exp(sc[i] - top) / sum;
+            cum += ex[i] / sum;
             if (fabs(cum - top_p) <= DP) certain = 0;
             below += cum < top_p;
         }
@@ -124,6 +128,7 @@ __global__ void __launch_bounds__(THREADS) sample_rows_kernel(const float* __res
     for (int i = 0; i < k && i < keep; ++i) {
         if (sc[i] < thr) continue;
         const double s = score[i];
+        if (s != s) certain = 0;                               // a NaN score (-inf - -inf): numpy's argmax takes it
         if (best < 0 || s > s1) { s2 = s1; s1 = s; best = i; }
         else if (s > s2) s2 = s;
     }

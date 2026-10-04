@@ -269,14 +269,17 @@ def indexed_prompt_bytes(t: dict, rows: int, world: int = 1) -> int:
 
 def exl3_expert_scratch(rows: int, slots: int, d: int, width: int, *, prompt: bool = False) -> int:
     """GLM's ``exl3_mm.Scratch`` for a window of ``rows`` rows: fp16 rotated inputs of gate/up (2 x pairs x d) and down
-    (pairs x ``width``, a rank's expert width); a decode window's fp32 split-K sums (2 x 4 splits x pairs x
-    max(width, d)) and block counters (16-pair items); a prompt window's (``prompt``: TF_GLM_EXL3_PROMPT) launch order."""
+    (pairs x ``width``, a rank's expert width); a decode window's fp32 split-K sums (gate/up's 2 x 4 splits x pairs x
+    ``width`` or down's pairs x d) with room for the streamed kernel's fine slabs (up to 16 rows of every chain's
+    partials) and block counters (16-pair items); a prompt window's (``prompt``: TF_GLM_EXL3_PROMPT) launch order."""
 
     pairs = rows * slots
     total = 2 * pairs * d * 2 + pairs * width * 2
     if prompt:
         return total + 4 + 4 + (pairs // 16 + 1024) * 4
-    return total + 2 * 4 * pairs * max(width, d) * 4 + (pairs + pairs // 16 + 1) * max(1, width // 128) * 4 + 4
+    fine = min(rows, 16) * slots * (32 * width + 4 * d)
+    return (total + (pairs * max(2 * 4 * width, d) + fine) * 4 + (pairs + pairs // 16 + 1) * max(1, width // 128) * 4
+            + 4)
 
 
 def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560, latent: bool = False,

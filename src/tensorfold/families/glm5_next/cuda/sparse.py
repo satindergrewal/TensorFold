@@ -747,7 +747,10 @@ def seg_select_tokens(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, row
     D = qi.shape[1] // H
     wscale = 1.0 / 5.656854249492381 if H == 32 else H ** -0.5            # select_tokens' constants
     scores = scratch.scores
-    grid = min(SEG_SCORE_GRID, triton.cdiv(scores.shape[1], 64))
+    from . import tune
+
+    t = tune.pick("sparse_scores", tune.shape(H, D), scores.shape[1])   # a launch table's grid (TF_GLM_TUNE)
+    grid = min(int(t["grid"]) if t else SEG_SCORE_GRID, triton.cdiv(scores.shape[1], 64))
     pkv, pks, rs, fp8 = kv8.parts(pk)
     # a window of R rows holds at most R segments: no programs for the table's unused (0-row) segments
     _seg_scores[(min(rows.max_segs, R), grid)](qi, wts, wts.stride(0), pkv, pks, scores, scores.stride(0), rows.pos,

@@ -149,8 +149,7 @@ class MultiDrafter:
         self.trash = self.t_max
         self.slot_rows = streams * self.cap + self.trash
         KV, hd = d.kvh, d.hd
-        self.kc = [torch.zeros((KV, self.slot_rows, hd), dtype=torch.bfloat16, device=self.dev) for _ in d.layers]
-        self.vc = [torch.zeros((KV, self.slot_rows, hd), dtype=torch.bfloat16, device=self.dev) for _ in d.layers]
+        self.kc, self.vc = self._pools(len(d.layers), KV, self.slot_rows, hd)
         self.pos = torch.zeros((streams + 1,), dtype=torch.int64, device=self.dev)   # + the trash entry
         self.contexts = [DraftContext(self, i) for i in range(streams)]
         pinned = torch.cuda.is_available()
@@ -176,6 +175,19 @@ class MultiDrafter:
         self.block_graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self.tap_graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self.buckets = list(range(n, T + 1, n))
+        self.replays = {"blocks graph": 0, "blocks eager": 0, "taps graph": 0, "taps eager": 0}   # the profile's
+        # TF_GLM_MULTI_PROFILE (``multi``): the block passes' GPU ms, read after the candidates' own sync
+        self.timing = False
+        self.pass_ms = 0.0
+        self._pev = None
+
+    def _pools(self, layers: int, kv: int, rows: int, hd: int) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        """The context rings: a key and a value tensor [kv heads, rows, head_dim] a layer (``dflash2_fast`` stacks
+        them into one tensor each and hands out per-layer views)."""
+
+        def ring() -> torch.Tensor:
+            return torch.zeros((kv, rows, hd), dtype=torch.bfloat16, device=self.dev)
+        return [ring() for _ in range(layers)], [ring() for _ in range(layers)]
 
     def nbytes(self) -> int:
         """The pool's context rows (the weights are the drafter's)."""
@@ -210,14 +222,20 @@ class MultiDrafter:
         _dattn_seg_kernel[(d.kvh, S)](q, self.kc[i], self.vc[i], out, pos, slot, d.window, d.hd ** -0.5, rows,
                                       self.slot_rows, N=n, G=d.heads // d.kvh, NH=d.heads, HD=d.hd, CAP=self.cap,
                                       BK=64, CAUSAL=d.causal, RING=bool(d.ring), num_warps=4)
-        x = _dconv(d._row(out, L.o), dyn, L.a_base, 1, d.gs, x, seg=n)
+        x = _dconv(self._project_rows(out, L.o), dyn, L.a_base, 1, d.gs, x, seg=n)
         normed, xs = d._norm(x, L.post_norm)
         dyn = _mm(normed, L.m_kp, xs)
         gu = _mm(_dconv(normed, dyn, L.m_base, 0, d.gs, seg=n), L.gu)
         act = torch.empty((rows, d.inter), dtype=torch.bfloat16, device=self.dev)
         axs = torch.empty((rows, d.inter // 64), dtype=torch.float32, device=self.dev)
         glue.swiglu(gu, act, axs, NO_LIMIT)
-        return _dconv(d._row(act, L.down, axs), dyn, L.m_base, 1, d.gs, x, seg=n)
+        return _dconv(self._project_rows(act, L.down, axs), dyn, L.m_base, 1, d.gs, x, seg=n)
+
+    def _project_rows(self, x: torch.Tensor, q, xs: torch.Tensor | None = None) -> torch.Tensor:
+        """A row-parallel projection's rows (``Drafter._row``: fp32 partials gathered and added in rank order);
+        ``dflash2_fast`` may gather bf16 partials instead."""
+
+        return self.d._row(x, q, xs)
 
     def _block_compute(self, S: int) -> None:
         """S streams' blocks [pending, mask x (block - 1)] at their committed lengths (``b_meta``), then each
@@ -341,6 +359,7 @@ class MultiDrafter:
             g.replay()
         else:
             self._taps_compute(T)
+        self.replays["taps graph" if g is not None else "taps eager"] += 1
         for c, part, p0 in pieces:
             c.context_end = p0 + part.shape[0]
 
@@ -385,16 +404,26 @@ class MultiDrafter:
             h[s], h[St + s], h[2 * St + s] = int(pending), c.slot, c.context_end
         self.b_meta.copy_(h, non_blocking=True)
         g = self.block_graphs.get(S)
+        timed = self.timing and self.cand_ready is not None
+        if timed:
+            if self._pev is None:
+                self._pev = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+            self._pev[0].record()
         if g is not None:
             g.replay()
         else:
             self._block_compute(S)
+        self.replays["blocks graph" if g is not None else "blocks eager"] += 1
+        if timed:
+            self._pev[1].record()
         if self.cand_ready is not None:
             self.cand_host.copy_(self.cand, non_blocking=True)
             self.cand_ready.record()
             self.cand_ready.synchronize()
         else:
             self.cand_host.copy_(self.cand)
+        if timed and self._pev[0].query() and self._pev[1].query():   # both recorded above, done by the sync
+            self.pass_ms += self._pev[0].elapsed_time(self._pev[1])
         d = self.d
         m, k = self.block - 1, d.top_k
         g_all = self.cand_host[:d.gathered * S * m * 2 * k].view(d.gathered, S * m, 2 * k)

@@ -314,11 +314,12 @@ bool qmm_clusters(int SK, bool reduce) {
     return SK > 1 && SK <= 8 && reduce && at::cuda::getCurrentDeviceProperties()->major >= 9;
 }
 
-// ``qmm_cuda`` for decode rows (M <= 16, groups of 64, K slices reduced) on tile config ``cfg``.
+// ``qmm_cuda`` for decode rows (M <= 64, groups of 64, K slices reduced) on tile config ``cfg``: above 16 rows the
+// configs' 16-row tiles sit side by side, as qmm_cuda's own buckets run them.
 void qmm_cfg_cuda(const at::Tensor& x, const at::Tensor& xs, const at::Tensor& w, const at::Tensor& scales,
                   const at::Tensor& biases, at::Tensor& out, const at::Tensor& part, int N, int SK, bool f32, int cfg) {
     const int M = x.size(0);
-    TORCH_CHECK(M <= 16, "qmm_cfg: decode rows (up to 16)");
+    TORCH_CHECK(M <= 64, "qmm_cfg: decode rows (up to 64: 16-row tiles side by side)");
     const bool cluster = qmm_clusters(SK, true);
     if (f32) { if (cluster) dispatch_cfg<true, true>(cfg, x, xs, w, scales, biases, out, part, N, SK);
                else dispatch_cfg<true, false>(cfg, x, xs, w, scales, biases, out, part, N, SK); }

@@ -93,6 +93,9 @@ class BatchedVerify:
         if taps:
             self.b.set_taps(tuple(taps), c.hidden)
         self.taps = bool(taps)
+        from .dflash2_fast import settings as _fast              # TF_GLM_DRAFT_FAST: one copy of the window's taps
+
+        self.one_cat = self.taps and _fast().on
         self.seg_rows = SegRows(rows, dev, max_segs=MAX_SEGS, ring=e.caches.ring if e.caches.rings else None)
         self.sel = SelectScratch(rows, e.caches.rows, dev) if e.caches.index is not None else None
         kda_layers = [l for l in w.layers if l.kind == "kda"]
@@ -110,23 +113,38 @@ class BatchedVerify:
         self.segments: list[Segment] = []
         self.R = 0
         self.graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self.pgraphs: dict[int, torch.cuda.CUDAGraph] = {}    # TF_GLM_SEGPROF (segprof): the profiled graphs
         self.replays = {"graph": 0, "eager": 0}
+        self.widths: list[int] = []                 # the captured widths (``wide.widths``), ascending
+
+    def width(self, R: int) -> int | None:
+        """The captured width a window of R rows replays (``wide.width_for``): R itself, or the next one a padded
+        round reaches (TF_GLM_MULTI_GRAPH_STEP); None past every one."""
+
+        from .wide import width_for
+
+        return width_for(R, self.widths)
 
     @torch.no_grad()
     def capture(self, rows: Sequence[int] | None = None) -> None:
-        """CUDA graphs of the window for each row count (default 1 .. its rows), both ranks together: positions,
+        """CUDA graphs of the window for each row count (default ``wide.widths``: 1 .. its rows, past 64 rows every
+        TF_GLM_MULTI_GRAPH_STEP rows), both ranks together: positions,
         extents, slots and parities live in the device tables, so one graph a row count covers every mix. Captured on
         a window of slot 0 at the pool's first rows (the warm-up runs write there; slot 0's states are cleared after,
         so capture before any stream is admitted). With the indexer the graphs always run the token selection (its
-        dense rows ignore it: the same bits as a window that skips it)."""
+        dense rows ignore it: the same bits as a window that skips it). TF_GLM_SEGPROF: each width a second time, its
+        segment boundaries as event-record nodes (``segprof``), then checked against the plain graphs."""
 
+        from . import segprof
         from .forward import compute
         from .sparse import SPARSE_FROM
+
+        from .wide import widths
 
         e, w, b = self.e, self.w, self.b
         index = e.caches.index is not None
         pool = torch.cuda.graph_pool_handle()
-        for R in rows or range(1, self.rows_max + 1):
+        for R in rows or widths(self.rows_max):
             self._stage([0] * R)
             self.seg_rows.set([self._span(e.home, 0, R)], sparse_from=SPARSE_FROM if index else None)
             self._write_table([(R, 0, 0, 0, R)])
@@ -138,7 +156,19 @@ class BatchedVerify:
             with torch.cuda.graph(g, pool=pool):
                 run()
             self.graphs[R] = g
+            sp = segprof.ACTIVE
+            if sp is not None:                  # the same calls with event-record nodes at the segment boundaries
+                pg = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(pg, pool=pool):
+                    with sp.recording() as log:
+                        run()
+                self.pgraphs[R], sp.logs[R] = pg, log
+        self.widths = sorted(self.graphs)
         torch.cuda.synchronize()
+        if segprof.ACTIVE is not None and self.pgraphs:
+            line = segprof.ACTIVE.check(self)   # every rank: its replays' all-gathers
+            if segprof.ACTIVE.reader:
+                print(line, flush=True)
         e.slots.rec[0].zero_()
         e.slots.conv[0].zero_()
 
@@ -156,19 +186,23 @@ class BatchedVerify:
         out = []
         start, stop = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         tokens = timing_tokens(self.w.cfg.vocab, self.rows_max)
+        timed: dict[int, float] = {}
         for R in range(1, min(most or self.rows_max, self.rows_max) + 1):
-            g = self.graphs[R]
-            self._stage(tokens[:R])
-            self.seg_rows.set([self._span(self.e.home, 0, R)], sparse_from=SPARSE_FROM if index else None)
-            self._write_table([(R, 0, 0, 0, R)])
-            best = float("inf")
-            for _ in range(reps + 1):
-                start.record()
-                g.replay()
-                stop.record()
-                stop.synchronize()
-                best = min(best, start.elapsed_time(stop))
-            out.append(best)
+            W = R if R in self.graphs else self.width(R)       # a round of R rows pads to W (wide.py)
+            if W not in timed:
+                g = self.graphs[W]
+                self._stage(tokens[:W])
+                self.seg_rows.set([self._span(self.e.home, 0, W)], sparse_from=SPARSE_FROM if index else None)
+                self._write_table([(W, 0, 0, 0, W)])
+                best = float("inf")
+                for _ in range(reps + 1):
+                    start.record()
+                    g.replay()
+                    stop.record()
+                    stop.synchronize()
+                    best = min(best, start.elapsed_time(stop))
+                timed[W] = best
+            out.append(timed[W])
         self.e.slots.rec[0].zero_()
         self.e.slots.conv[0].zero_()
         return out
@@ -232,19 +266,37 @@ class BatchedVerify:
         self._tables(segments)
         self.segments, self.R = list(segments), R
         g = self.graphs.get(R)
+        from . import segprof
+
+        sp = segprof.ACTIVE
+        profiled = sp is not None and sp.want()           # TF_GLM_SEGPROF: every K-th batched round
         if g is not None:
             self.replays["graph"] += 1
-            g.replay()
+            pg = self.pgraphs.get(R) if profiled else None
+            if pg is not None:
+                pg.replay()
+                sp.replayed(R, R)
+            else:
+                g.replay()
             logits = b.logits[:R]
         else:
             self.replays["eager"] += 1
             select = index and self.seg_rows.any_sparse()
-            logits = compute(w, None, b, R, mixer=lambda layer: self._mixer(layer, R, select))
+            if profiled:
+                with sp.eager(R):
+                    compute(w, None, b, R, mixer=lambda layer: self._mixer(layer, R, select))
+                logits = b.logits[:R]
+            else:
+                logits = compute(w, None, b, R, mixer=lambda layer: self._mixer(layer, R, select))
         out, taps, at = [], [], 0
+        whole = torch.cat([t[:R] for t in b.taps], dim=1) if self.one_cat else None     # views of one copy, the same rows
         for seg in segments:
             n = len(seg.tokens)
             out.append(logits[at:at + n])
-            taps.append(torch.cat([t[at:at + n] for t in b.taps], dim=1) if self.taps else None)
+            if whole is not None:
+                taps.append(whole[at:at + n])
+            else:
+                taps.append(torch.cat([t[at:at + n] for t in b.taps], dim=1) if self.taps else None)
             at += n
         return Verified(out, taps)
 

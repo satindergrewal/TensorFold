@@ -199,7 +199,7 @@ def _hc_ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_glm_hc_v2", sources=[str(here / "hc.cpp"), str(here / "hc.cu")],
+    return load(name="tensorfold_glm_hc_v2a2", sources=[str(here / "hc.cpp"), str(here / "hc.cu")],
                 extra_cuda_cflags=["-O3"], verbose=False)
 
 
@@ -278,6 +278,96 @@ def hc_post_pair(x: torch.Tensor, xout: torch.Tensor, g0: torch.Tensor, g1: torc
     block = min(1024, d)
     rs = (g1.data_ptr() - g0.data_ptr()) // g0.element_size()
     _hc_post[(rows, d // block)](x, xout, g0, post, comb, rs, D=d, S=s, WORLD=2, BLOCK=block, num_warps=4)
+
+
+@triton.jit
+def _hc_finish_copy(XN, X, PART, BASE, SCALE, NW, OUT, XS, POST, COMB, eps_norm, hc_eps,
+                    D: tl.constexpr, S: tl.constexpr, NB: tl.constexpr, ITERS: tl.constexpr, BLOCK: tl.constexpr):
+    """``hc_post_pre``'s second launch, row r: _hc_finish's code verbatim on the new streams XN (which the first
+    launch computed with _hc_post's operations and stored there; this kernel recomputes nothing), then XN's row copied
+    to X, bit for bit. No buffer is read and written here: XN and PART are read, X, OUT, XS, POST and COMB written."""
+
+    r = tl.program_id(0)
+    m = tl.arange(0, 32)
+    mix = tl.zeros((32,), dtype=tl.float32)
+    ss = 0.0
+    for b in range(NB):
+        mix += tl.load(PART + (r * NB + b) * 32 + m)
+        ss += tl.load(PART + (r * NB + b) * 32 + 24)
+    rinv = 1.0 / tl.sqrt(ss / (S * D) + eps_norm)
+    mix = mix * rinv
+    s_pre = tl.load(SCALE + 0)
+    s_post = tl.load(SCALE + 1)
+    s_comb = tl.load(SCALE + 2)
+    sv = tl.arange(0, 4)
+    base = tl.load(BASE + m, mask=m < 24, other=0.0)
+    pre_logit = tl.sum(tl.where(m[None, :] == sv[:, None], (mix * s_pre + base)[None, :], 0.0), axis=1)
+    post_logit = tl.sum(tl.where(m[None, :] == (sv[:, None] + 4), (mix * s_post + base)[None, :], 0.0), axis=1)
+    pre = 1.0 / (1.0 + tl.exp(-pre_logit)) + hc_eps
+    post = 2.0 * (1.0 / (1.0 + tl.exp(-post_logit)))
+    ii = tl.arange(0, 4)[:, None]
+    jj = tl.arange(0, 4)[None, :]
+    flat = 8 + ii * 4 + jj
+    cl = tl.sum(tl.where(m[None, None, :] == flat[:, :, None], (mix * s_comb + base)[None, None, :], 0.0), axis=2)
+    cmax = tl.max(cl, axis=1)
+    ce = tl.exp(cl - cmax[:, None])
+    comb = ce / tl.sum(ce, axis=1)[:, None] + hc_eps
+    comb = comb / (tl.sum(comb, axis=0)[None, :] + hc_eps)
+    for _ in range(ITERS - 1):
+        comb = comb / (tl.sum(comb, axis=1)[:, None] + hc_eps)
+        comb = comb / (tl.sum(comb, axis=0)[None, :] + hc_eps)
+    tl.store(POST + r * S + sv, post)
+    tl.store(COMB + r * 16 + ii * 4 + jj, comb)
+    d = tl.arange(0, BLOCK)
+    p0 = tl.sum(tl.where(sv == 0, pre, 0.0), axis=0)
+    p1 = tl.sum(tl.where(sv == 1, pre, 0.0), axis=0)
+    p2 = tl.sum(tl.where(sv == 2, pre, 0.0), axis=0)
+    p3 = tl.sum(tl.where(sv == 3, pre, 0.0), axis=0)
+    x0 = tl.load(XN + r * (S * D) + d).to(tl.float32)
+    x1 = tl.load(XN + r * (S * D) + D + d).to(tl.float32)
+    x2 = tl.load(XN + r * (S * D) + 2 * D + d).to(tl.float32)
+    x3 = tl.load(XN + r * (S * D) + 3 * D + d).to(tl.float32)
+    c = (((p0 * x0 + p1 * x1) + p2 * x2) + p3 * x3).to(tl.bfloat16).to(tl.float32)
+    rinv2 = 1.0 / tl.sqrt(tl.sum(c * c, axis=0) / D + eps_norm)
+    w = tl.load(NW + d).to(tl.float32)
+    y = (w * (c * rinv2).to(tl.bfloat16).to(tl.float32)).to(tl.bfloat16)
+    tl.store(OUT + r * D + d, y)
+    g = tl.sum(tl.reshape(y.to(tl.float32), (BLOCK // 64, 64)), axis=1)
+    tl.store(XS + r * (D // 64) + tl.arange(0, BLOCK // 64), g)
+    for s in tl.static_range(S):                              # the new streams into X, bit for bit
+        tl.store(X + r * (S * D) + s * D + d, tl.load(XN + r * (S * D) + s * D + d))
+
+
+def hc_post_pre_ok(x: torch.Tensor, gathered: torch.Tensor, fn: torch.Tensor | None = None,
+                   norm_w: torch.Tensor | None = None) -> bool:
+    """Whether ``hc_post_pre`` takes these tensors (decode rows at the CUDA kernel's shapes); ``fn`` / ``norm_w``:
+    the next site's weights, when known."""
+    if gathered.dim() != 3:
+        return False
+    world, rows, d = gathered.shape
+    ok = (x.is_contiguous() and gathered.is_contiguous() and gathered.dtype == torch.float32 and x.dim() == 2
+          and x.shape[1] == 16384 and d == 4096 and HC_BLOCKS == 16 and 1 <= world <= 4 and x.shape[0] == rows)
+    if fn is not None:
+        ok = ok and fn.is_contiguous() and tuple(fn.shape) == (24, 16384)
+    if norm_w is not None:
+        ok = ok and norm_w.shape[0] == d
+    return ok
+
+
+def hc_post_pre(x: torch.Tensor, gathered: torch.Tensor, fn: torch.Tensor, base: torch.Tensor, scale: torch.Tensor,
+                norm_w: torch.Tensor, out: torch.Tensor, xs: torch.Tensor, post: torch.Tensor, comb: torch.Tensor,
+                part: torch.Tensor, eps: float, hc_eps: float, iters: int, xn: torch.Tensor) -> None:
+    """``hc_post(x, x, gathered, post, comb)`` then ``hc_pre(x, fn, ..., post, comb, part)`` for decode rows in two
+    launches instead of three, with the same bits (``fuse``'s check compares them on this GPU first): the new streams
+    (hc.cu, POST: _hc_post's operations as Triton orders them, into ``xn`` [rows, S * D] bf16, scratch) and their
+    partial dots from the old streams, then _hc_finish on xn and xn's rows copied to x (_hc_finish_copy). ``post`` /
+    ``comb`` hold the previous site's on entry and this site's on return."""
+
+    world, rows, d = gathered.shape
+    s = x.shape[1] // d
+    _hc_ext().hc_post_partial(x, gathered, rows * d, post, comb, fn, part, rows, world, xn)
+    _hc_finish_copy[(rows,)](xn, x, part, base, scale, norm_w, out, xs, post, comb, eps, hc_eps, D=d, S=s,
+                             NB=HC_BLOCKS, ITERS=iters, BLOCK=d, num_warps=8)
 
 
 @triton.jit
@@ -458,6 +548,68 @@ def select(logits: torch.Tensor, bias: torch.Tensor, pick: torch.Tensor, wts: to
     block = triton.next_power_of_2(experts + 1)
     _topk[(rows,)](logits, bias, pick, wts, float(scale), NE=experts, TOPK=top_k, SLOTS=top_k + 1, BLOCK=block,
                    SLOTP=triton.next_power_of_2(top_k + 1), NORM=norm, num_warps=4)
+
+
+@triton.jit
+def _router_topk(PART, L, BIAS, PICK, WTS, scale, total, KS: tl.constexpr, NE: tl.constexpr, TOPK: tl.constexpr,
+                 SLOTS: tl.constexpr, BLOCK: tl.constexpr, SLOTP: tl.constexpr, NORM: tl.constexpr):
+    """_router_sum then _topk for row r in one program (decode rows, ``router_select``): the row's logits are the KS
+    slice partials added in slice order (_router_sum's adds), stored to L as _router_sum does, then _topk's code as it
+    is on them (its load of L replaced by the values just summed: the same fp32 values)."""
+
+    r = tl.program_id(0)
+    ar = tl.arange(0, BLOCK)
+    ak = tl.arange(0, SLOTP)
+    ok = ar < NE
+    i = r * NE + ar
+    lg = tl.load(PART + i, mask=ok, other=0.0)
+    for s in tl.static_range(1, KS):
+        lg = lg + tl.load(PART + s * total + i, mask=ok, other=0.0)
+    tl.store(L + i, lg, mask=ok)
+    score = 1.0 / (1.0 + tl.exp(-lg))
+    choice = tl.where(ok, score + tl.load(BIAS + ar, mask=ok, other=0.0), float("-inf"))
+    picks = tl.zeros((SLOTP,), dtype=tl.int32)
+    wts = tl.zeros((SLOTP,), dtype=tl.float32)
+    total_w = 0.0
+    for k in tl.static_range(TOPK):
+        mx = tl.max(choice, axis=0)
+        idx = tl.min(tl.where(choice == mx, ar, BLOCK), axis=0)
+        sk = tl.sum(tl.where(ar == idx, score, 0.0), axis=0)
+        picks = tl.where(ak == k, idx, picks)
+        wts = tl.where(ak == k, sk, wts)
+        total_w += sk
+        choice = tl.where(ar == idx, float("-inf"), choice)
+    if NORM:
+        wts = wts / (total_w + 1e-20)
+    wts = wts * scale
+    picks = tl.where(ak == TOPK, NE, picks)
+    wts = tl.where(ak == TOPK, 1.0, wts)
+    tl.store(PICK + r * SLOTS + ak, picks, mask=ak < SLOTS)
+    tl.store(WTS + r * SLOTS + ak, wts, mask=ak < SLOTS)
+
+
+def router_select_ok(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor) -> bool:
+    """Whether ``router`` runs the sliced path here (the one ``router_select`` fuses), with one logit an expert."""
+    return (ROUTER_KS > 1 and x.shape[1] % (ROUTER_KS * 64) == 0 and out.is_contiguous()
+            and w.shape[0] == out.shape[-1])
+
+
+def router_select(x: torch.Tensor, w: torch.Tensor, logits: torch.Tensor, bias: torch.Tensor, pick: torch.Tensor,
+                  wts: torch.Tensor, top_k: int, experts: int, scale: float, norm: bool) -> None:
+    """``router(x, w, logits)`` then ``select(logits, ...)`` with _router_sum folded into _topk: one launch less,
+    the same bits (``fuse``'s check compares them on this GPU first); logits are written as before."""
+
+    m, d = x.shape
+    ne = w.shape[0]
+    bm = 16 if m <= 16 else 32 if m <= 32 else 64 if m <= 64 else 128
+    ks = ROUTER_KS
+    part = torch.empty((ks, m, ne), dtype=torch.float32, device=x.device)
+    _router_part[(triton.cdiv(m, bm), triton.cdiv(ne, 32), ks)](x, w, part, m, x.stride(0), D=d, NE=ne, BM=bm,
+                                                                 BLOCK_E=32, BK=64, KS=ks, num_warps=4,
+                                                                 num_stages=3)
+    block = triton.next_power_of_2(experts + 1)
+    _router_topk[(m,)](part, logits, bias, pick, wts, float(scale), m * ne, KS=ks, NE=experts, TOPK=top_k,
+                       SLOTS=top_k + 1, BLOCK=block, SLOTP=triton.next_power_of_2(top_k + 1), NORM=norm, num_warps=4)
 
 
 @triton.jit

@@ -16,8 +16,23 @@ def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_glm_kda_v2", sources=[str(here / "kda.cpp"), str(here / "kda.cu")],
+    return load(name="tensorfold_glm_kda_v2a4", sources=[str(here / "kda.cpp"), str(here / "kda.cu")],
                 extra_cuda_cflags=["-O3", "--fmad=false"], verbose=False)
+
+
+STEP_DEFAULT = (4, 16)      # the step kernels' warps a block and staged rows (GB10's choice; kda.cu STEP_DISPATCH)
+
+
+def step_launch(heads: int, rows: int) -> tuple[int, int]:
+    """(warps, staged rows) of the wide chain's step kernel for ``rows`` rows of ``heads`` heads: STEP_DEFAULT, or a
+    launch table's ``kda_step`` entry (TF_GLM_TUNE). Every setting gives the same bits."""
+
+    from . import tune
+
+    t = tune.pick("kda_step", tune.shape(heads), rows)
+    if not t:
+        return STEP_DEFAULT
+    return int(t.get("warps", STEP_DEFAULT[0])), int(t.get("tr", STEP_DEFAULT[1]))
 
 
 class KDAScratch:
@@ -93,8 +108,9 @@ def reserve(rows: int, heads: int, device) -> None:
 def chain(p: torch.Tensor, b_off: int, a: torch.Tensor, g: torch.Tensor, conv_state: torch.Tensor,
           conv_w: torch.Tensor, state_in: torch.Tensor, a_log: torch.Tensor, dt_bias: torch.Tensor,
           norm_w: torch.Tensor, eps: float, lower: float, rows: int, scratch: KDAScratch,
-          state_out: torch.Tensor, *, wide: bool | None = None, pos: int | None = None) -> torch.Tensor:
-    """Run projection rows p [q | k | v | ... | b at b_off ...] and bf16 gate rows a and g; windows of WIDE_ROWS rows or more take the three-kernel path, same bits; a prompt chunk (``pos``: its first row's position) takes the chunked form under TF_GLM_KDA_CHUNKED=1 (scratch's k/v/g/b are not written)."""
+          state_out: torch.Tensor, *, wide: bool | None = None, pos: int | None = None,
+          xs: torch.Tensor | None = None) -> torch.Tensor:
+    """Run projection rows p [q | k | v | ... | b at b_off ...] and bf16 gate rows a and g; windows of WIDE_ROWS rows or more take the three-kernel path, same bits; a prompt chunk (``pos``: its first row's position) takes the chunked form under TF_GLM_KDA_CHUNKED=1 (scratch's k/v/g/b are not written). ``xs`` (decode rows): also out's 64-input group sums, qmm.group_sums' bits (the wide path computes them in its output kernel)."""
 
     if CHUNKED and pos is not None:
         from . import kda_chunked
@@ -103,13 +119,18 @@ def chain(p: torch.Tensor, b_off: int, a: torch.Tensor, g: torch.Tensor, conv_st
                                  rows, scratch.out, state_out, pos)
     if wide if wide is not None else rows >= WIDE_ROWS:
         q_tmp, y_tmp = _wide_scratch(rows, a_log.numel(), p.device)
+        warps, tr = step_launch(a_log.numel(), int(rows))
         _ext().chain_wide(p, p.stride(0), int(b_off), a, a.stride(0), g, g.stride(0), conv_state, conv_w, state_in,
                           a_log, dt_bias, norm_w, float(eps), float(lower), int(rows), scratch.out, state_out,
-                          scratch.k, scratch.v, scratch.g, scratch.b, q_tmp, y_tmp)
+                          scratch.k, scratch.v, scratch.g, scratch.b, q_tmp, y_tmp, warps, tr)
         return scratch.out[:rows]
     _ext().chain(p, p.stride(0), int(b_off), a, a.stride(0), g, g.stride(0), conv_state, conv_w, state_in, a_log,
                  dt_bias, norm_w, float(eps), float(lower), int(rows), scratch.out, state_out, scratch.k, scratch.v,
                  scratch.g, scratch.b)
+    if xs is not None:                   # the one-block chain has no group sums of its own
+        from . import qmm
+
+        qmm.group_sums(scratch.out[:rows], xs)
     return scratch.out[:rows]
 
 
@@ -156,16 +177,17 @@ def segment_table(segments, device, out: torch.Tensor | None = None) -> torch.Te
 def chain_segments(seg: torch.Tensor, p: torch.Tensor, b_off: int, a: torch.Tensor, g: torch.Tensor,
                    conv: torch.Tensor, conv_w: torch.Tensor, rec: torch.Tensor, a_log: torch.Tensor,
                    dt_bias: torch.Tensor, norm_w: torch.Tensor, eps: float, lower: float, rows: int,
-                   scratch: KDAScratch) -> torch.Tensor:
+                   scratch: KDAScratch, xs: torch.Tensor | None = None) -> torch.Tensor:
     """One layer's window of ``rows`` rows cut into the segments ``seg`` (``segment_table``): p/a/g as in ``chain``;
     conv [conv slots, 3, 3 H 128] this layer's conv windows (read only; ``conv_shift_segments`` after the commit);
     rec [state slots, 2, H, 128, 128] this layer's states (e.g. ``rec[:, :, layer]``). The three-kernel path
     (``chain_wide``) for any window."""
 
     q_tmp, y_tmp = _wide_scratch(rows, a_log.numel(), p.device)
+    warps, tr = step_launch(a_log.numel(), int(rows))
     _ext().chain_wide_segments(seg, p, p.stride(0), int(b_off), a, a.stride(0), g, g.stride(0), conv, conv_w, rec,
                                a_log, dt_bias, norm_w, float(eps), float(lower), int(rows), scratch.out, scratch.k,
-                               scratch.v, scratch.g, scratch.b, q_tmp, y_tmp)
+                               scratch.v, scratch.g, scratch.b, q_tmp, y_tmp, warps, tr)
     return scratch.out[:rows]
 
 

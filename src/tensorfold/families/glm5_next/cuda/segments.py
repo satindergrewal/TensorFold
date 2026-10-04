@@ -19,17 +19,21 @@ MAX_SEGS = 4          # streams a window holds (GlmEngine raises it to --paralle
 EXTENT = 2048         # a stream's extent starts at a multiple of this many tokens (its pooled keys at base / 4)
 
 
+WINDOW_LEAST, WINDOW_MOST = 16, 256  # TF_GLM_MULTI_WINDOW's range (wide windows past 63 rows: wide.py)
+
+
 def window_rows(value: str | None = None) -> int:
     """TF_GLM_MULTI_WINDOW: rows of every stream's verify windows together in one --parallel
-    round (default 32, as before). 16 to 63: the decode buffers hold 64 rows (geometry.MLA_DECODE_ROWS) and a window
-    of 64 rows or more would take the routed experts' prompt kernels (exl3_mm.PROMPT_ROWS)."""
+    round (default 32, as before), 16 to 256. A window of 64 rows or more keeps the decode kernels (its buffers are
+    decode buffers, sized by the window; the routed experts take the grouped or streamed kernels, the decode kernel's
+    bits), and the startup estimate counts its rows past 64 (``wide.extra_bytes``)."""
 
     import os
 
     value = (os.environ.get("TF_GLM_MULTI_WINDOW", "") if value is None else value).strip()
     rows = 32 if value == "" else int(value) if value.isdecimal() else -1
-    if not 16 <= rows <= 63:
-        raise ValueError(f"TF_GLM_MULTI_WINDOW: 16 to 63 rows, not {value!r}")
+    if not WINDOW_LEAST <= rows <= WINDOW_MOST:
+        raise ValueError(f"TF_GLM_MULTI_WINDOW: {WINDOW_LEAST} to {WINDOW_MOST} rows, not {value!r}")
     return rows
 
 

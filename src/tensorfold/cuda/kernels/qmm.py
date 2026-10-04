@@ -18,7 +18,7 @@ def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_qmm_v6", sources=[str(here / "qmm.cpp"), str(here / "qmm.cu"),
+    return load(name="tensorfold_qmm_v7", sources=[str(here / "qmm.cpp"), str(here / "qmm.cu"),
                                                    str(here / "qmm_group.cu"), str(here / "qmm_prefill.cu"),
                                                    str(here / "qmm_prefill8.cu")],
                 extra_cuda_cflags=["-O3"], verbose=False)
@@ -128,6 +128,11 @@ def split_k(n: int, k: int, gs: int = 64, target: int = 192) -> int:
     return sk
 
 
+# rows up to which ``variant`` may run a decode tile config (16-row tiles side by side above 16 rows; tiles never
+# change bits; a launch table chooses a variant above 16 rows, nothing else does)
+CFG_ROWS = 64
+
+
 def bucket(m: int) -> int:
     """The row tile: 16 or 32 rows, else 64-row tiles side by side; tiles never change bits."""
 
@@ -158,7 +163,7 @@ def matmul(x: torch.Tensor, q: Q4, xs: torch.Tensor | None = None, *, sk: int | 
            out: torch.Tensor | None = None, part: torch.Tensor | None = None, reduce: bool = True,
            variant: int | None = None) -> torch.Tensor:
     """x @ q.T as (M, n) bf16, or unrounded fp32 with ``f32``; ``reduce=False`` returns K slices to add in order;
-    ``variant``: decode rows (up to 16, groups of 64) on another tile config (``qmm_cfg``: the same bits)."""
+    ``variant``: decode rows (up to CFG_ROWS, groups of 64) on another tile config (``qmm_cfg``: the same bits)."""
 
     if x.dtype != torch.bfloat16 or x.dim() != 2 or x.shape[1] != q.k:
         raise ValueError(f"matmul: x must be (M, {q.k}) bf16")
@@ -176,7 +181,7 @@ def matmul(x: torch.Tensor, q: Q4, xs: torch.Tensor | None = None, *, sk: int | 
         return out
     if sk > 1 and not reduce and part is None:
         part = torch.empty((sk, m, q.n), dtype=torch.float32, device=x.device)
-    if variant is not None and reduce and m <= 16 and q.gs == 64:
+    if variant is not None and reduce and m <= CFG_ROWS and q.gs == 64:
         _ext().qmm_cfg(x, xs, q.weight, q.scales, q.biases, out, part, q.n, sk, f32, int(variant))
         return out
     _ext().qmm(x, xs, q.weight, q.scales, q.biases, out, part, q.n, sk, q.gs, bucket(m), f32, reduce)

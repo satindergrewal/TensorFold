@@ -254,11 +254,17 @@ class RoundProfile:
         self.every, self.log, self.label = every, log, label
         self.cuda = torch.cuda.is_available()
         self.ev = [torch.cuda.Event(enable_timing=True) for _ in range(2)] if self.cuda else None
+        self.armed = 0                    # this round's events recorded: 1 after gpu_start, 2 after gpu_stop
+        # () -> cumulative {path: count} of CUDA graph replays and eager runs (the decoder's verify windows, the
+        # drafter's block passes and tap updates); each report gives the counts since the last one
+        self.counters = None
+        self._c0: dict = {}
         self._reset()
         self.t_report = time.perf_counter()
 
     def _reset(self) -> None:
         self.rounds = 0
+        self.gpu_rounds = 0               # rounds whose verify GPU time was read (every round of a live decoder)
         self.sums = dict.fromkeys(self.STAGES + ("wall", "gpu"), 0.0)
         self.rows = self.streams = self.tokens = self.drafted = 0
         self.fill_s = 0.0
@@ -267,6 +273,7 @@ class RoundProfile:
     def begin(self, t0: float | None = None) -> None:
         self.t0 = time.perf_counter() if t0 is None else t0
         self.t = self.t0
+        self.armed = 0
 
     def mark(self, stage: str) -> None:
         now = time.perf_counter()
@@ -276,10 +283,12 @@ class RoundProfile:
     def gpu_start(self) -> None:
         if self.cuda:
             self.ev[0].record()
+            self.armed = 1
 
     def gpu_stop(self) -> None:
-        if self.cuda:
+        if self.cuda and self.armed == 1:
             self.ev[1].record()
+            self.armed = 2
 
     def fill(self, seconds: float) -> None:
         self.fills += 1
@@ -287,8 +296,13 @@ class RoundProfile:
 
     def end(self, streams: int, rows: int, tokens: int, drafted: int) -> None:
         self.sums["wall"] += time.perf_counter() - self.t0
-        if self.cuda:
+        # the window's GPU time when this round recorded both events and both have completed (a decoder's round
+        # records them around its verify and the sampler has waited for it); any other round adds no GPU time
+        # rather than raising (an event never recorded) or waiting (one not yet reached)
+        if self.cuda and self.armed == 2 and self.ev[0].query() and self.ev[1].query():
             self.sums["gpu"] += self.ev[0].elapsed_time(self.ev[1]) / 1e3
+            self.gpu_rounds += 1
+        self.armed = 0
         self.rounds += 1
         self.streams += streams
         self.rows += rows
@@ -297,17 +311,37 @@ class RoundProfile:
         if self.rounds >= self.every:
             self.report()
 
+    def _replays(self) -> str:
+        """'; replays verify graph N eager M, ...' since the last report (empty without counters)."""
+
+        if self.counters is None:
+            return ""
+        try:
+            now = dict(self.counters())
+        except Exception:  # noqa: BLE001 - the profile never stops a round
+            return ""
+        delta = {k: v - self._c0.get(k, 0) for k, v in now.items()}
+        self._c0 = now
+        n = max(self.rounds, 1)
+        counts = ", ".join(f"{k} {v}" for k, v in delta.items() if not k.endswith(" ms"))
+        times = ", ".join(f"{k[:-3]} {v / n:.2f} ms a round" for k, v in delta.items() if k.endswith(" ms"))
+        return "; replays " + counts + (f"; {times}" if times else "")
+
     def report(self) -> None:
         n = max(self.rounds, 1)
         ms = {k: 1e3 * v / n for k, v in self.sums.items()}
+        ms["gpu"] = 1e3 * self.sums["gpu"] / max(self.gpu_rounds, 1)        # a timed round's
+        untimed = (f" ({self.gpu_rounds} of {self.rounds} rounds timed)"
+                   if self.cuda and self.gpu_rounds < self.rounds else "")
         staged = sum(ms[k] for k in self.STAGES)
         span = time.perf_counter() - self.t_report
         self.log(f"[tensorfold] multi profile{' (' + self.label + ')' if self.label else ''}, {self.rounds} rounds: {self.streams / n:.2f} streams, "
                  f"{self.rows / n:.1f} rows ({self.drafted / n:.1f} drafted), {self.tokens / n:.2f} tokens a round; "
                  f"ms a round: wall {ms['wall']:.1f} = " +
                  " + ".join(f"{k} {ms[k]:.1f}" for k in self.STAGES) +
-                 f" + other {ms['wall'] - staged:.1f}; verify GPU {ms['gpu']:.1f}; "
+                 f" + other {ms['wall'] - staged:.1f}; verify GPU {ms['gpu']:.1f}{untimed}; "
                  f"{self.tokens / max(self.sums['wall'], 1e-9):.1f} tok/s in rounds; prompt chunks {self.fills} "
-                 f"({1e3 * self.fill_s:.0f} ms, {100 * self.fill_s / max(span, 1e-9):.1f}% of {span:.1f} s)")
+                 f"({1e3 * self.fill_s:.0f} ms, {100 * self.fill_s / max(span, 1e-9):.1f}% of {span:.1f} s)"
+                 + self._replays())
         self._reset()
         self.t_report = time.perf_counter()

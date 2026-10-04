@@ -42,7 +42,7 @@ def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_gpu_sample_v1", sources=[str(here / "gpu_sample.cpp"), str(here / "gpu_sample.cu")],
+    return load(name="tensorfold_gpu_sample_v2", sources=[str(here / "gpu_sample.cpp"), str(here / "gpu_sample.cu")],
                 extra_cuda_cflags=["-O3"], verbose=False)
 
 
@@ -132,17 +132,18 @@ def launch(got: torch.Tensor, rank_stride: int, world: int, tab: np.ndarray) -> 
 
     rows = int(tab.shape[0])
     dev = got.device
-    host_t = _buf("table", (rows, COLS), torch.int64)
-    host_t.numpy()[:] = tab
-    dev_t = _buf("table", (rows, COLS), torch.int64, dev)
-    dev_t.copy_(host_t, non_blocking=True)
-    out = _buf("out", (rows, 2), torch.int32, dev)
-    _ext().sample_rows(got.contiguous().view(-1), int(rank_stride), int(world), dev_t, out, rows)
-    host_o = _buf("out", (rows, 2), torch.int32)
-    host_o.copy_(out, non_blocking=True)
-    ev = torch.cuda.Event()
-    ev.record()
-    ev.synchronize()
+    with torch.cuda.device(dev):                    # the copies, the kernel and the event on got's device's stream
+        host_t = _buf("table", (rows, COLS), torch.int64)
+        host_t.numpy()[:] = tab
+        dev_t = _buf("table", (rows, COLS), torch.int64, dev)
+        dev_t.copy_(host_t, non_blocking=True)
+        out = _buf("out", (rows, 2), torch.int32, dev)
+        _ext().sample_rows(got.contiguous().view(-1), int(rank_stride), int(world), dev_t, out, rows)
+        host_o = _buf("out", (rows, 2), torch.int32)
+        host_o.copy_(out, non_blocking=True)
+        ev = torch.cuda.Event()
+        ev.record(torch.cuda.current_stream(dev))
+        ev.synchronize()
     o = host_o.numpy()
     return o[:, 0].astype(np.int64), o[:, 1] != 0
 

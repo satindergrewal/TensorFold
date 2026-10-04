@@ -72,6 +72,10 @@ class Buffers:
         self.post = torch.empty((rows, S), dtype=f32, device=dev)
         self.comb = torch.empty((rows, S * S), dtype=f32, device=dev)
         self.hcpart = torch.empty((rows, glue.HC_BLOCKS, 32), dtype=f32, device=dev)
+        # decode windows' new hyper-connection streams under TF_GLM_FUSE hc (glue.hc_post_pre's scratch): only when
+        # the setting asks for hc, for windows of up to TF_GLM_FUSE_HC_ROWS rows
+        hc_rows = 0 if prefill else _hc_scratch_rows(rows)
+        self.hcx = torch.empty((hc_rows, S * D), dtype=bf, device=dev) if hc_rows else None
         # KDA
         self.ka = torch.empty((rows, LL * 128), dtype=bf, device=dev)
         self.kg = torch.empty((rows, LL * 128), dtype=bf, device=dev)
@@ -411,7 +415,7 @@ def mm(b: Buffers, x: torch.Tensor, q, xs: torch.Tensor | None, out: torch.Tenso
     """A projection: 4-bit ones of a prompt chunk on the shared prefill matmul, the rest on ``qmm.matmul``."""
 
     if b.prefill and isinstance(q, qmm.Q4):
-        return shared.prefill_matmul(x, q, f32=f32, out=out)
+        return shared.prefill_matmul(x, q, f32=f32, out=out, tile=qmm.prefill_tile(q.n, q.k, x.shape[0]))
     return qmm.matmul(x, q, xs, out=out, f32=f32, part=b.sk)
 
 
@@ -478,20 +482,62 @@ def kda_block(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, done: tu
                 kda_front(layer, b, lo, hi)
         else:
             mm(b, b.normed[:R], k.proj, b.xs[:R], p)
-            fa = p[:, k.fa_off:k.fa_off + 128]
-            ga = p[:, k.ga_off:k.ga_off + 128]
-            mm(b, fa, k.fb, qmm.group_sums(fa, b.xs_fa[:R]), b.ka[:R])
-            mm(b, ga, k.gb, qmm.group_sums(ga, b.xs_ga[:R]), b.kg[:R])
+            _kda_gates(layer, b, p, R)
             l2pf.site(layer.index, "o")
     if pre:                              # a prompt chunk keeps every row: the layer commits now
         out = kda_rows(layer, w, st, b, 0, R)
     else:
         cur = st.cur[li]
         with prof.timed("kda: recurrence"):
+            sums = _kda_out_sums(k)
             out = kda_mod.chain(p, k.b_off, b.ka[:R], b.kg[:R], st.conv[li], k.conv, st.rec[cur, li], k.a_log,
-                                k.dt_bias, k.norm, c.eps, c.lower, R, st.scratch[li], st.rec[1 - cur, li])
+                                k.dt_bias, k.norm, c.eps, c.lower, R, st.scratch[li], st.rec[1 - cur, li],
+                                xs=b.kxs[:R] if sums else None)
     with prof.timed("kda: out + all-gather"):
-        return out_proj(w, b, out, k.o, None if pre else qmm.group_sums(out, b.kxs[:R]), R, site=(layer.index, "a"))
+        xs = None if pre else b.kxs[:R] if sums else qmm.group_sums(out, b.kxs[:R])
+        return out_proj(w, b, out, k.o, xs, R, site=(layer.index, "a"))
+
+
+def _fuse():
+    from . import fuse
+
+    return fuse
+
+
+def _hc_scratch_rows(rows: int) -> int:
+    """Rows of the hc fusion's scratch for a decode buffer of ``rows`` rows (0: none). Never raises: a setting that is
+    not valid gets none here, and the engine's start check refuses it on every rank."""
+    try:
+        f = _fuse()
+        return min(rows, f.hc_rows()) if f.asks("hc") else 0
+    except ValueError:
+        return 0
+
+
+def _fused(name: str, applies: bool, check) -> bool:
+    """TF_GLM_FUSE: run fusion ``name`` here (it applies to these tensors and passed its check on this GPU)."""
+    return applies and _fuse().on(name, check)
+
+
+def _kda_gates(layer: LayerW, b: Buffers, p: torch.Tensor, R: int) -> None:
+    """A decode window's KDA gate projections: f_b and g_b on their 128-input low-rank rows and their group sums (one
+    launch for both under TF_GLM_FUSE gates, the same bits)."""
+
+    k = layer.kda
+    fa = p[:, k.fa_off:k.fa_off + 128]
+    ga = p[:, k.ga_off:k.ga_off + 128]
+    if k.ga_off == k.fa_off + 128 and _fused("gates", True, lambda: _fuse().check_gates(p.shape[1], k.fa_off, p.device)):
+        qmm.group_sums_split(p[:, k.fa_off:k.fa_off + 256], 128, b.xs_fa[:R], b.xs_ga[:R])
+        mm(b, fa, k.fb, b.xs_fa[:R], b.ka[:R])
+        mm(b, ga, k.gb, b.xs_ga[:R], b.kg[:R])
+        return
+    mm(b, fa, k.fb, qmm.group_sums(fa, b.xs_fa[:R]), b.ka[:R])
+    mm(b, ga, k.gb, qmm.group_sums(ga, b.xs_ga[:R]), b.kg[:R])
+
+
+def _kda_out_sums(k) -> bool:
+    """Whether the KDA chain writes its read-out's group sums itself (TF_GLM_FUSE kdaout, checked on this GPU)."""
+    return _fused("kdaout", True, lambda: _fuse().check_kdaout(k.heads, k.a_log.device))
 
 
 def _scratch_rows(s, lo: int):
@@ -536,17 +582,16 @@ def kda_segments(layer: LayerW, w: Weights, b: Buffers, R: int, seg: torch.Tenso
     p = proj[li, :R]
     with prof.timed("kda: projections"):
         mm(b, b.normed[:R], k.proj, b.xs[:R], p)
-        fa = p[:, k.fa_off:k.fa_off + 128]
-        ga = p[:, k.ga_off:k.ga_off + 128]
-        mm(b, fa, k.fb, qmm.group_sums(fa, b.xs_fa[:R]), b.ka[:R])
-        mm(b, ga, k.gb, qmm.group_sums(ga, b.xs_ga[:R]), b.kg[:R])
+        _kda_gates(layer, b, p, R)
         l2pf.site(layer.index, "o")
     with prof.timed("kda: recurrence"):
+        sums = _kda_out_sums(k)
         out = kda_mod.chain_segments(seg, p, k.b_off, b.ka[:R], b.kg[:R], slots.conv[:, li], k.conv,
                                      slots.rec[:, :, li], k.a_log, k.dt_bias, k.norm, c.eps, c.lower, R,
-                                     scratch.views[li])
+                                     scratch.views[li], xs=b.kxs[:R] if sums else None)
     with prof.timed("kda: out + all-gather"):
-        return out_proj(w, b, out, k.o, qmm.group_sums(out, b.kxs[:R]), R, site=(layer.index, "a"))
+        return out_proj(w, b, out, k.o, b.kxs[:R] if sums else qmm.group_sums(out, b.kxs[:R]), R,
+                        site=(layer.index, "a"))
 
 
 def dsa_front(layer: LayerW, w: Weights, b: Buffers, lo: int, hi: int) -> None:
@@ -764,14 +809,26 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int, done: tuple[int, in
     c = w.cfg
     m = layer.moe
     with prof.timed("moe: route"):
-        glue.router(b.normed[:R], m.router, b.mlog[:R])
-        glue.select(b.mlog[:R], m.bias, b.pick[:R], b.wts[:R], c.top_k, c.experts, c.routed_scale, c.norm_topk)
-        grouped.route(b.pick[:R], b.plan, b.plan.tile)   # the plan keeps its pass (TF_GLM_EXL3_PASS)
+        x = b.normed[:R]
+        if not b.prefill and _fused("router", glue.router_select_ok(x, m.router, b.mlog[:R]), lambda: _fuse().check_router(
+                x, m.router, m.bias, c.top_k, c.experts, c.routed_scale, c.norm_topk)):
+            glue.router_select(x, m.router, b.mlog[:R], m.bias, b.pick[:R], b.wts[:R], c.top_k, c.experts,
+                               c.routed_scale, c.norm_topk)
+        else:
+            glue.router(x, m.router, b.mlog[:R])
+            glue.select(b.mlog[:R], m.bias, b.pick[:R], b.wts[:R], c.top_k, c.experts, c.routed_scale, c.norm_topk)
+        if b.plan is not None:           # (the universal EXL3 route groups its own pairs)
+            grouped.route(b.pick[:R], b.plan, b.plan.tile)   # the plan keeps its pass (TF_GLM_EXL3_PASS)
     if m.shared is not None:
         # EXL3: the routed slots through the trellis kernels, the shared expert (last slot) through BF16 matmuls
         from . import exl3_mm
 
         if l2pf.ACTIVE is not None and done is None:
+            # TF_GLM_L2PF_EXPERT_MB (exl3_stream): the routed experts' first MiB into L2 on the prefetcher's side
+            # stream while the shared expert runs (it only reads)
+            from . import exl3_stream
+
+            exl3_stream.prefetch_experts(l2pf.ACTIVE, b.plan, m.experts, R)
             # TF_GLM_L2PF: the shared expert before the routed experts (disjoint buffers, the same kernels: the same
             # bits), while the L2 still holds what site "a" prefetched for it
             shared_front(layer, w, b, 0, R)
@@ -862,18 +919,51 @@ def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch:
     segmented blocks, ``verify.BatchedVerify``); everything else is the same calls."""
 
     c = w.cfg
-    x = b.x[:R]
-    h = layer.attn_hc
-    glue.hc_pre(x, h.fn, h.base, h.scale, layer.in_norm, b.normed[:R], b.xs[:R], b.post[:R], b.comb[:R],
-                b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters, prompt=b.prefill)
+    _hc_pre(b, R, c, layer.attn_hc, layer.in_norm)
     g = mixer(layer) if mixer is not None else _mixer(layer, w, st, b, R, nch, host_pos, sparse_np)
     with prof.timed("hc"):
-        glue.hc_post(x, x, g, b.post[:R], b.comb[:R])
-        h = layer.ffn_hc
-        glue.hc_pre(x, h.fn, h.base, h.scale, layer.post_norm, b.normed[:R], b.xs[:R], b.post[:R], b.comb[:R],
-                    b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters, prompt=b.prefill)
+        _hc_post(b, R, g)
+        _hc_pre(b, R, c, layer.ffn_hc, layer.post_norm)
     g = _ffn(layer, w, b, R)
+    _hc_post(b, R, g)
+
+
+# Decode windows (TF_GLM_FUSE hc, fuse.py): a site's hc_post is left pending and runs inside the next site's hc_pre
+# (glue.hc_post_pre: two launches instead of three, the same bits); anything else that reads b.x first flushes it.
+def _hc_post(b: Buffers, R: int, g: torch.Tensor) -> None:
+    from . import fuse
+
+    x = b.x[:R]
+    _hc_flush(b, R)                      # (never pending here: every hc_post is followed by an hc_pre or a flush)
+    if (not b.prefill and getattr(b, "hcx", None) is not None and fuse.asks("hc") and R <= fuse.hc_rows()
+            and R <= b.hcx.shape[0] and glue.hc_post_pre_ok(x, g)):
+        b.hc_pending = g                 # the gathered partials: read by the next hc_pre, before the next gather
+        return
     glue.hc_post(x, x, g, b.post[:R], b.comb[:R])
+
+
+def _hc_flush(b: Buffers, R: int) -> None:
+    g = getattr(b, "hc_pending", None)
+    if g is not None:
+        b.hc_pending = None
+        glue.hc_post(b.x[:R], b.x[:R], g, b.post[:R], b.comb[:R])
+
+
+def _hc_pre(b: Buffers, R: int, c, h, norm: torch.Tensor) -> None:
+    x = b.x[:R]
+    g = getattr(b, "hc_pending", None)
+    if g is not None:
+        from . import fuse
+
+        b.hc_pending = None
+        if glue.hc_post_pre_ok(x, g, h.fn, norm) and b.hcpart.is_contiguous() and fuse.on(
+                "hc", lambda: fuse.check_hc(x, g, h.fn, h.base, h.scale, norm, c.eps, c.hc_eps, c.hc_iters)):
+            glue.hc_post_pre(x, g, h.fn, h.base, h.scale, norm, b.normed[:R], b.xs[:R], b.post[:R], b.comb[:R],
+                             b.hcpart[:R], c.eps, c.hc_eps, c.hc_iters, b.hcx[:R])
+            return
+        glue.hc_post(x, x, g, b.post[:R], b.comb[:R])
+    glue.hc_pre(x, h.fn, h.base, h.scale, norm, b.normed[:R], b.xs[:R], b.post[:R], b.comb[:R], b.hcpart[:R], c.eps,
+                c.hc_eps, c.hc_iters, prompt=b.prefill)
 
 
 def split_layers(w: Weights, st: State, b: Buffers, R: int, nch: int | None, host_pos: int | None,
@@ -968,10 +1058,15 @@ def _compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, 
         else:
             split_layers(w, st, b, R, nch, host_pos, mixer)  # also leaves the taps and b.hidden[:R]
     else:
+        b.hc_pending = None
         for layer in w.layers:
             layer_forward(layer, w, st, b, R, nch, host_pos, sparse_np, mixer)
-            for slot in b.tap_at.get(layer.index, ()):
+            taps = b.tap_at.get(layer.index, ())
+            if taps:
+                _hc_flush(b, R)
+            for slot in taps:
                 glue.stream_mean(b.x[:R], b.taps[slot][:R])
+        _hc_flush(b, R)
         glue.stream_mean(b.x[:R], b.hidden[:R])
     if not logits:
         return None
