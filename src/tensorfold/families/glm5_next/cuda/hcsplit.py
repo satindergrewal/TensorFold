@@ -327,6 +327,23 @@ class HcSplit:
 
         return self.mine(), min(self.mine() + self.H, self.R)
 
+    def _post(self, j: int, lo: int, hi: int) -> None:
+        """hc_post of this rank's rows lo .. hi (piece j): every rank's partial of them summed rank 0 first."""
+
+        b = self.b
+        x = b.x[lo:hi]
+        own = b.part[lo:hi]
+        if lane_partials.on():                          # TF_GLM_LANE_PARTIALS=bf16: this rank's rows rounded too
+            lane_partials.round_(own, b.partb[lo:hi])
+        if self.world == 2 and not self.blocks:
+            got = self.got[j]
+            g0, g1 = (own, got) if self.rank == 0 else (got, own)
+            glue.hc_post_pair(x, x, g0, g1, b.post[lo:hi], b.comb[lo:hi])
+        else:
+            block = self.got[j]
+            block[self.rank].copy_(own)
+            glue.hc_post(x, x, block, b.post[lo:hi], b.comb[lo:hi])
+
     def glue(self, hc=None, norm=None, taps: tuple[int, ...] = (), final: bool = False,
              front: Callable[[int, int], None] | None = None) -> None:
         """hc_post of this rank's rows, then (in order) the layer's DFlash2 taps, the final stream mean (``final``)
@@ -344,21 +361,15 @@ class HcSplit:
             if self.stream is not None:
                 main.wait_event(self.ev_part[j])
             b = self.b
+            self._post(j, lo, hi)
             x = b.x[lo:hi]
-            own = b.part[lo:hi]
-            if lane_partials.on():                          # TF_GLM_LANE_PARTIALS=bf16: this rank's rows rounded too
-                lane_partials.round_(own, b.partb[lo:hi])
-            if self.world == 2 and not self.blocks:
-                got = self.got[j]
-                g0, g1 = (own, got) if self.rank == 0 else (got, own)
-                glue.hc_post_pair(x, x, g0, g1, b.post[lo:hi], b.comb[lo:hi])
-                for slot in taps:
-                    glue.stream_mean(x, b.taps[slot][lo:hi])
-                if final:
-                    glue.stream_mean(x, b.hidden[lo:hi])
-                if hc is not None:
-                    glue.hc_pre(x, hc.fn, hc.base, hc.scale, norm, b.normed[lo:hi], b.xs[lo:hi], b.post[lo:hi],
-                                b.comb[lo:hi], b.hcpart[lo:hi], c.eps, c.hc_eps, c.hc_iters, prompt=True)
+            for slot in taps:
+                glue.stream_mean(x, b.taps[slot][lo:hi])
+            if final:
+                glue.stream_mean(x, b.hidden[lo:hi])
+            if hc is not None:
+                glue.hc_pre(x, hc.fn, hc.base, hc.scale, norm, b.normed[lo:hi], b.xs[lo:hi], b.post[lo:hi],
+                            b.comb[lo:hi], b.hcpart[lo:hi], c.eps, c.hc_eps, c.hc_iters, prompt=True)
             if self.stream is None:
                 self._swap_rows(j, outs)
                 if front is not None:
