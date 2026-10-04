@@ -633,6 +633,12 @@ class GlmEngine:
         if rank == 0 and kda_chunked_on():
             print("[tensorfold] TF_GLM_KDA_CHUNKED=1: KDA prompt chunks in chunked (WY) form, 32-row sub-chunks "
                   "(close to the serial kernel, not its bits; decode keeps the serial kernel)", flush=True)
+        from . import kda_split as kda_split_mod      # patch 0160: TF_GLM_KDA_SPLIT* (a bad value stops the start)
+
+        if kda_chunked_on() and kda_split_mod.SPLIT is not None:
+            kda_split_mod.prepare()
+            if rank == 0:
+                print(f"[tensorfold] {kda_split_mod.describe()}", flush=True)
         # rank 0: the role token whose first appearance ends a prompt's system block (a shared-prefix point)
         self.opener = user_opener(model_dir) if self.shared and rank == 0 else None
         if rank == 0 and self.shared:

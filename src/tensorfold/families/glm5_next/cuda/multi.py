@@ -127,6 +127,19 @@ def fill_share(value: str | None = None) -> float:
     return share
 
 
+def _ids_array(c) -> np.ndarray:
+    """A kept prompt's ids as an int64 array, made once and kept on the snapshot (its ids never change)."""
+
+    arr = getattr(c, "ids_np", None)
+    if arr is None or len(arr) != len(c.ids):
+        arr = np.asarray(c.ids, dtype=np.int64)
+        try:
+            c.ids_np = arr
+        except AttributeError:            # a snapshot type without a free attribute slot: no cache
+            pass
+    return arr
+
+
 def multi_code(code: list[int], dflash: bool, dflash_policy: list[int]) -> list[int]:
     """A request's policy code under --parallel: serial stays serial; auto becomes TF_GLM_DFLASH_POLICY; an MTP
     policy its DFlash2 twin; without a draft model, serial."""
@@ -251,12 +264,22 @@ def sample_streams(w, parts: Sequence[tuple]) -> list[list[int]]:
         layout.append((k, logits.shape[0], n))
     if packed:
         flat = torch.cat(packed) if len(packed) > 1 else packed[0]
-        if w.comm is None:
-            host = flat.view(1, -1).cpu()
-        else:
+        world = 1 if w.comm is None else w.world
+        got = flat.contiguous()
+        if w.comm is not None:
             got = torch.empty((w.world * flat.numel(),), dtype=torch.float32, device=flat.device)
             w.comm.all_gather(flat.contiguous(), got)
-            host = got.view(w.world, -1).cpu()
+        specs, at = [], 0
+        for k, R, n in layout:
+            specs.append((at, R, n, list(parts[k][1]), parts[k][2]))
+            at += R * 2 * n
+        from .decode import _gpu_draw, _gpu_draws
+
+        if _gpu_draws(world, max(n for _, _, n in layout), flat.device, specs):
+            for (k, _, _), toks in zip(layout, _gpu_draw(got, flat.numel(), world, specs)):
+                out[k] = toks                    # TENSORFOLD_GPU_SAMPLE: the host rule's tokens, drawn on the GPU
+            layout = []
+        host = got.view(world, -1).cpu() if layout else None
         at = 0
         for k, R, n in layout:
             g = host[:, at:at + R * 2 * n].reshape(host.shape[0], R, 2 * n)
@@ -608,7 +631,7 @@ class MultiDecoder:
         cut = len(hit.ids) if hit is not None else 0
         shared: list[int] = []
         if draft and feed is None and g.shared:
-            known = [np.asarray(c.ids, dtype=np.int64) for c in self.kept]
+            known = [_ids_array(c) for c in self.kept]
             shared = shared_points(prompt, cut, grid_point(len(prompt), cut, self.grid), self.grid, g.shared, known,
                                    g.opener)
         sid = self.next_sid
@@ -722,14 +745,23 @@ class MultiDecoder:
 
     def _resume(self, prompt: list[int]):
         """The longest kept strict prefix of ``prompt``, or the whole prompt when it kept its head's logits row (a
-        replay of an earlier prompt), whose DFlash2 window came along."""
+        replay of an earlier prompt), whose DFlash2 window came along. The prompt is compared as one int64 array
+        against each kept prompt's cached array (``_ids_array``): the same answer as comparing the id lists, without
+        copying every kept prompt's ids for every request (32 kept prompts of 100K+ tokens cost tens of ms a request)."""
         best = None
+        arr = None
         for c in self.kept:
             n = len(c.ids)
             fits = c.drafter_end == n and c.drafter_rows is not None or self.drafts is None
             fits = fits and not (self.grid and n % self.grid)
             short = n < len(prompt) or (n == len(prompt) and c.head is not None)
-            if fits and short and prompt[:n] == c.ids and (best is None or n > len(best.ids)):
+            if not (fits and short and (best is None or n > len(best.ids))):
+                continue
+            if n and prompt[n - 1] != c.ids[-1]:              # cheap reject before the full comparison
+                continue
+            if arr is None:
+                arr = np.asarray(prompt, dtype=np.int64)
+            if np.array_equal(arr[:n], _ids_array(c)):
                 best = c
         return best
 

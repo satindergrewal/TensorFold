@@ -191,6 +191,11 @@ def chain(p: torch.Tensor, b_off: int, a: torch.Tensor, g: torch.Tensor, conv_st
     [H, 128, 128]; ``pos`` is the first row's absolute position. Writes out[:rows] (bf16 [rows, H * 128])."""
 
     rows = int(rows)
+    from . import kda_split                    # patch 0160: TF_GLM_KDA_SPLIT, the same bits on the whole GPU
+
+    if kda_split.SPLIT is not None:
+        return kda_split.chain(p, b_off, a, g, conv_state, conv_w, state_in, a_log, dt_bias, norm_w, eps, lower, rows,
+                               out, state_out, pos)
     _ext().chain(p, p.stride(0), int(b_off), a, a.stride(0), g, g.stride(0), conv_state, conv_w, state_in, a_log,
                  dt_bias, norm_w, float(eps), float(lower), rows, int(pos) % CHUNK, out, state_out)
     return out[:rows]

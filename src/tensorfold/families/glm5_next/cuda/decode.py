@@ -33,13 +33,20 @@ def sample_rows(w: Weights, logits: torch.Tensor, positions: Sequence[int], samp
         k = min(logits.shape[1], 20 + MARGIN)       # the draft's confidence needs its competitors too
     vals, ids = torch.topk(logits.float(), k, dim=-1)
     ids = (ids + (w.vocab_offset if offset is None else offset)).to(torch.int32)
+    world = 1 if w.comm is None else w.world
+    gpu = probs is None and _gpu_draws(world, k, logits.device, [(0, R, k, positions, sampling)])
     if w.comm is None:
+        if gpu:                                      # TENSORFOLD_GPU_SAMPLE: the host rule's tokens, drawn here
+            packed = torch.cat([vals, ids.view(torch.float32)], dim=1).contiguous()
+            return _gpu_draw(packed.view(-1), R * 2 * k, 1, [(0, R, k, list(positions), sampling)])[0]
         values = vals.cpu().numpy().astype(np.float32)
         tokens = ids.cpu().numpy().astype(np.int64)
     else:
         packed = torch.cat([vals, ids.view(torch.float32)], dim=1).contiguous()
         got = torch.empty((w.world * packed.numel(),), dtype=torch.float32, device=logits.device)
         w.comm.all_gather(packed.view(-1), got)
+        if gpu:
+            return _gpu_draw(got, R * 2 * k, w.world, [(0, R, k, list(positions), sampling)])[0]
         g = got.view(w.world, R, 2 * k).cpu()
         values = torch.cat([g[r, :, :k] for r in range(w.world)], dim=1).numpy().astype(np.float32)
         tokens = torch.cat([g[r, :, k:].contiguous().view(torch.int32) for r in range(w.world)], dim=1).numpy()
@@ -52,6 +59,21 @@ def sample_rows(w: Weights, logits: torch.Tensor, positions: Sequence[int], samp
     if probs is not None:
         probs.extend(_probability(values, tokens, chosen, sampling))
     return chosen
+
+
+def _gpu_draws(world: int, n: int, device, parts) -> bool:
+    """TENSORFOLD_GPU_SAMPLE (tensorfold.cuda.gpu_sample): draw these parts' rows on the GPU (keyed top-k or greedy
+    rows, the host rule's tokens; checked against the host rule at the first call)."""
+
+    from tensorfold.cuda import gpu_sample
+
+    return gpu_sample.applies(parts) and gpu_sample.enabled(world, n, device)
+
+
+def _gpu_draw(got, rank_stride: int, world: int, parts) -> list[list[int]]:
+    from tensorfold.cuda import gpu_sample
+
+    return gpu_sample.draw(got, rank_stride, world, parts)
 
 
 def _probability(values: np.ndarray, tokens: np.ndarray, chosen: list[int], sampling: Sampling | None) -> list[float]:

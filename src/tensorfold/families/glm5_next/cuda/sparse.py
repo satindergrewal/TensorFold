@@ -708,7 +708,8 @@ def seg_select_tokens(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, row
     scores = scratch.scores
     grid = min(SEG_SCORE_GRID, triton.cdiv(scores.shape[1], 64))
     pkv, pks, rs, fp8 = kv8.parts(pk)
-    _seg_scores[(rows.max_segs, grid)](qi, wts, wts.stride(0), pkv, pks, scores, scores.stride(0), rows.pos,
+    # a window of R rows holds at most R segments: no programs for the table's unused (0-row) segments
+    _seg_scores[(min(rows.max_segs, R), grid)](qi, wts, wts.stride(0), pkv, pks, scores, scores.stride(0), rows.pos,
                                        rows.sparse, rows.seg_start, rows.seg_rows, rows.seg_pbase, rows.seg_pools,
                                        D ** -0.5, wscale, H=H, HP=max(16, triton.next_power_of_2(H)), D=D, BP=64,
                                        G=grid, RS=rs, FP8=fp8, num_warps=4)

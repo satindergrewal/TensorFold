@@ -201,7 +201,16 @@ def sample_packed(w, parts: Sequence[tuple]) -> list[list[int]]:
         words2 = packed.contiguous().view(torch.float32).view(-1)
         host2 = gather(words2).reshape(-1, words2.numel()).view(torch.int64).reshape(-1, rows, 3 * count + 2)
         host2 = host2.cpu().numpy()
-    host1 = got1.cpu()
+    if topk:
+        from .decode import _gpu_draw, _gpu_draws
+
+        specs = [(at, R, n, list(parts[k][1]), parts[k][2]) for k, R, n, at in topk]
+        if _gpu_draws(world, max(n for _, _, n, _ in topk), got1.device, specs):
+            g1 = got1.contiguous()
+            for (k, _, _, _), toks in zip(topk, _gpu_draw(g1, g1.numel() // world, world, specs)):
+                out[k] = toks                    # TENSORFOLD_GPU_SAMPLE: the host rule's tokens, drawn on the GPU
+            topk = []
+    host1 = got1.cpu() if topk else None
     for k, R, n, at in topk:
         g = host1[:, at:at + R * 2 * n].reshape(host1.shape[0], R, 2 * n)
         values = torch.cat([g[r, :, :n] for r in range(g.shape[0])], dim=1).numpy().astype(np.float32)

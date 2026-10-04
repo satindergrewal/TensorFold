@@ -180,6 +180,12 @@ class BatchedVerify:
         self._write_table([(len(s.tokens), s.st.slot, s.st.cur[0] if s.st.cur else 0, s.st.slot,
                             len(s.tokens) if keeps is None else keeps[k]) for k, s in enumerate(segments)])
 
+    def _kseg(self, R: int) -> torch.Tensor:
+        """The KDA segment table's first min(segments, R) rows (a view: graphs see the in-place writes): a window of R
+        rows holds at most R segments, so the segmented kernels' grids need no more (the rest have 0 rows and would
+        only launch empty blocks; --parallel 32 or 40 at a few rows otherwise pays for every unused slot)."""
+        return self.kseg[:min(self.kseg.shape[0], max(1, int(R)))]
+
     def _span(self, st, pos: int, n: int) -> tuple:
         """SegRows' segment of ``n`` rows of ``st`` from ``pos``: its extent's base, and its slot's ring base."""
         caches = self.e.caches
@@ -251,7 +257,7 @@ class BatchedVerify:
         e = self.e
         if layer.kind == "kda":
             with prof.timed("kda"):
-                return kda_segments(layer, self.w, self.b, R, self.kseg, e.slots, self.proj, self.scratch,
+                return kda_segments(layer, self.w, self.b, R, self._kseg(R), e.slots, self.proj, self.scratch,
                                     self.kda_index[layer.index])
         caches = e.caches
         di = self.dsa_index[layer.index]
@@ -278,8 +284,8 @@ class BatchedVerify:
         if self.scratch is not None:
             self._tables(segments, keeps)
             if any(k < len(s.tokens) for s, k in zip(segments, keeps)):
-                kda_mod.replay_layers_segments(self.kseg, e.slots.rec, self.scratch)
-            conv_shift_segments(e.slots.conv, self.proj, self.kseg)
+                kda_mod.replay_layers_segments(self._kseg(self.R), e.slots.rec, self.scratch)
+            conv_shift_segments(e.slots.conv, self.proj, self._kseg(self.R))
         for seg, keep in zip(segments, keeps):
             st = seg.st
             if st.cur:
