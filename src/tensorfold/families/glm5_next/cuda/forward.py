@@ -912,17 +912,24 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int, done: tuple[int, in
         with prof.timed("moe: routed (exl3)"):
             from tensorfold.cuda.exl3 import experts as x3experts
             if isinstance(m.experts, x3experts.Exl3RoutedExperts):
-                # mixed k3/k4 rates: per-expert widths, the weighted combine fused into the down epilogue
-                import os as _os
-                if getattr(w, "x3_scratch", None) is None:
-                    w.x3_scratch = x3experts.Scratch(m.experts, int(_os.environ.get("TF_GLM_X3_ROWS", "1024")), c.top_k)
+                # mixed k3/k4 rates: per-expert widths, the weighted combine fused into the down epilogue.
+                # hot path: the scratch and the contiguous pick buffer are made once and reused every chunk
+                # (the prefill profile showed the per-call allocation + env reads costing real host time).
+                s3 = getattr(w, "x3_scratch", None)
+                if s3 is None:
+                    import os as _os
+                    s3 = x3experts.Scratch(m.experts, int(_os.environ.get("TF_GLM_X3_ROWS", "1024")), c.top_k)
+                    w.x3_scratch = s3
+                    w.x3_pick = torch.empty((s3.rows, c.top_k), dtype=torch.int32, device=b.pick.device)
                 # the group launch needs R * slots * 4 B of dynamic smem: > 1024 rows busts the 48 KB default,
                 # so the routed pass runs in scratch-sized slices (the 4bpw path has no such launch)
-                for _lo in range(0, R, w.x3_scratch.rows):
-                    _hi = min(_lo + w.x3_scratch.rows, R)
-                    y = x3experts.routed(b.normed[_lo:_hi], b.pick[_lo:_hi, :c.top_k].contiguous(), None, m.experts,
-                                         w.x3_scratch, None, _hi - _lo, c.limit)
-                    b.ey[_lo:_hi, :c.top_k, :] = y.view(_hi - _lo, c.top_k, -1).to(b.ey.dtype)
+                for _lo in range(0, R, s3.rows):
+                    _hi = min(_lo + s3.rows, R)
+                    _n = _hi - _lo
+                    pk = w.x3_pick[:_n]
+                    pk.copy_(b.pick[_lo:_hi, :c.top_k])
+                    y = x3experts.routed(b.normed[_lo:_hi], pk, None, m.experts, s3, None, _n, c.limit)
+                    b.ey[_lo:_hi, :c.top_k, :] = y.view(_n, c.top_k, -1).to(b.ey.dtype)
             else:
                 exl3_mm.routed(b.normed[:R], b.pick, b.plan, m.experts, b.exl3, b.ey.view(-1, c.hidden), R, c.limit)
 
