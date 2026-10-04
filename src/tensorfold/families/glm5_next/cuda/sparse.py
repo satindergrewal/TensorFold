@@ -366,34 +366,75 @@ def _select_prompt(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: i
       radix select's threshold and ties are the same. (Rows with count 0, whose tokens nothing reads, may differ.)
       The scores buffer keeps pool_bucket's size (the allocator's few sizes), used as a contiguous [R, NP] prefix;
     - _scores takes score_rows() rows a program: a row's keys are masked to its own pools before its dot, as with 1;
-    - one kernel (_tokens) writes tokens and counts with select_tokens' integer formulas."""
+    - one kernel (_tokens) writes tokens and counts with select_tokens' integer formulas.
 
-    dev = qi.device
-    NP = pool_count(pos, R, np_max)
-    # rows go through in blocks of SELECT_ROWS: every block scores the chunk's NP pools (the same columns, so the same
-    # bits a row), and the fp32 scores take SELECT_ROWS rows, not the chunk's, of the capacity-sized memory
-    B = min(R, SELECT_ROWS)
-    buf = torch.empty((B * pool_bucket(pos, R, np_max),), dtype=torch.float32, device=dev)
-    H = wts.shape[1]
-    D = qi.shape[1] // H
-    wscale = 1.0 / 5.656854249492381 if H == 32 else H ** -0.5            # 32 ** -0.5 exactly as before
-    rb = score_rows()
-    width = TOPK_POOLS * POOL + POOL - 1
-    tokens = torch.empty((R, width), dtype=torch.int32, device=dev)
-    counts = torch.empty((R,), dtype=torch.int32, device=dev)
-    pkv, pks, rs, fp8 = kv8.parts(pk)
-    for a in range(0, R, B):
-        n = min(B, R - a)
-        at = pos_dev if a == 0 else pos_dev + a
-        scores = buf[:n * NP].view(n, NP)
-        _scores[(triton.cdiv(n, rb), triton.cdiv(NP, 64))](qi[a:a + n], wts[a:a + n], wts.stride(0), pkv, pks, scores,
-                                                           at, n, NP, D ** -0.5, wscale, H=H,
-                                                           HP=max(16, triton.next_power_of_2(H)), D=D, BP=64, RB=rb,
-                                                           RS=rs, FP8=fp8, num_warps=4)
-        pools = top_pools(scores, TOPK_POOLS)                                           # ascending pool index
-        _tokens[(n,)](pools, at, tokens[a:a + n], counts[a:a + n], W=width, K=TOPK_POOLS, PL=POOL, BLOCK=1024,
-                      num_warps=4)
+    The work goes block by block (``PromptSelect``, patch 0120): a block's pools, then its tokens; the index
+    split (``index_split``, TF_GLM_INDEX_SPLIT) runs the very same two steps for each block, the pools on one rank."""
+
+    sel = PromptSelect(qi, wts, pk, pos, R, np_max, pos_dev)
+    tokens, counts = sel.outputs()
+    for a in sel.blocks():
+        at = sel.at(a)
+        sel.write_tokens(a, sel.pools(a, at), at, tokens, counts)
     return tokens, counts
+
+
+class PromptSelect:
+    """``_select_prompt``'s constants for one prompt chunk (or one piece of a multi-prompt chunk) and its two steps
+    for the block of rows a .. a + n (n = min(B, R - a), B = min(R, SELECT_ROWS)): ``pools`` scores the block's rows
+    over the chunk's NP pools and selects each row's 512 best (int64 [n, 512], ascending), ``write_tokens`` turns
+    them into the rows' tokens and counts. Every launch is the one _select_prompt made before this class existed (the
+    same kernels, grids, constexprs and arguments: patch 0120 only cut the loop body in two)."""
+
+    def __init__(self, qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: int, R: int, np_max: int,
+                 pos_dev: torch.Tensor) -> None:
+        self.qi, self.wts, self.R, self.pos_dev = qi, wts, int(R), pos_dev
+        self.dev = qi.device
+        self.NP = pool_count(pos, R, np_max)
+        # rows go through in blocks of SELECT_ROWS: every block scores the chunk's NP pools (the same columns, so the
+        # same bits a row), and the fp32 scores take SELECT_ROWS rows, not the chunk's, of the capacity-sized memory
+        self.B = min(R, SELECT_ROWS)
+        self.buf = torch.empty((self.B * pool_bucket(pos, R, np_max),), dtype=torch.float32, device=self.dev)
+        self.H = wts.shape[1]
+        self.D = qi.shape[1] // self.H
+        self.wscale = 1.0 / 5.656854249492381 if self.H == 32 else self.H ** -0.5   # 32 ** -0.5 exactly as before
+        self.rb = score_rows()
+        self.width = TOPK_POOLS * POOL + POOL - 1
+        self.pkv, self.pks, self.rs, self.fp8 = kv8.parts(pk)
+
+    def outputs(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return (torch.empty((self.R, self.width), dtype=torch.int32, device=self.dev),
+                torch.empty((self.R,), dtype=torch.int32, device=self.dev))
+
+    def blocks(self) -> range:
+        """Each block's first row."""
+        return range(0, self.R, self.B)
+
+    def rows(self, a: int) -> int:
+        return min(self.B, self.R - a)
+
+    def at(self, a: int) -> torch.Tensor:
+        """The device position of the block's first row."""
+        return self.pos_dev if a == 0 else self.pos_dev + a
+
+    def pools(self, a: int, at: torch.Tensor) -> torch.Tensor:
+        """The block's rows' 512 best pools, ascending (int64 [n, 512]); reads qi and wts rows a .. a + n only."""
+
+        n, NP = self.rows(a), self.NP
+        scores = self.buf[:n * NP].view(n, NP)
+        _scores[(triton.cdiv(n, self.rb), triton.cdiv(NP, 64))](
+            self.qi[a:a + n], self.wts[a:a + n], self.wts.stride(0), self.pkv, self.pks, scores, at, n, NP,
+            self.D ** -0.5, self.wscale, H=self.H, HP=max(16, triton.next_power_of_2(self.H)), D=self.D, BP=64,
+            RB=self.rb, RS=self.rs, FP8=self.fp8, num_warps=4)
+        return top_pools(scores, TOPK_POOLS)                                           # ascending pool index
+
+    def write_tokens(self, a: int, pools: torch.Tensor, at: torch.Tensor, tokens: torch.Tensor,
+                     counts: torch.Tensor) -> None:
+        """The block's rows' tokens and counts from their pools (int64 [n, 512], contiguous)."""
+
+        n = self.rows(a)
+        _tokens[(n,)](pools, at, tokens[a:a + n], counts[a:a + n], W=self.width, K=TOPK_POOLS, PL=POOL, BLOCK=1024,
+                      num_warps=4)
 
 
 @triton.jit

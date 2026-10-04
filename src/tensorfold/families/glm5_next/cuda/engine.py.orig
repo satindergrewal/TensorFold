@@ -558,7 +558,7 @@ class GlmEngine:
             self.split.code() + [int(self.dump is not None), quant_code, self.shared, int(DRAFT_RING), int(self.mtp_on),
                                  parallel, *verify_code, int(union_cover()), MAX_ROWS, len(WIDE_GRAPHS),
                                  sum(WIDE_GRAPHS), max(WIDE_GRAPHS, default=0),
-                                 KV_KINDS.index(kv), MULTI_WINDOW]
+                                 KV_KINDS.index(kv)]
         from .index_split import settings as index_split_settings     # patch 0120: TF_GLM_INDEX_SPLIT*
 
         mine += index_split_settings().code()
@@ -577,7 +577,8 @@ class GlmEngine:
                                "TF_GLM_DRAFT_QUANT, TF_GLM_SHARED_PREFIX, TF_GLM_DRAFT_RING, TF_GLM_MTP, --parallel, "
                                "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE, "
                                "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV, TF_GLM_INDEX_SPLIT*, "
-                               "TF_GLM_PREFILL_LANES, TF_GLM_LANE_MIN_ROWS): "                               f"rank 0 {rows[0][:-1]}, " + ", ".join(f"rank {r} {rows[r][:-1]}" for r in odd) +
+                               "TF_GLM_PREFILL_LANES, TF_GLM_LANE_MIN_ROWS): "
+                               f"rank 0 {rows[0][:-1]}, " + ", ".join(f"rank {r} {rows[r][:-1]}" for r in odd) +
                                "; pull the draft model on every machine (or pass --drafter none to all) and give "
                                "every rank the same flags")
         else:
@@ -642,10 +643,7 @@ class GlmEngine:
         if self.e.pbuf.split is not None:
             self.e.pbuf.split.warm()                 # both ranks: open the send/receive connection now
             if rank == 0:
-                print(f"[tensorfold] {self.split.describe()}", flush=True)
-                if not self.e.pbuf.split.applies(prefill_rows):      # e.g. TF_GLM_HC_SPLIT_MIN_ROWS past a chunk
-                    print(f"[tensorfold] note: a full {prefill_rows}-row prompt chunk runs unsplit at {world} ranks "
-                          "(only shorter ones split)", flush=True)
+                print(f"[tensorfold] {self.split.describe()} (only shorter ones split)", flush=True)
         if rank == 0 and index_split_settings().on and world > 1:
             print(f"[tensorfold] {index_split_settings().describe()}", flush=True)
         if rank == 0 and lanes_mod.LANES > 1:

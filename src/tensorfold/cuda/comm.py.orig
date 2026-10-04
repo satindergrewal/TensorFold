@@ -1,12 +1,5 @@
 """NCCL all-gather (and paired send/receive) on the current stream so CUDA graphs capture it; a rank-order sum after
-it keeps ranks bit-equal.
-
-TF_NCCL_EXCHANGE_ENV (optional, e.g. ``NCCL_P2P_DISABLE=1``): the paired sends and receives (``exchange``,
-``exchange_all``: the row-split prompt chunks' swaps) go through a second NCCL communicator, created from a second
-copy of the library with these NCCL_* settings (space separated) in effect for it alone. NCCL reads its settings once a
-process, so one library cannot run its all-gathers over one transport and its sends over another; on PCIe hosts where
-NCCL's peer-to-peer all-gathers are fast but its peer-to-peer send/receive path is slow (two channels a peer), this keeps
-every collective on peer-to-peer and the bulk swaps on shared memory. The same bytes move in the same order."""
+it keeps ranks bit-equal."""
 
 from __future__ import annotations
 
@@ -58,68 +51,6 @@ def _library() -> ctypes.CDLL:
     raise RuntimeError("libnccl not found (set TF_NCCL_LIB)")
 
 
-def _loaded_path(name: str = "libnccl.so") -> str | None:
-    """The file of the loaded library named ``name``* (libnccl.so, libnccl.so.2, ...; not NCCL's plugins such as
-    libnccl-net-*.so) in this process's memory map, or None."""
-
-    try:
-        with open("/proc/self/maps") as f:
-            for line in f:
-                path = line.split()[-1] if line.strip() else ""
-                if os.path.basename(path).startswith(name):
-                    return path
-    except OSError:
-        pass
-    return None
-
-
-def _second_library(lib: ctypes.CDLL) -> ctypes.CDLL:
-    """A second, independent instance of the loaded NCCL library (a private copy of its file, mapped on its own, so it
-    keeps its own once-a-process settings); the copy is unlinked once mapped."""
-
-    import shutil
-    import tempfile
-
-    src = _loaded_path() or getattr(lib, "_name", "")
-    if not src or not os.path.exists(src):
-        raise RuntimeError("TF_NCCL_EXCHANGE_ENV: cannot find the loaded NCCL library's file to copy")
-    tmp = tempfile.mkdtemp(prefix="tf-nccl-exchange-")
-    dst = os.path.join(tmp, "libnccl-exchange.so.2")
-    shutil.copy2(os.path.realpath(src), dst)
-    try:
-        return ctypes.CDLL(dst, mode=getattr(os, "RTLD_LOCAL", 0) | getattr(os, "RTLD_NOW", 2))
-    finally:
-        os.unlink(dst)
-        os.rmdir(tmp)
-
-
-def exchange_env(value: str | None = None) -> dict[str, str]:
-    """TF_NCCL_EXCHANGE_ENV: NCCL_* settings (space separated NAME=VALUE) for the send/receive communicator; empty: off."""
-
-    value = (os.environ.get("TF_NCCL_EXCHANGE_ENV", "") if value is None else value).strip()
-    out: dict[str, str] = {}
-    for item in value.split():
-        name, eq, setting = item.partition("=")
-        if not eq or not name.startswith("NCCL_") or not name.replace("_", "").isalnum():
-            raise ValueError(f"TF_NCCL_EXCHANGE_ENV: NCCL_NAME=value items separated by spaces, not {item!r}")
-        out[name] = setting
-    return out
-
-
-def _bind(lib: ctypes.CDLL) -> None:
-    lib.ncclGetErrorString.restype = ctypes.c_char_p
-    lib.ncclGetErrorString.argtypes = [ctypes.c_int]
-    lib.ncclGetUniqueId.argtypes = [ctypes.POINTER(_UniqueId)]
-    lib.ncclCommInitRank.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_int, _UniqueId, ctypes.c_int]
-    lib.ncclAllGather.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p,
-                                  ctypes.c_void_p]
-    for name in ("ncclSend", "ncclRecv"):
-        getattr(lib, name).argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int,
-                                       ctypes.c_void_p, ctypes.c_void_p]
-    lib.ncclGroupStart.argtypes = []
-    lib.ncclGroupEnd.argtypes = []
-
-
 class NCCL:
     def __init__(self, rank: int, world: int, master: str, port: int, *, timeout_s: float = 600,
                  key: str = "tf_nccl_uid") -> None:
@@ -129,7 +60,13 @@ class NCCL:
 
         self.rank, self.world = rank, world
         self.lib = _library()
-        _bind(self.lib)
+        lib = self.lib
+        lib.ncclGetErrorString.restype = ctypes.c_char_p
+        lib.ncclGetErrorString.argtypes = [ctypes.c_int]
+        lib.ncclGetUniqueId.argtypes = [ctypes.POINTER(_UniqueId)]
+        lib.ncclCommInitRank.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_int, _UniqueId, ctypes.c_int]
+        lib.ncclAllGather.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p,
+                                      ctypes.c_void_p]
         self.store = TCPStore(master, port, world, rank == 0, timeout=timedelta(seconds=timeout_s))
         uid = _UniqueId()
         if rank == 0:
@@ -141,34 +78,6 @@ class NCCL:
         self.comm = ctypes.c_void_p()
         torch.cuda.current_device()
         self._check(self.lib.ncclCommInitRank(ctypes.byref(self.comm), world, uid, rank))
-        # the paired sends and receives' communicator (TF_NCCL_EXCHANGE_ENV), else this one
-        self.xlib, self.xcomm = self.lib, self.comm
-        settings = exchange_env()
-        if settings:
-            saved = {k: os.environ.get(k) for k in settings}
-            os.environ.update(settings)              # read by the second library's first calls, once
-            try:
-                self.xlib = _second_library(self.lib)
-                _bind(self.xlib)
-                xuid = _UniqueId()
-                if rank == 0:
-                    self._check(self.xlib.ncclGetUniqueId(ctypes.byref(xuid)), self.xlib)
-                    self.store.set(key + "_exchange", bytes(xuid.internal))
-                else:
-                    raw = self.store.get(key + "_exchange")
-                    ctypes.memmove(ctypes.addressof(xuid), raw, 128)
-                self.xcomm = ctypes.c_void_p()
-                self._check(self.xlib.ncclCommInitRank(ctypes.byref(self.xcomm), world, xuid, rank), self.xlib)
-            finally:
-                for k, v in saved.items():
-                    if v is None:
-                        os.environ.pop(k, None)
-                    else:
-                        os.environ[k] = v
-            if rank == 0:
-                print("[tensorfold] paired sends and receives over a second NCCL communicator with "
-                      + " ".join(f"{k}={v}" for k, v in settings.items()) + " (TF_NCCL_EXCHANGE_ENV); "
-                      "all-gathers on the first", flush=True)
 
     def _check(self, code: int) -> None:
         if code != 0:
@@ -213,43 +122,24 @@ class NCCL:
 
         if len(sends) != len(recvs) or peer == self.rank or not 0 <= peer < self.world:
             raise ValueError("exchange: one receive per send, with another rank")
-        x, xc = self.xlib, self.xcomm          # TF_NCCL_EXCHANGE_ENV's communicator, else the main one
+        lib = self.lib
+        if not getattr(self, "_p2p", False):
+            for name in ("ncclSend", "ncclRecv"):
+                getattr(lib, name).argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int,
+                                               ctypes.c_void_p, ctypes.c_void_p]
+            lib.ncclGroupStart.argtypes = []
+            lib.ncclGroupEnd.argtypes = []
+            self._p2p = True
         stream = torch.cuda.current_stream().cuda_stream
-        self._check(x.ncclGroupStart(), x)
+        self._check(lib.ncclGroupStart())
         try:
             for s, r in zip(sends, recvs):
                 if s.numel():
-                    self._check(x.ncclSend(s.data_ptr(), s.numel(), _DTYPES[s.dtype], peer, xc, stream), x)
+                    self._check(lib.ncclSend(s.data_ptr(), s.numel(), _DTYPES[s.dtype], peer, self.comm, stream))
                 if r.numel():
-                    self._check(x.ncclRecv(r.data_ptr(), r.numel(), _DTYPES[r.dtype], peer, xc, stream), x)
+                    self._check(lib.ncclRecv(r.data_ptr(), r.numel(), _DTYPES[r.dtype], peer, self.comm, stream))
         finally:
-            self._check(x.ncclGroupEnd(), x)
-
-    def exchange_all(self, sends: dict[int, list[torch.Tensor]], recvs: dict[int, list[torch.Tensor]]) -> None:
-        """One NCCL group on the current stream with several peers: every ``sends[p][i]`` to peer p and
-        every ``recvs[p][i]`` from it (contiguous tensors; every peer's matching call has the same sizes and
-        dtypes in the same order)."""
-
-        for p in sends:
-            if p == self.rank or not 0 <= p < self.world:
-                raise ValueError("exchange_all: peers are other ranks")
-            if len(sends[p]) != len(recvs.get(p, [])):
-                raise ValueError("exchange_all: one receive per send, with another rank")
-            for s, r in zip(sends[p], recvs[p]):
-                if s.numel() != r.numel() or s.dtype != r.dtype or not (s.is_contiguous() and r.is_contiguous()):
-                    raise ValueError("exchange_all: each send and receive must be contiguous and alike")
-        stream = torch.cuda.current_stream().cuda_stream
-        x, xc = self.xlib, self.xcomm          # TF_NCCL_EXCHANGE_ENV's communicator, else the main one
-        self._check(x.ncclGroupStart(), x)
-        try:
-            for p in sorted(sends):
-                for s, r in zip(sends[p], recvs[p]):
-                    if s.numel():
-                        self._check(x.ncclSend(s.data_ptr(), s.numel(), _DTYPES[s.dtype], p, xc, stream), x)
-                    if r.numel():
-                        self._check(x.ncclRecv(r.data_ptr(), r.numel(), _DTYPES[r.dtype], p, xc, stream), x)
-        finally:
-            self._check(x.ncclGroupEnd(), x)
+            self._check(lib.ncclGroupEnd())
 
     def barrier(self) -> None:
         x = torch.zeros((1,), dtype=torch.float32, device="cuda")
