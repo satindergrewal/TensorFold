@@ -12,8 +12,9 @@ decode round, alternating by TF_GLM_FILL_SHARE; a prompt chunk never shares a fo
 TF_GLM_MULTI_PREFILL=1 a prompt chunk holds the next rows of several filling streams (``multi_prefill``: each
 stream's rows get the bits of a chunk of their own; the shortest remaining prompts first, within the same row
 budget). A round: each
-decoding stream (admission order) proposes drafts under its own DFlash2 policy (copy drafts first), the combined
-window is capped at ``MAX_WINDOW`` rows (the longest tails trimmed), one verify over every stream's rows
+decoding stream (admission order; at most ``MAX_WINDOW`` streams, the others in the next rounds: ``round_cap``)
+proposes drafts under its own DFlash2 policy (copy drafts first), the combined window is capped at ``MAX_WINDOW``
+rows (the longest tails trimmed), one verify over every stream's rows
 (``forward_streams``: ``verify.BatchedVerify``, one forward over every stream's rows through the segmented KDA and
 DSA kernels, or ``verify.SerialVerify``, the reference running each window as its own forward; TF_GLM_MULTI_VERIFY),
 one packed all-gather for the samplers, each stream accepts and commits its own.
@@ -44,11 +45,14 @@ import torch
 from tensorfold.cuda import priority as prio
 from tensorfold.cuda.scheduler import Scheduler, Waiting
 from tensorfold.cuda.streams import Stream, next_fill
+from tensorfold.cuda.incremental import PromptIds, copy_prompt, enabled as incremental_enabled, keep_rendered
+from .admit_delta import pack_prompt, unpack_prompt
 
 from . import digest as _digest, multi_prefill
 from . import prof as _prefill_prof
 from .multi_tune import MultiSettings, RoundProfile, allocate, reach_of, sample_packed, scaled_confidence
 from .pool import ALIGN, Pool, align_up
+from .round_cap import RoundCap
 from .segments import window_rows
 from .verify import BatchedVerify, Segment, SerialVerify, Verified
 
@@ -161,8 +165,12 @@ def multi_code(code: list[int], dflash: bool, dflash_policy: list[int]) -> list[
 
 def trim(drafts: list[list[int]], cap: int = MAX_WINDOW) -> list[list[int]]:
     """Cut drafts until every window (a pending token and its drafts) fits ``cap`` rows together: one draft at a
-    time off the longest window (the latest of equals)."""
+    time off the longest window (the latest of equals). A pending row is never cut: a round holds at most ``cap``
+    streams (``round_cap``), and more raise here, on every rank alike, before the window is staged."""
 
+    if len(drafts) > cap:
+        raise ValueError(f"a round of {len(drafts)} streams in a {cap}-row window: a round holds at most the window's "
+                         "rows of streams (round_cap)")
     drafts = [list(d) for d in drafts]
     total = sum(1 + len(d) for d in drafts)
     while total > cap:
@@ -438,6 +446,8 @@ class MultiDecoder:
         self.outbox: list[int] = []
         self.idle = True
         self.broken: Exception | None = None
+        # X3: which decoding streams a round holds, at most MAX_WINDOW (rank 0 plans; rank 1 applies the plan)
+        self.cap = RoundCap(MAX_WINDOW, classes=self.arbiter is not None)
         self.requeue: list[Stream] = []                  # rank 0: streams given back to the scheduler's queue
         self.eos = tuple(self.w.cfg.eos)
         self.dflash_code = encode_policy(DFLASH_POLICY)
@@ -457,13 +467,25 @@ class MultiDecoder:
 
     def health(self) -> dict:
         lanes = list(self.lanes.values())
+        cap = getattr(self, "cap", None)
         return {"streams": {"decoding": sum(l.decoding and not l.paused for l in lanes),
                             "filling": sum(not l.decoding for l in lanes),
                             "paused": sum(l.decoding and l.paused for l in lanes)},
                 "pool_tokens": self.pool.rows, "pool_free_tokens": self.pool.free_rows(),
                 "kept_prompts": len(self.kept), **({"multi_prefill": dict(self.grouped)} if self.group else {}),
                 **({"lanes": self._class_counts(lanes), "arbiter": dict(self.arbiter.counts)}
-                   if self.arbiter is not None else {})}
+                   if self.arbiter is not None else {}),
+                **({"round_cap": {"rows": cap.rows, **cap.counts}} if cap is not None and self.count > cap.rows
+                   else {})}
+
+    def _round_cap(self) -> RoundCap:
+        """Rank 0's round planner (``round_cap``): at most MAX_WINDOW streams a round, by class when the priority
+        lanes are on (made here for a decoder built without ``__init__``, as the scheduler simulations build one)."""
+
+        cap = getattr(self, "cap", None)
+        if cap is None:
+            cap = self.cap = RoundCap(MAX_WINDOW, classes=getattr(self, "arbiter", None) is not None)
+        return cap
 
     @staticmethod
     def _class_counts(lanes: Sequence[Lane]) -> dict:
@@ -629,7 +651,8 @@ class MultiDecoder:
 
         self._check()
         g = self.g
-        prompt = [int(t) for t in s.prompt]
+        incremental = incremental_enabled()
+        prompt = copy_prompt(s.prompt) if incremental and isinstance(s.prompt, PromptIds) else [int(t) for t in s.prompt]
         if not prompt:
             raise ValueError("a request needs at least one prompt token")
         if len(prompt) >= g.limit:
@@ -691,7 +714,7 @@ class MultiDecoder:
         sid = self.next_sid
         payload = [sid, slot, base, need, hit.kid if hit is not None else -1, copy, s.count, int(s.stop_eos),
                    int(draft), *pack_sampling(s.sampling), *(shared + [0] * SHARED_SLOTS)[:SHARED_SLOTS], *code,
-                   len(prompt), *prompt]
+                   *pack_prompt(prompt, hit if incremental and feed is None else None)]
         from tensorfold.engine.grammar import pack
 
         packed = pack(s.constraint)
@@ -703,17 +726,16 @@ class MultiDecoder:
             self.broken = exc
             raise
 
-    @staticmethod
-    def _parse_admit(p: list[int]) -> dict:
+    def _parse_admit(self, p: list[int]) -> dict:
         (sid, slot, base, size, kid, copy, count, stop_eos, draft) = p[:9]
         sampling = unpack_sampling(p[9:19])
         shared = [v for v in p[19:19 + SHARED_SLOTS] if v]
         i = 19 + SHARED_SLOTS
         code = p[i:i + 4]
         i += 4
-        n = p[i]
-        prompt = p[i + 1:i + 1 + n]
-        i += 1 + n
+        # Decoding the wire format is unconditional, so ranks with different
+        # local switch settings still follow rank 0's authoritative operation.
+        prompt, i = unpack_prompt(p, i, self._kept_by_id, kid)
         n = p[i]
         packed = p[i + 1:i + 1 + n]
         i += 1 + n
@@ -732,7 +754,7 @@ class MultiDecoder:
         g, e = self.g, self.e
         hit = self._kept_by_id(a["kid"]) if a["kid"] >= 0 else None
         prompt = a["prompt"]
-        s.prompt = list(prompt)
+        s.prompt = copy_prompt(s.prompt) if isinstance(s.prompt, PromptIds) and s.prompt == prompt else list(prompt)
         cut = len(hit.ids) if hit is not None else 0
         if hit is not None and hit.ids != prompt[:cut]:
             raise RuntimeError(f"the kept prompt {a['kid']} is not a prefix of stream {a['sid']}'s prompt")
@@ -848,6 +870,7 @@ class MultiDecoder:
         snap.kid = self.next_kid
         self.next_kid += 1
         snap.extent = lane.extent
+        keep_rendered(snap, lane.s.prompt)
         for c in [c for c in self.kept if c.ids == snap.ids]:
             self._drop(c)
         lane.extent.kept.append(snap)
@@ -1059,7 +1082,7 @@ class MultiDecoder:
             if prof is not None:
                 prof.fill(time.perf_counter() - t)
             return [lane.s] if lane.s.done else []
-        lanes = [l for l in self.lanes.values() if l.decoding and not l.s.done]
+        lanes = decoding = [l for l in self.lanes.values() if l.decoding and not l.s.done]
         t_begin = time.perf_counter()
         heads = self._heads(lanes)            # priority lanes: a realtime reply's head decodes in rounds of its own,
         if heads and self.full_at is None:
@@ -1074,6 +1097,8 @@ class MultiDecoder:
         for l in lanes:                       # room for this round's widest window, else paused
             l.paused = not self._grow(l.extent, l.st.pos + self.rows_max, protect=[l.extent])
         active = [l for l in lanes if not l.paused]
+        if active:                            # at most MAX_WINDOW streams (a pending row each); the others wait
+            active = self._round_cap().take(active, decoding, full=len(lanes) == everyone)
         if not active:
             done = []
             if lanes and not any(not l.decoding for l in self.lanes.values()):
@@ -1098,7 +1123,7 @@ class MultiDecoder:
         self._round(active, lone=lone)
         if self.arbiter is not None:
             self.arbiter.rounded()
-            if len(lanes) == everyone:
+            if len(lanes) == everyone and self._round_cap().settled():     # every stream had its round
                 self.full_at = self.clock()
         return [l.s for l in active if l.s.done]
 
@@ -1345,11 +1370,13 @@ class MultiDecoder:
         drafts: list[list[int]] = []
         copied: list[bool] = []
         asks = []
-        for l in lanes:
-            c = l.copies.propose(copy_room(l.copies, l.s.count, l.s.out)) if l.copies is not None else []
+        room = MAX_WINDOW - len(lanes)       # rows left for drafts: 0 when the pending rows fill the window (trim would
+        for l in lanes:                      # cut every draft), so none is proposed (both ranks alike: no block pass)
+            c = (l.copies.propose(copy_room(l.copies, l.s.count, l.s.out)) if l.copies is not None and room > 0
+                 else [])
             copied.append(bool(c))
             drafts.append(list(c))
-            if not c and l.dflash and l.depth > 0:
+            if not c and l.dflash and l.depth > 0 and room > 0:
                 conf = l.policy.confidence
                 if tune.depth == "scale":
                     conf = scaled_confidence(conf, len(lanes), tune.alpha)
@@ -1541,6 +1568,8 @@ class MultiDecoder:
         x = lane.extent
         x.owner = None
         self._settle(x)
+        if getattr(self, "cap", None) is not None:
+            self.cap.forget(sid)
         lane.s.finished = lane.s.finished or time.perf_counter()
 
     def _give_back(self) -> list[Stream]:
@@ -1750,7 +1779,7 @@ class GlmScheduler(Scheduler):
         box: queue.Queue = queue.Queue()
         if priority is None:
             priority = prio.BACKGROUND if background else self.prio.default if self.prio.enabled else prio.NORMAL
-        stream = Stream(list(prompt), max(1, count), sampling, draft=draft, stop_eos=stop_eos, vision=vision,
+        stream = Stream(copy_prompt(prompt), max(1, count), sampling, draft=draft, stop_eos=stop_eos, vision=vision,
                         constraint=constraint, background=background, priority=int(priority), arrived=self.clock())
         stream.glm = dict(glm or {})
         self.saw(stream.priority)

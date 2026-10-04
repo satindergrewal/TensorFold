@@ -379,6 +379,38 @@ def _select_prompt(qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: i
     return tokens, counts
 
 
+_FAST: bool | None = None
+
+
+def fast_scores(sel) -> bool:
+    """TF_GLM_SELECT_FAST=1 (patch 0192, ``select_fast``): a prompt chunk's pool scores by the fast kernel, once it
+    gave ``_scores``' bits on this GPU (its first call checks)."""
+
+    global _FAST
+    if _FAST is None:
+        import os
+
+        value = (os.environ.get("TF_GLM_SELECT_FAST", "") or "0").strip()
+        if value not in ("0", "1"):
+            raise ValueError(f"TF_GLM_SELECT_FAST: 0 or 1, not {value!r}")
+        _FAST = value == "1"
+    if not _FAST:
+        return False
+    from . import select_fast
+
+    return select_fast.on(sel)
+
+
+def _top_prompt(scores: torch.Tensor) -> torch.Tensor:
+    """A prompt block's top-512 pools (``top_pools``); TF_GLM_TOPK_FAST=1 (patch 0199, ``topk_fast``): the same pools
+    by a kernel that reads the scores twice, once checked on this GPU."""
+    from . import topk_fast
+
+    if topk_fast.ENABLED and topk_fast.on(scores):
+        return topk_fast.top512(scores)
+    return top_pools(scores, TOPK_POOLS)
+
+
 class PromptSelect:
     """``_select_prompt``'s constants for one prompt chunk (or one piece of a multi-prompt chunk) and its two steps
     for the block of rows a .. a + n (n = min(B, R - a), B = min(R, SELECT_ROWS)): ``pools`` scores the block's rows
@@ -424,11 +456,16 @@ class PromptSelect:
 
         n, NP = self.rows(a), self.NP
         scores = self.buf[:n * NP].view(n, NP)
+        if fast_scores(self):            # TF_GLM_SELECT_FAST=1 (patch 0192): _scores' bits, faster
+            from . import select_fast
+
+            select_fast.scores(self, a, at, scores)
+            return _top_prompt(scores)
         _scores[(triton.cdiv(n, self.rb), triton.cdiv(NP, 64))](
             self.qi[a:a + n], self.wts[a:a + n], self.wts.stride(0), self.pkv, self.pks, scores, at, n, NP,
             self.D ** -0.5, self.wscale, H=self.H, HP=max(16, triton.next_power_of_2(self.H)), D=self.D, BP=64,
             RB=self.rb, RS=self.rs, FP8=self.fp8, num_warps=4)
-        return top_pools(scores, TOPK_POOLS)                                           # ascending pool index
+        return _top_prompt(scores)                                                     # ascending pool index
 
     def write_tokens(self, a: int, pools: torch.Tensor, at: torch.Tensor, tokens: torch.Tensor,
                      counts: torch.Tensor) -> None:

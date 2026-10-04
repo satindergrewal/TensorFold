@@ -28,10 +28,19 @@ ranks must be restarted together. GPU-side waits on a peer that died mid-step do
 host-side ones do (TF_GLM_CE_TIMEOUT_S). The same protocol, with its own staging, also runs behind comm.exchange /
 exchange_all as a transport of the communicator (``tensorfold.cuda.ce_comm``, TENSORFOLD_EXCHANGE=ce).
 
+TF_GLM_LANE_INPUTS (patch 0183, ``lane_inputs``) adds a third kind of step: a lane's bf16 input rows of an output
+projection, each peer's rows into its input staging ([N - 1, H] rows of the widest chosen input, one slot a sender as
+for the rows), which the receiver's own projections then read (``inputs``, ``staged``); the same protocol and reuse
+rule (its readers run on the exchange stream before this rank's next record). TF_GLM_LANE_DIRECT (the same patch):
+row buffers that live in the arena ("homes", after the staging) take the peers' rows straight from their copies
+(``rows(direct=True)``): no staging and no local copies for them (their readers' order: ``lane_inputs``).
+TF_GLM_LANE_PARTIALS=bf16 (patch 0293, ``lane_partials``): the partials' step moves bf16 rows into a bf16 staging
+[N, H, D] (a slot a sender) and widens them into the fp32 staging block hc_post reads (``partials(partb=...)``).
+
 Needs: every rank on one host, each process seeing every GPU (its own first: TensorFold uses device 0) with peer
 access between them, and room in each GPU's BAR1 for the arena (about 7 x R x D bytes: 56 MiB at 2,048 rows, 112 MiB
-at 4,096; TF_GLM_CE_ARENA_MIB caps it, default 192). The startup check exchanges a pattern and stops the server, on
-every rank, if anything is missing or wrong."""
+at 4,096, and (N - 1) x H x 2 bytes x the widest input with TF_GLM_LANE_INPUTS; TF_GLM_CE_ARENA_MIB caps it, default
+192). The startup check exchanges a pattern and stops the server, on every rank, if anything is missing or wrong."""
 
 from __future__ import annotations
 
@@ -105,14 +114,26 @@ class _Raw:
                                          "version": 3, "strides": None}
 
 
-def arena_bytes(rows: int, world: int, width: int, tensors: int, narrow: int = 0) -> tuple[int, int]:
+def arena_bytes(rows: int, world: int, width: int, tensors: int, narrow: int = 0,
+                inputs: int = 0) -> tuple[int, int]:
     """(partials' staging bytes, rows' staging bytes) for prompt buffers of ``rows`` rows: H = ceil(rows / world)
     rows a rank; [N, H, D] fp32 (hc_post reads every rank's slot) and [T, N - 1, H, D] bf16 (one slot a peer), then
     ``narrow`` bytes a row for the narrow row buffers ``rows`` may carry beside them ([N - 1, H, narrow]: a sender's
-    rows of each narrow buffer back to back; TF_GLM_MOE_GLUE rowsplit's picks and weights)."""
+    rows of each narrow buffer back to back; TF_GLM_MOE_GLUE rowsplit's picks and weights), then ``inputs`` bytes a
+    row for TF_GLM_LANE_INPUTS's input staging ([N - 1, H, inputs], from a 256-byte boundary)."""
 
     H = -(-int(rows) // int(world))
-    return world * H * width * 4, tensors * (world - 1) * H * width * 2 + (world - 1) * H * int(narrow)
+    rs = world * H * width * 4
+    ag = tensors * (world - 1) * H * width * 2 + (world - 1) * H * int(narrow)
+    if inputs:
+        ag = _inputs_at(rs, ag) - rs + (world - 1) * H * int(inputs)
+    return rs, ag
+
+
+def _inputs_at(rs: int, ag: int) -> int:
+    """The input staging's byte offset in the arena: past the rows' (and narrow rows') staging, on 256 bytes."""
+
+    return -(-(rs + ag) // 256) * 256
 
 
 def arena_cap() -> int:
@@ -134,18 +155,38 @@ class CeExchange:
     """One rank's copy-engine exchange for a prompt buffer's row split (set up collectively by every rank)."""
 
     def __init__(self, rank: int, world: int, store, rows: int, width: int, tensors: int, tag: str = "hcce",
-                 narrow: int = 0) -> None:
+                 narrow: int = 0, inputs: int = 0, homes: dict | None = None, pbf16: bool = False) -> None:
         self.rank, self.world, self.store = int(rank), int(world), store
         self.narrow = int(narrow)            # bytes a row of narrow row buffers ``rows`` carries (0: none)
+        self.inp_row = int(inputs)           # bytes a row of the input staging (TF_GLM_LANE_INPUTS; 0: none)
         # peers in rotated order (rank + 1, rank + 2, ..): at each moment every rank copies to a different peer, so
         # no GPU takes three senders' traffic at once while another takes none
         self.peers = [(self.rank + i) % self.world for i in range(1, self.world)]
         self.width, self.tensors = int(width), int(tensors)
         self.H = -(-int(rows) // self.world)
-        self.rs_bytes, self.ag_bytes = arena_bytes(rows, world, width, tensors, self.narrow)
+        self.rs_bytes, self.ag_bytes = arena_bytes(rows, world, width, tensors, self.narrow, self.inp_row)
         self.ag_main = self.tensors * (self.world - 1) * self.H * self.width * 2      # the bf16 rows' part
+        self.nw_bytes = (self.world - 1) * self.H * self.narrow                       # the narrow rows' part
+        self.inp_off = _inputs_at(self.rs_bytes, self.ag_main + self.nw_bytes)        # the input staging's start
+        # TF_GLM_LANE_DIRECT: row buffers living in the arena ({name: bytes}), each from a 256-byte boundary past the
+        # staging; a peer writes its rows into them directly (``home``, ``rows(direct=True)``)
+        end = self.rs_bytes + self.ag_bytes
+        # TF_GLM_LANE_PARTIALS=bf16: the partials' bf16 staging [N, H, D] (sender r's rows in slot r), from 256 bytes
+        self.pb_off = 0
+        self.pbf16 = bool(pbf16)
+        if self.pbf16:
+            self.pb_off = -(-end // 256) * 256
+            end = self.pb_off + self.world * self.H * self.width * 2
+        self.home_off: dict[str, int] = {}
+        self.home_size: dict[str, int] = {}
+        for name, nbytes in (homes or {}).items():
+            end = -(-end // 256) * 256
+            self.home_off[name], self.home_size[name] = end, int(nbytes)
+            end += int(nbytes)
+        self.total = end
         self.timeout = timeout_s()
         self.step = 0
+        self.sent = self.sent_steps = 0      # bytes this rank's steps sent (TF_GLM_CE_COUNT=1: ``report``)
         self.key = f"tf_{tag}"
         self.device = "cuda"
         self.lib = None
@@ -184,7 +225,7 @@ class CeExchange:
         if bad:
             raise RuntimeError("TF_GLM_HC_EXCHANGE=ce could not start (" + "; ".join(bad) + "). It needs every rank "
                                "on one host, each process seeing every GPU (its own first) with peer access, and "
-                               f"BAR1 room for the arena ({(self.rs_bytes + self.ag_bytes) >> 20} MiB a GPU beside "
+                               f"BAR1 room for the arena ({self.total >> 20} MiB a GPU beside "
                                "NCCL's peer buffers: nvidia-smi -q -d MEMORY shows BAR1; shorter prompt chunks "
                                "shrink it); TF_GLM_HC_EXCHANGE=p2p is NCCL's exchange.")
 
@@ -192,7 +233,7 @@ class CeExchange:
         """This rank's part: the arena (allocated and exported), its events (exported), its host identity; rank 0
         also creates the host table. Writes every key ``_connect`` reads."""
 
-        total = self.rs_bytes + self.ag_bytes
+        total = self.total
         if total > arena_cap():
             raise RuntimeError(f"the arena would take {total >> 20} MiB, past TF_GLM_CE_ARENA_MIB "
                                f"({arena_cap() >> 20}): shorter prompt chunks (TF_GLM_PREFILL_ROWS) or a larger cap")
@@ -210,10 +251,17 @@ class CeExchange:
         arena = torch.as_tensor(_Raw(self.base, total), device="cuda")
         if arena.data_ptr() != self.base or arena.numel() != total:
             raise RuntimeError("the arena's tensor view does not cover the allocation")
+        self.arena = arena
         self.rs = arena[:self.rs_bytes].view(torch.float32)
         self.ag = arena[self.rs_bytes:self.rs_bytes + self.ag_main].view(torch.bfloat16).view(
             self.tensors, self.world - 1, self.H, self.width)
-        self.nw = arena[self.rs_bytes + self.ag_main:]       # the narrow rows' part (bytes), empty without it
+        self.nw = arena[self.rs_bytes + self.ag_main:self.rs_bytes + self.ag_main + self.nw_bytes]   # narrow rows
+        # TF_GLM_LANE_INPUTS: the input staging (bytes), empty without it
+        self.inp = arena[self.inp_off:self.inp_off + (self.world - 1) * self.H * self.inp_row] if self.inp_row \
+            else arena[:0]
+        # TF_GLM_LANE_PARTIALS=bf16: the partials' bf16 staging, None without it
+        self.pb = arena[self.pb_off:self.pb_off + self.world * self.H * self.width * 2].view(torch.bfloat16).view(
+            self.world, self.H, self.width) if self.pbf16 else None
         handle = _IpcHandle()
         self._check(lib.cudaIpcGetMemHandle(ctypes.byref(handle), ctypes.c_void_p(self.base)), "cudaIpcGetMemHandle")
         s.set(f"{self.key}/mem/{self.rank}", bytes(handle))
@@ -293,12 +341,29 @@ class CeExchange:
             for p in self.peers:
                 if not bool(torch.all(got[p] == float(p + 1))):
                     raise RuntimeError(f"the startup pattern from rank {p} did not arrive")
+            if self.pbf16:                             # TF_GLM_LANE_PARTIALS=bf16: the bf16 staging, one step
+                fp = torch.full((self.world * n, d), float(self.rank + 11), dtype=torch.float32, device=self.device)
+                fb = fp.to(torch.bfloat16)
+                self.rs[:self.world * n * d].zero_()
+                self.partials(fp, n, 0, n, partb=fb)
+                got = self.block(0, n)
+                for p in self.peers:
+                    if not bool(torch.all(got[p] == float(p + 11))):
+                        raise RuntimeError(f"the startup bf16 pattern from rank {p} did not arrive")
+            if self.inp_row:                           # TF_GLM_LANE_INPUTS: the input staging too, one step
+                k = self.inp_row // 2
+                x = torch.full((self.world * n, k), float(self.rank + 1), dtype=torch.bfloat16, device=self.device)
+                self.inputs(x, n, 0, n)
+                for p in self.peers:
+                    if not bool(torch.all(self.staged(p, k, 0, n) == float(p + 1))):
+                        raise RuntimeError(f"the startup input rows from rank {p} did not arrive")
             self._sync()
         except Exception as exc:                       # noqa: BLE001
             problem = f"{type(exc).__name__}: {exc}"
         finally:
             self.timeout = timeout
         self._vote("probe", problem)
+        self.sent = self.sent_steps = 0
 
     # -- the protocol ------------------------------------------------------------------------------------------------
     def _await(self, idx: int, target: int, what: str) -> None:
@@ -337,12 +402,23 @@ class CeExchange:
         for dst, src, nbytes in copies:
             if nbytes:
                 self._copy(dst, src, nbytes, stream)
+                self.sent += nbytes
+        self.sent_steps += 1
         self._record(k, stream)
         self.tab[self.rank] = e
         for p in self.peers:
             self._await(p, e, f"rank {p}'s copies")
             self._wait(p, k, stream)
             self.tab[W + self.rank * W + p] = e
+
+    def report(self, label: str) -> None:
+        """TF_GLM_CE_COUNT=1 (patch 0293, a diagnostic): one line with the bytes this rank's steps sent since the last
+        line (counted on the host as the copies are issued), then the count starts again."""
+
+        if os.environ.get("TF_GLM_CE_COUNT", "") == "1" and self.sent:
+            print(f"[tensorfold] ce bytes rank {self.rank}: {label}: {self.sent} bytes out in {self.sent_steps} steps",
+                  flush=True)
+        self.sent = self.sent_steps = 0
 
     # the device operations (a CPU test replaces these)
     def _sync(self) -> None:
@@ -362,10 +438,13 @@ class CeExchange:
         stream.wait_event(self.theirs[p][k])
 
     # -- the row split's two exchanges ---------------------------------------------------------------------------------
-    def partials(self, part: torch.Tensor, H: int, off: int, n: int, at: int | None = None) -> None:
+    def partials(self, part: torch.Tensor, H: int, off: int, n: int, at: int | None = None,
+                 partb: torch.Tensor | None = None) -> None:
         """Piece (off, n): this rank's fp32 partial rows of each peer q (part[q H + off ..]) into q's staging block
         of the piece ([N, n, D] at N x ``at`` rows of the arena, ``at`` = off unless given; this rank's slot); the
-        peers' into this rank's."""
+        peers' into this rank's. ``partb`` (TF_GLM_LANE_PARTIALS=bf16): the rows to send as bf16 rows of the same
+        layout (rounded by the caller); they land in the bf16 staging and are widened into the block's peer slots
+        (exactly: a bf16 value is an fp32 value)."""
 
         d = self.width
         if part.shape[1] != d or part.dtype != torch.float32 or not part.is_contiguous():
@@ -373,10 +452,36 @@ class CeExchange:
         at = off if at is None else at
         if at + n > self.H:
             raise ValueError(f"ce partials: arena rows {at} .. {at + n} past its {self.H}")
+        if partb is not None:
+            if self.pb is None:
+                raise ValueError("ce partials: bf16 rows need the arena's bf16 staging (TF_GLM_LANE_PARTIALS=bf16)")
+            if partb.shape[1] != d or partb.dtype != torch.bfloat16 or not partb.is_contiguous():
+                raise ValueError("ce partials: contiguous bf16 rows of the arena's width")
+            row = d * 2
+            copies = [(self.remote[q] + self.pb_off + (self.rank * self.H + at) * row, partb[q * H + off].data_ptr(),
+                       n * row) for q in self.peers]
+            self.exchange(copies)
+            block = self.block(at, n)
+            for p in self.peers:
+                block[p].copy_(self.pb[p, at:at + n])
+            return
         row = d * 4
         copies = [(self.remote[q] + (self.world * at + self.rank * n) * row, part[q * H + off].data_ptr(), n * row)
                   for q in self.peers]
         self.exchange(copies)
+
+    def home(self, name: str, dtype: torch.dtype, shape: tuple) -> torch.Tensor:
+        """TF_GLM_LANE_DIRECT: the arena region ``name`` as a tensor (a row buffer that lives there)."""
+
+        off, size = self.home_off[name], self.home_size[name]
+        t = self.arena[off:off + size].view(dtype)
+        return t.view(*shape)
+
+    def _direct(self, buf: torch.Tensor) -> bool:
+        """Whether ``buf`` lies inside one of this arena's homes."""
+
+        lo, hi = buf.data_ptr(), buf.data_ptr() + buf.numel() * buf.element_size()
+        return any(self.base + o <= lo and hi <= self.base + o + self.home_size[k] for k, o in self.home_off.items())
 
     def block(self, off: int, n: int) -> torch.Tensor:
         """The piece's staging block [N, n, D] in this rank's arena (``hcsplit``'s ``got``)."""
@@ -385,12 +490,13 @@ class CeExchange:
         return self.rs[self.world * off * d:self.world * (off + n) * d].view(self.world, n, d)
 
     def rows(self, outs: list[torch.Tensor], H: int, off: int, n: int, at: int | None = None,
-             narrow: tuple | list = ()) -> None:
+             narrow: tuple | list = (), direct: bool = False) -> None:
         """Piece (off, n) of bf16 row buffers: this rank's rows (rank H + off ..) of each into every peer's staging
         (its rows ``at`` .., ``at`` = off unless given), then the peers' rows from this rank's staging into place
         (rows p H + off ..). ``narrow``: contiguous row buffers of any dtype whose rows together take at most the
         arena's ``narrow`` bytes, moved the same way in the same step (their staging: a sender's slot of [H, row]
-        a buffer, back to back)."""
+        a buffer, back to back). ``direct`` (TF_GLM_LANE_DIRECT): buffers that live in the arena's homes go straight
+        to the same place in each peer's (no staging, no local copies); the others as before."""
 
         if len(outs) > self.tensors:
             raise ValueError(f"ce rows: {len(outs)} buffers, the staging holds {self.tensors}")
@@ -402,26 +508,69 @@ class CeExchange:
         mine = self.rank * H + off
         N = self.world
         copies = []
+        placed = set()                           # direct: buffers whose rows the peers write in place
         for t, buf in enumerate(outs):
             if buf.shape[1] != d or buf.dtype != torch.bfloat16 or not buf.is_contiguous():
                 raise ValueError("ce rows: contiguous bf16 rows of the arena's width")
+            if direct and self._direct(buf):     # the same offset in each peer's arena
+                placed.add(id(buf))
+                src = buf[mine].data_ptr()
+                copies += [(self.remote[q] + src - self.base, src, n * row) for q in self.peers]
+                continue
             for q in self.peers:                 # sender r's slot in receiver q's staging: (r - q - 1) mod N
                 pos = ((t * (N - 1) + (self.rank - q - 1) % N) * self.H + at) * row
                 copies.append((self.remote[q] + self.rs_bytes + pos, buf[mine].data_ptr(), n * row))
         lay = self._narrow_layout(narrow)
         for buf, start, rb in lay:
+            if direct and self._direct(buf):
+                placed.add(id(buf))
+                src = buf[mine].data_ptr()
+                copies += [(self.remote[q] + src - self.base, src, n * rb) for q in self.peers]
+                continue
             for q in self.peers:
                 pos = ((self.rank - q - 1) % N) * self.H * self.narrow + start * self.H + at * rb
                 copies.append((self.remote[q] + self.rs_bytes + self.ag_main + pos, buf[mine].data_ptr(), n * rb))
         self.exchange(copies)
         for t, buf in enumerate(outs):
+            if id(buf) in placed:
+                continue
             for p in self.peers:
                 buf[p * H + off:p * H + off + n].copy_(self.ag[t, (p - self.rank - 1) % N, at:at + n])
         for buf, start, rb in lay:
+            if id(buf) in placed:
+                continue
             for p in self.peers:
                 pos = ((p - self.rank - 1) % N) * self.H * self.narrow + start * self.H + at * rb
                 got = self.nw[pos:pos + n * rb].view(buf.dtype).view(n, *buf.shape[1:])
                 buf[p * H + off:p * H + off + n].copy_(got)
+
+    # -- TF_GLM_LANE_INPUTS: an output projection's input rows ---------------------------------------------------------
+    def inputs(self, x: torch.Tensor, H: int, off: int, n: int, at: int | None = None) -> None:
+        """Piece (off, n) of a lane's bf16 input rows of an output projection (``lane_inputs``): this rank's rows of
+        each peer q (x[q H + off ..]) into q's input staging (sender r's slot (r - q - 1) mod N, rows ``at`` ..,
+        ``at`` = off unless given, packed at the input's own width), the peers' rows of this rank's rows into this
+        rank's (``staged``)."""
+
+        if x.dim() != 2 or x.dtype != torch.bfloat16 or not x.is_contiguous():
+            raise ValueError("ce inputs: contiguous bf16 rows")
+        rb = x.shape[1] * 2
+        if not rb or rb > self.inp_row or rb % 16:
+            raise ValueError(f"ce inputs: rows of {rb} bytes, the input staging holds {self.inp_row} (16-byte rows)")
+        at = off if at is None else at
+        if at + n > self.H:
+            raise ValueError(f"ce inputs: staging rows {at} .. {at + n} past its {self.H}")
+        N = self.world
+        copies = [(self.remote[q] + self.inp_off + ((self.rank - q - 1) % N) * self.H * self.inp_row + at * rb,
+                   x[q * H + off].data_ptr(), n * rb) for q in self.peers]
+        self.exchange(copies)
+
+    def staged(self, p: int, k: int, at: int, n: int) -> torch.Tensor:
+        """Peer p's input rows ``at`` .. ``at`` + n (``k`` bf16 wide) in this rank's input staging, as the last inputs
+        step of those rows left them: [n, k], contiguous."""
+
+        rb = k * 2
+        start = ((p - self.rank - 1) % self.world) * self.H * self.inp_row + at * rb
+        return self.inp[start:start + n * rb].view(torch.bfloat16).view(n, k)
 
     def _narrow_layout(self, narrow) -> list[tuple[torch.Tensor, int, int]]:
         """(buffer, byte offset of its rows within a row's narrow bytes, row bytes) for each narrow buffer."""

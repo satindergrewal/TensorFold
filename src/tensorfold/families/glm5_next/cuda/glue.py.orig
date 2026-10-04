@@ -253,14 +253,13 @@ def _hc_post(X, XOUT, G, POST, COMB, RS, D: tl.constexpr, S: tl.constexpr, WORLD
 
 def hc_post(x: torch.Tensor, xout: torch.Tensor, gathered: torch.Tensor, post: torch.Tensor,
             comb: torch.Tensor) -> None:
-    """gathered: [world, R, D] fp32 partials, each rank's rows contiguous, the ranks ``gathered.stride(0)`` elements
-    apart (R x D when contiguous; the two-shot exchange's view, ``twoshot``). x and xout may be the same tensor."""
+    """gathered: [world, R, D] fp32 partials (contiguous). x and xout may be the same tensor."""
 
     world, rows, d = gathered.shape
     s = x.shape[1] // d
     block = min(1024, d)
-    _hc_post[(rows, d // block)](x, xout, gathered, post, comb, gathered.stride(0), D=d, S=s, WORLD=world,
-                                 BLOCK=block, num_warps=4)
+    _hc_post[(rows, d // block)](x, xout, gathered, post, comb, rows * d, D=d, S=s, WORLD=world, BLOCK=block,
+                                 num_warps=4)
 
 
 def hc_post_pair(x: torch.Tensor, xout: torch.Tensor, g0: torch.Tensor, g1: torch.Tensor, post: torch.Tensor,
@@ -387,12 +386,9 @@ def _residual_add(X, XOUT, G, RS, D: tl.constexpr, WORLD: tl.constexpr, BLOCK: t
 
 
 def residual_add(x: torch.Tensor, xout: torch.Tensor, gathered: torch.Tensor) -> None:
-    """gathered: as ``hc_post``'s (the ranks ``gathered.stride(0)`` elements apart)."""
-
     world, rows, d = gathered.shape
     block = min(1024, d)
-    _residual_add[(rows, d // block)](x, xout, gathered, gathered.stride(0), D=d, WORLD=world, BLOCK=block,
-                                      num_warps=4)
+    _residual_add[(rows, d // block)](x, xout, gathered, rows * d, D=d, WORLD=world, BLOCK=block, num_warps=4)
 
 
 @triton.jit

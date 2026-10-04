@@ -306,7 +306,8 @@ def round_costs(costs: dict) -> tuple[float, ...]:
 
 from .segments import window_rows as _window_rows  # noqa: E402
 
-PARALLEL_MOST = 64                    # --parallel: concurrent requests at most (was 4; segments.MAX_SEGS follows --parallel)
+PARALLEL_MOST = 64                    # --parallel: concurrent requests at most (was 4; segments.MAX_SEGS follows --parallel;
+                                      # a round holds at most the verify window's rows of streams: round_cap)
 MULTI_WINDOW = _window_rows()         # --parallel: rows of every stream's verify windows together (multi.MAX_WINDOW;
                                       # TF_GLM_MULTI_WINDOW, default 32)
 
@@ -473,6 +474,10 @@ class GlmEngine:
         # TF_GLM_KVB=fp8/q4 (an EXL3 checkpoint, latent cache): kv_b as the absorb and expand kernels read it
         kvb = kvb_kind() if cfg.quant == "exl3" and LATENT else "bf16"
         weights_estimate = kvb_weights(weights_estimate, kvb)
+        # TF_GLM_LANE_INPUTS (patch 0183): every rank's slice of the chosen output projections on each rank
+        from . import lane_inputs as lane_inputs_mod
+
+        weights_estimate = lane_inputs_mod.weights(weights_estimate, cfg, world)
         # TF_GLM_KV=fp8: the DSA latent cache and the indexer's pooled keys as e4m3 rows (``kv8``), half the bytes
         from .kv8 import KINDS as KV_KINDS, kv_kind
 
@@ -573,15 +578,22 @@ class GlmEngine:
                                  parallel, *verify_code, int(union_cover()), MAX_ROWS, len(WIDE_GRAPHS),
                                  sum(WIDE_GRAPHS), max(WIDE_GRAPHS, default=0),
                                  KV_KINDS.index(kv), MULTI_WINDOW]
+        from . import twoshot as twoshot_mod                          # TF_GLM_TWOSHOT_*: the decode exchange
+
+        mine += twoshot_mod.code()
         from .index_split import settings as index_split_settings     # patch 0120: TF_GLM_INDEX_SPLIT*
 
         mine += index_split_settings().code()
+<<<<<<<
+        from . import lanes as lanes_mod                              # patch 0123: TF_GLM_PREFILL_LANES*
+=======
+        from .index_split import gather_code as index_gather_code     # patch 0198: TF_GLM_INDEX_SPLIT_GATHER
+
+        mine.append(index_gather_code())
         from . import lanes as lanes_mod                # patches 0123, 0128: TF_GLM_PREFILL_LANES*, TF_GLM_KDA_OVERLAP
+>>>>>>>
 
         mine += lanes_mod.code()
-        from . import draft_skip as draft_skip_mod                    # patch 0124: TF_GLM_DRAFT_PROMPT_SKIP
-
-        mine += draft_skip_mod.code()
         from . import draft_skip as draft_skip_mod                    # patch 0124: TF_GLM_DRAFT_PROMPT_SKIP
 
         mine += draft_skip_mod.code()
@@ -591,6 +603,13 @@ class GlmEngine:
         from . import wide as wide_mod                                # TF_GLM_MULTI_GRAPH_STEP: captures and pads
 
         mine += [wide_mod.code()]
+        # the 0.6.1 port's choices: the EXL3 expert route (patch 0000: GLM's kernels or the universal route, other
+        # prompt bits) and the grouped lane matmul's mode (patch 0016: the same bits, other speed)
+        from tensorfold.cuda.kernels import qmm as shared_qmm
+        from .weights import exl3_route
+
+        mine += [int(cfg.quant == "exl3" and exl3_route(str(model_dir), rank, world) == "universal"),
+                 shared_qmm.GROUP_MODES.index(shared_qmm.GROUP_MODE)]
         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
         plan = self.capacity_plan
         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
@@ -604,7 +623,14 @@ class GlmEngine:
                                "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE, "
                                "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV, TF_GLM_INDEX_SPLIT*, "
                                "TF_GLM_PREFILL_LANES, TF_GLM_LANE_MIN_ROWS, TF_GLM_KDA_OVERLAP, TF_GLM_DRAFT_PROMPT_SKIP, "
+<<<<<<<
                                "TF_GLM_DRAFT_FAST*, TF_GLM_MULTI_GRAPH_STEP): "
+=======
+                               "TF_GLM_DRAFT_FAST*, TF_GLM_MULTI_GRAPH_STEP, TF_GLM_EXL3_PATH, TENSORFOLD_QMM_GROUP): "
+                               f"rank 0 {rows[0][:-1]}, " + ", ".join(f"rank {r} {rows[r][:-1]}" for r in odd) +
+                               "; pull the draft model on every machine (or pass --drafter none to all) and give "
+                               "every rank the same flags")
+>>>>>>>
                                f"rank 0 {both[0][:-1]}, rank 1 {both[1][:-1]}; pull the draft model on both machines "
                                "(or pass --drafter none to both) and give both the same flags")
         self.cache_bytes = min(both[0][-1], both[1][-1]) << 20
@@ -636,7 +662,27 @@ class GlmEngine:
                 raise ValueError(f"--parallel {parallel}: a pool of {pool_rows} tokens is less than one {ALIGN}-token "
                                  f"extent; free memory or lower --context")
             self.limit = min(self.limit, pool_rows - MAX_ROWS)
+<<<<<<<
             self.cache_bytes = 0                 # kept prompts live in the pool
+=======
+<<<<<<<
+=======
+                return -1, str(exc)
+
+        from . import exl3_stream as _exl3_stream
+        from . import lane_partials as _lane_partials           # patch 0293: TF_GLM_LANE_PARTIALS
+        from . import segprof as _segprof
+
+>>>>>>>
+        mine = [quiet(_fuse.code), quiet(_fuse.hc_rows), quiet(_gpu_sample.wanted), quiet(moe_glue_mod.mask),
+                quiet(moe_glue_mod.shared_tile), quiet(lambda: moe_glue_mod.side_priority() + 1),
+                quiet(_exl3_stream.code),
+                quiet(_segprof.code), quiet(lane_inputs_mod.mask),
+                quiet(_lane_partials.mask)]
+        got = self._gather_ints([_tune.code()] + [v for v, _ in mine])
+        tables = [row[0] for row in got]
+        if any(t == -1 for t in tables) or any(t != tables[0] for t in tables):
+>>>>>>>
             plan["pool_tokens"] = pool_rows
         if rank == 0 and self.cache_bytes < wanted and parallel == 1:
             print(f"[tensorfold] other conversations' prompts are kept in {self.cache_bytes / 2 ** 30:.1f} GiB, what "
@@ -648,7 +694,27 @@ class GlmEngine:
         w = load(model_dir, rank=rank, mtp=self.mtp_on)
         w.comm = self.comm
         self.comm.ready("loading")                   # a peer stuck loading is named, not waited on in NCCL
+<<<<<<<
         self.comm.barrier()
+=======
+            why = "; ".join(w for _, w in mine if w)
+            raise RuntimeError("TF_GLM_FUSE (as a mask), TF_GLM_FUSE_HC_ROWS, TENSORFOLD_GPU_SAMPLE, TF_GLM_MOE_GLUE "
+                               "(as a mask), TF_GLM_MOE_SHARED_TILE, TF_GLM_MOE_SIDE_PRIORITY + 1, "
+                               "TF_GLM_EXL3_STREAM* / TF_GLM_L2PF_EXPERT_MB, TF_GLM_SEGPROF*, "
+                               "TF_GLM_LANE_INPUTS and TF_GLM_LANE_DIRECT (as a mask), TF_GLM_LANE_PARTIALS by rank "
+                               f"{settings} (-1: not valid)" + (f"; this rank: {why}" if why else "")
+                               + ": give every rank the same valid values")
+        if mine[2][0] == 1 and torch.cuda.is_available():  # the GPU sampler built and checked before the first request
+>>>>>>>
+<<<<<<<
+=======
+        w.comm = self.comm
+        self.comm.ready("loading")                   # a peer stuck loading is named, not waited on in NCCL
+        self.comm.barrier()
+        # TF_GLM_LANE_INPUTS: the other ranks' slices of the chosen output projections (a collective; the estimate
+        # counted them); before the prompt buffers' split sizes its copy-engine arena by them
+        lane_inputs_added = lane_inputs_mod.gather(w)
+>>>>>>>
         self.w = w
         if rank == 0 and cfg.mtp_layers and not self.mtp_on:
             print("[tensorfold] the checkpoint's MTP head is not loaded (TF_GLM_MTP=" +
@@ -673,12 +739,15 @@ class GlmEngine:
         if rank == 0 and index_split_settings().on and world > 1:
             print(f"[tensorfold] {index_split_settings().describe()}", flush=True)
             print(f"[tensorfold] {draft_skip_mod.describe()}", flush=True)
+        from . import moe_glue as moe_glue_mod
         if rank == 0 and moe_glue_mod.on():
             print(f"[tensorfold] {moe_glue_mod.describe()}", flush=True)
+        if rank == 0 and (lane_inputs_mod.wanted() or lane_inputs_mod.direct_wanted()):
+            print(f"[tensorfold] {lane_inputs_mod.describe(world, lane_inputs_added)}", flush=True)
+        if rank == 0 and _lane_partials.on():
+            print(f"[tensorfold] {_lane_partials.describe()}", flush=True)
         if rank == 0 and parallel > 1 and self.drafter is not None and dflash2_fast.settings().on:
             print(f"[tensorfold] {dflash2_fast.settings().describe()}", flush=True)
-        if rank == 0 and draft_skip_mod.ON and self.drafter is not None:
-            print(f"[tensorfold] {draft_skip_mod.describe()}", flush=True)
         if rank == 0 and lanes_mod.LANES > 1:
             print(f"[tensorfold] {lanes_mod.describe()}"
                   + ("" if self.e.pbuf.split is not None else ": not used, it needs TF_GLM_HC_SPLIT=1"), flush=True)
@@ -742,6 +811,9 @@ class GlmEngine:
         self.model_dir = Path(model_dir)
         self.request = threading.local()    # the calling request's policy and stop-at-EOS (``app.GlmApp``)
         # kept conversations (decode.Snapshot, least recently used first) and the live caches' ids; states and saved rows stay within cache_bytes
+        if rank == 0 and moe_glue_mod.on():
+            print(f"[tensorfold] {moe_glue_mod.describe()}", flush=True)
+
         self.cache: list = []
         self.live: list[int] = []
         self.cache_entries = int(os.environ.get("TF_GLM_CACHE_ENTRIES", "8"))
@@ -758,10 +830,26 @@ class GlmEngine:
                       f"{self.multi.fill_rows} rows while others decode (TF_GLM_FILL_ROWS, TF_GLM_FILL_SHARE "
                       f"{self.multi.share:g}){'; waiting prompts share prompt chunks (TF_GLM_MULTI_PREFILL)' if self.multi.group else ''}; "
                       f"{self.multi.tune.describe()}", flush=True)
+<<<<<<<
+=======
                 print(f"[tensorfold] --parallel {parallel}: {self.scheduler.prio.describe(parallel)}", flush=True)
+                if parallel > MULTI_WINDOW:     # more streams than window rows: rounds rotate them (round_cap)
+                    print(f"[tensorfold] --parallel {parallel} over a {MULTI_WINDOW}-row window "
+                          f"(TF_GLM_MULTI_WINDOW): {self.multi._round_cap().describe()}", flush=True)
                 if self.multi.row_ms is not None:
                     print("[tensorfold] --parallel batched window ms by rows: " +
                           " ".join(f"{i + 1}:{ms:.1f}" for i, ms in enumerate(self.multi.row_ms)), flush=True)
+>>>>>>>
+            print(f"[tensorfold] {index_split_settings().describe()}", flush=True)
+        from . import index_split as index_split_mod        # patch 0198: every rank, the split's own IPC gather
+        index_split_mod.warm(getattr(self.comm, "nccl", self.comm), rank, world, prefill_rows)
+        if rank == 0 and draft_skip_mod.ON and self.drafter is not None:
+            print(f"[tensorfold] {draft_skip_mod.describe()}", flush=True)
+        if rank == 0 and moe_glue_mod.on():
+            print(f"[tensorfold] {moe_glue_mod.describe()}", flush=True)
+        if rank == 0 and lanes_mod.LANES > 1:
+            print(f"[tensorfold] {lanes_mod.describe()}"
+                  + ("" if self.e.pbuf.split is not None else ": not used, it needs TF_GLM_HC_SPLIT=1"), flush=True)
         if hasattr(self.comm, "settle"):                # startup is over: RoCE gathers go without a barrier first
             self.comm.settle()
 
@@ -1065,6 +1153,9 @@ class GlmEngine:
         if self.shared and draft and feed is None and hit is not None:     # what it resumed from is used again
             self.cache = [c for c in self.cache if c is not hit] + [hit]
         for snap in kept:
+            from tensorfold.cuda.incremental import keep_rendered
+
+            keep_rendered(snap, prompt)
             self._remember(snap)
         if not kept and draft and feed is None and hit is not None:     # the resume point is the grid point: newest
             self.cache = [c for c in self.cache if c is not hit] + [hit]
@@ -1124,6 +1215,8 @@ class GlmEngine:
                  priority: int | None = None) -> dict[str, Any]:
         """Mirror one rank-0 request on rank 1; draft=False uses serial decoding and fresh prefill as the reference drafted replies must equal; ``vision``: an image prompt's prepared pictures (``GlmPrepared``); ``background``: under --parallel, after the other requests and yielding to them; ``priority``: under --parallel, the request's class (``tensorfold.cuda.priority``, patch 0141; None: from ``background``)."""
 
+        from tensorfold.cuda.incremental import copy_prompt
+
         if len(prompt) >= self.limit:
             raise ValueError(f"prompt of {len(prompt)} tokens: this engine serves contexts up to {self.limit}")
         max_tokens = max(1, min(int(max_tokens), self.limit - len(prompt)))
@@ -1136,7 +1229,7 @@ class GlmEngine:
         if self.scheduler is not None:          # --parallel: the scheduler's worker runs it with the others
             if vision is not None and self.vision is None:
                 raise ValueError("image inputs require starting this server with --vision")
-            stats = self.scheduler.submit(list(prompt), max_tokens, sampling, bool(draft) and not self.serial_only,
+            stats = self.scheduler.submit(copy_prompt(prompt), max_tokens, sampling, bool(draft) and not self.serial_only,
                                           on_tokens, stop_eos=stop_eos, vision=vision, constraint=constraint,
                                           background=background, glm={"code": code, "spec": spec},
                                           priority=priority)
@@ -1178,7 +1271,7 @@ class GlmEngine:
             self._share(pack(constraint))
         if positions:
             self._share(positions)
-        stats = self._run(list(prompt), max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, constraint, feed,
+        stats = self._run(copy_prompt(prompt), max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, constraint, feed,
                           shared)
         stats.update(policy=spec, drafts=draft)
         if hasattr(self.comm, "check"):                  # a RoCE wait that timed out inside a graph surfaces here
@@ -1188,8 +1281,13 @@ class GlmEngine:
         return stats
 
     def score_labels(self, prompt_ids: list[int], label_ids: list[int]) -> tuple[list[float], float]:
-        """Both ranks prefill the prompt and return its label logits plus the full-vocabulary logsumexp."""
+        """Every rank prefills the prompt; rank 0 returns its label logits plus the full-vocabulary logsumexp. The
+        one-stream engine only: with --parallel above 1 the followers run the multi-stream loop, which takes no
+        decision header, so the request is refused before any rank is told of it."""
 
+        if getattr(self, "multi", None) is not None:
+            raise ValueError(f"decision scoring runs on the one-stream engine (--parallel 1); this server decodes up "
+                             f"to {self.parallel} streams at once")
         prompt = [int(token) for token in prompt_ids]
         labels = [int(token) for token in label_ids]
         if not prompt:
@@ -1198,7 +1296,7 @@ class GlmEngine:
             raise ValueError("empty labels")
         if len(prompt) >= self.limit:
             raise ValueError(f"prompt of {len(prompt)} tokens: this engine serves contexts up to {self.limit}")
-        self._ring()                    # rank 1 waits on the store before this header, as a chat request does
+        self._ring()                    # the followers wait on the store before this header, as a chat request does
         self._share([0, len(labels)])   # max_tokens on a chat header is at least 1, so 0 is a score
         self._share(prompt)
         self._share(labels)
@@ -1218,15 +1316,22 @@ class GlmEngine:
         rows = [local] if self.comm is None else self._gather_floats(local)
         if self.rank != 0:
             return [], 0.0
-        return reduce_vocab_shards(rows, labels, len(rows[0]))
+        # the ranks' vocabulary shards in rank order (tp.Layout: they may differ in width), joined into one row
+        whole = [value for row in rows for value in row]
+        return reduce_vocab_shards([whole], labels, len(whole))
 
     def _gather_floats(self, values: list[float]) -> list[list[float]]:
+        """Every rank's ``values`` (its vocabulary shard: widths may differ between ranks), in rank order."""
+
         torch = self.torch
-        mine = torch.tensor(values, dtype=torch.float32, device="cuda")
-        got = torch.empty((2 * len(values),), dtype=torch.float32, device="cuda")
+        world = int(getattr(self, "world", 2))
+        sizes = [int(row[0]) for row in self._gather_ints([len(values)])]
+        width = max(sizes)
+        mine = torch.zeros((width,), dtype=torch.float32, device="cuda")
+        mine[:len(values)] = torch.tensor(values, dtype=torch.float32, device="cuda")
+        got = torch.empty((world * width,), dtype=torch.float32, device="cuda")
         self.comm.all_gather(mine, got)
-        width = len(values)
-        return [[float(item) for item in got[:width].tolist()], [float(item) for item in got[width:].tolist()]]
+        return [[float(item) for item in got[r * width:r * width + n].tolist()] for r, n in enumerate(sizes)]
 
     def follow(self) -> None:
         """Rank 1: mirror every request rank 0 serves, forever."""

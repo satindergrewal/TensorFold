@@ -25,7 +25,19 @@ decides from the same numbers, so they all take the same branch; the startup com
 
 Where the gather runs: on the row split's second stream when a prompt chunk runs split with overlap and NCCL
 exchanges (``hcsplit.HcSplit``), so every NCCL call of the chunk stays on one stream in one order; else (no overlap,
-or copy-engine exchanges, which take no NCCL call) on the current stream."""
+or copy-engine exchanges, which take no NCCL call) on the current stream.
+
+TF_GLM_INDEX_SPLIT_GATHER (patch 0198): how the pools travel. ``nccl`` (the default): the NCCL all-gather. On a host
+whose GPUs sit on PCIe, beside the row split's copy-engine exchange, that gather (NCCL's LL protocol on a few
+channels) moves its 1 MiB a rank at about 1 GB/s: 1.5 to 4.9 ms a call on every rank, also the last to arrive, on the
+stream that waits for it (about 1.4 s a rank of a cold 100K prompt). ``ipc``: a CUDA IPC all-gather of the split's
+own (``tensorfold.cuda.ipc.IpcGather``, set up at startup by ``warm``): each rank's copy engines push its pools into a
+slot of every peer's exported memory, a flag a peer says they landed, and each rank copies the peers' pools out in
+rank order. ``ipc-sm``: the same with SM stores instead of the copy engines (its flag protocol). Either way the
+receive buffer holds what NCCL's all-gather leaves (rank r's pools at r x the send size), copied, never computed:
+the same tokens and counts. A gather larger than the regions set up for (``gather_bytes``) and every gather after a
+failed setup (no peer-to-peer access: every rank says so) go through NCCL; the choice depends on the byte count only,
+the same on every rank."""
 
 from __future__ import annotations
 
@@ -76,6 +88,79 @@ def settings() -> IndexSplit:
     if SETTINGS is None:
         SETTINGS = IndexSplit.from_env()
     return SETTINGS
+
+
+GATHERS = ("nccl", "ipc", "ipc-sm")      # TF_GLM_INDEX_SPLIT_GATHER (patch 0198)
+GATHER_BLOCK = 256 << 10                 # bytes a block of the IPC gather's copy-out (1 MiB a rank: 4 blocks)
+_IPC = None                              # the split's CUDA IPC gather (``warm``), or None: NCCL
+
+
+def gather_mode(env=None) -> str:
+    """TF_GLM_INDEX_SPLIT_GATHER: nccl (the default), ipc (copy engines) or ipc-sm (SM stores)."""
+
+    env = os.environ if env is None else env
+    value = str(env.get("TF_GLM_INDEX_SPLIT_GATHER", "") or "nccl").strip().lower()
+    if value not in GATHERS:
+        raise ValueError(f"TF_GLM_INDEX_SPLIT_GATHER: nccl, ipc or ipc-sm, not {value!r}")
+    return value
+
+
+def gather_code(env=None) -> int:
+    """The gather setting for the ranks' startup comparison."""
+
+    return GATHERS.index(gather_mode(env))
+
+
+def gather_bytes(rows: int, world: int) -> int:
+    """The most bytes one rank sends in a split gather of a piece of up to ``rows`` rows: int32 [slots, B, 512]
+    (``select``'s send buffer: B the piece's block rows, slots the blocks a rank holds)."""
+
+    most = 0
+    for R in range(128, int(rows) + 1):
+        b = min(R, split_block(R, world))
+        blocks = -(-R // b)
+        most = max(most, -(-blocks // int(world)) * b * 512 * 4)
+    return most
+
+
+def warm(comm, rank: int, world: int, rows: int) -> None:
+    """Every rank at startup (a collective step): with the split on and TF_GLM_INDEX_SPLIT_GATHER=ipc / ipc-sm,
+    the split's CUDA IPC gather, with regions for ``gather_bytes(rows, world)`` a rank; ``comm``: the NCCL
+    communicator (its all-gather exchanges the regions' handles). Without peer-to-peer access every rank says so and
+    the split's gathers stay on NCCL."""
+
+    global _IPC
+    mode = gather_mode()
+    if not (settings().on and int(world) > 1 and mode != "nccl") or _IPC is not None:
+        return
+    from tensorfold.cuda.ipc import PROTO, IpcGather, IpcUnavailable
+
+    nbytes = gather_bytes(rows, world)
+    proto = PROTO["ce"] if mode == "ipc" else PROTO["flag"]
+    try:
+        _IPC = IpcGather(comm, int(rank), int(world), max_bytes=nbytes, block_bytes=GATHER_BLOCK,
+                         bands=[(proto, nbytes)])
+    except IpcUnavailable as exc:
+        _IPC = None
+        if int(rank) == 0:
+            print(f"[tensorfold] TF_GLM_INDEX_SPLIT_GATHER={mode}: {exc}; the index split's gathers stay on NCCL",
+                  flush=True)
+        return
+    if int(rank) == 0:
+        how = "copy engines" if mode == "ipc" else "SM stores"
+        print(f"[tensorfold] the index split's pools over CUDA IPC ({how}, up to {nbytes >> 10} KiB a rank)",
+              flush=True)
+
+
+def _all_gather(comm, send: torch.Tensor, recv: torch.Tensor) -> None:
+    """recv <- every rank's send in rank order: the split's IPC gather when it was set up and the bytes fit (the same
+    answer on every rank), NCCL otherwise; the same bytes either way."""
+
+    ipc = _IPC
+    if ipc is not None and ipc.fits_bytes(send.numel() * send.element_size()):
+        ipc.all_gather(send, recv)
+    else:
+        comm.all_gather(send, recv)
 
 
 def applies(w, b, R: int, host_pos: int | None, all_sparse: bool, sparse_np: int | None) -> bool:
@@ -159,14 +244,14 @@ def select(w, b, qr: torch.Tensor, xs_qr: torch.Tensor, qb, qi: torch.Tensor, wt
     comm = getattr(w.comm, "nccl", w.comm)
     side = _side_stream(b)
     if side is None:
-        comm.all_gather(send.reshape(-1), recv.reshape(-1))
+        _all_gather(comm, send.reshape(-1), recv.reshape(-1))
     else:
         main = torch.cuda.current_stream()
         ready = torch.cuda.Event()
         ready.record(main)
         with torch.cuda.stream(side):
             side.wait_event(ready)
-            comm.all_gather(send.reshape(-1), recv.reshape(-1))
+            _all_gather(comm, send.reshape(-1), recv.reshape(-1))
             done = torch.cuda.Event()
             done.record(side)
         send.record_stream(side)

@@ -12,9 +12,10 @@ from tensorfold.cuda import experts as grouped
 from tensorfold.cuda.geometry import MLA_PROMPT_ATT_ROWS as PROMPT_ATT_ROWS   # a dense latent call's prompt rows
 from tensorfold.cuda.kernels import prefill_attention, qmm as shared
 
-from . import glue, index_split, kda as kda_mod, kv8, l2pf, lanes, latent, prof, qmm, sparse
+from . import glue, index_split, kda as kda_mod, kv8, l2pf, lane_partials, lanes, latent, moe_glue, prof, qmm, sparse, tp
 from .attention import AttnScratch, attention, kv_write
 from .weights import LayerW, Weights
+from . import twoshot                     # noqa: E402  (TF_GLM_TWOSHOT_ROWS: decode partials in two shots)
 
 
 # rows a prompt chunk's dense latent attention runs at once (its partials' rows; the startup estimate's)
@@ -128,6 +129,16 @@ class Buffers:
         # rank partials
         self.part = torch.empty((rows, D), dtype=f32, device=dev)
         self.gath = torch.empty((w.world * rows * D,), dtype=f32, device=dev)
+        # TF_GLM_LANE_PARTIALS=bf16 (lane_partials.py): the partial's bf16 rows (rounded before every exchange); decode
+        # buffers also all-gather them (bf16, widened into b.gath); prompt buffers' rare unsplit chunks gather fp32
+        # (attributes only with the setting: without it the buffers are exactly as before)
+        if lane_partials.on():
+            self.partb = torch.empty((rows, D), dtype=bf, device=dev)
+            if not prefill and w.world > 1:
+                self.gathb = torch.empty((w.world * rows * D,), dtype=bf, device=dev)
+        # TF_GLM_TWOSHOT_ROWS (twoshot.py): a decode buffer's windows of that many rows or more exchange their partials
+        # in two shots, the same bits; None: one all-gather a site
+        self.twoshot = None if prefill else twoshot.attach(w, rows)
         # split-K partials of BF16 / FP8 projections (``mm``): a prompt chunk's 4-bit ones run the prompt matmul, which
         # keeps none, so an MLX checkpoint's and TF_GLM_DENSE=q4's prompt buffers hold none (the FP8 head's one row
         # allocates its few itself); a partials buffer holds scratch only, so where it lives never changes a bit
@@ -406,6 +417,22 @@ def gather(w: Weights, b: Buffers, R: int) -> torch.Tensor:
     d = b.part.shape[1]
     if w.comm is None:
         return b.part[:R].view(1, R, d)
+    ts = getattr(b, "twoshot", None)
+    two = ts is not None and ts.applies(R)
+    pb = getattr(b, "partb", None)
+    if pb is not None:                            # TF_GLM_LANE_PARTIALS=bf16: this rank's partial rounded to bf16
+        lane_partials.to_bf16(pb[:R], b.part[:R])
+        gb = getattr(b, "gathb", None)
+        if gb is not None and not two:            # a decode buffer: the all-gather moves the bf16 rows
+            out = b.gath[:b.world * R * d]
+            got = gb[:b.world * R * d]
+            w.comm.all_gather(pb[:R].reshape(-1), got)
+            lane_partials.widen(out, got)
+            return out.view(b.world, R, d)
+        lane_partials.widen(b.part[:R], pb[:R])   # else fp32 rows holding the bf16 values (the same sums)
+    if two:                                       # the branch where rank 0's partial sits, -0.0 for the others
+        # (inside the layer loop the glue takes a split exchange: TF_GLM_TWOSHOT_SPLIT, ``_hc_post``)
+        return ts.exchange(b.part, R, split=getattr(b, "hc_split_ok", False))
     out = b.gath[:b.world * R * d]
     w.comm.all_gather(b.part[:R].reshape(-1), out)
     return out.view(b.world, R, d)
@@ -443,6 +470,9 @@ def out_proj(w: Weights, b: Buffers, x: torch.Tensor, q: qmm.Q4, xs: torch.Tenso
     def fill(lo: int, hi: int) -> None:          # rows are independent: any row range gives the same bits
         mm(b, x[lo:hi], q, None if xs is None else xs[lo:hi], b.part[lo:hi], f32=True)
 
+    ranks = getattr(q, "ranks", None)            # TF_GLM_LANE_INPUTS: every rank's slice is here (lane_inputs.py);
+    if ranks is not None and b.prefill:          # a prompt lane then swaps the inputs (lanes.LaneSplit._inputs)
+        fill.inputs, fill.ranks = x, ranks
     return partials(w, b, R, fill, site=site)
 
 
@@ -600,9 +630,34 @@ def dsa_front(layer: LayerW, w: Weights, b: Buffers, lo: int, hi: int) -> None:
     c = w.cfg
     a = layer.dsa
     mm(b, b.normed[lo:hi], a.proj, b.xs[lo:hi], b.dp[lo:hi])
-    glue.rmsnorm(b.dp[lo:hi, :c.q_lora], a.q_norm, c.eps, b.qr[lo:hi], b.xs_qr[lo:hi])
-    glue.rmsnorm(b.dp[lo:hi, c.q_lora:], a.kv_norm, c.eps, b.lat[lo:hi], b.xs_lat[lo:hi])
+    _dsa_norms(c, a, b, lo, hi)
     mm(b, b.qr[lo:hi], a.q_b, b.xs_qr[lo:hi], b.q[lo:hi].view(hi - lo, a.heads * c.qk_dim))
+
+
+def _dsa_norms(c, a, b: Buffers, lo: int, hi: int) -> None:
+    """The DSA front's query and latent RMSNorms of rows lo .. hi (one launch under TF_GLM_DSA_FUSE norms, patch
+    0193: the same bits)."""
+
+    qa, qb = b.dp[lo:hi, :c.q_lora], b.dp[lo:hi, c.q_lora:]
+    from . import dsa_fuse
+
+    if dsa_fuse.wanted() and dsa_fuse.norm_pair_ok(qa, qb) and dsa_fuse.on(
+            "norms", lambda: dsa_fuse.check_norms(c.q_lora, c.kv_lora, qa.device)):
+        dsa_fuse.norm_pair(qa, a.q_norm, b.qr[lo:hi], b.xs_qr[lo:hi], qb, a.kv_norm, b.lat[lo:hi], b.xs_lat[lo:hi],
+                           c.eps)
+        return
+    glue.rmsnorm(qa, a.q_norm, c.eps, b.qr[lo:hi], b.xs_qr[lo:hi])
+    glue.rmsnorm(qb, a.kv_norm, c.eps, b.lat[lo:hi], b.xs_lat[lo:hi])
+
+
+def _writes_fused(lc: torch.Tensor) -> bool:
+    """TF_GLM_DSA_FUSE writes (patch 0193): the latent write, index write and pool keys in one launch, once checked
+    bit for bit on this GPU (for this cache format)."""
+
+    from . import dsa_fuse
+
+    return bool(dsa_fuse.wanted()) and dsa_fuse.on(
+        "writes", lambda: dsa_fuse.check_writes(kv8.kind_of(lc), lc.device))
 
 
 def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
@@ -612,8 +667,9 @@ def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos
 
     c = w.cfg
     a = layer.dsa
-    for lo, hi in undone(R, done):
-        dsa_front(layer, w, b, lo, hi)
+    with prof.timed("dsa: front", events_only=True):
+        for lo, hi in undone(R, done):
+            dsa_front(layer, w, b, lo, hi)
     HL = a.heads
     if a.absorb is not None:
         return _dsa_latent(a, w, kc, pos_dev, b, R, nch, index, host_pos, sparse_np, layer=layer.index)
@@ -678,7 +734,8 @@ def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffe
     """DSA on the latent cache: the same indexer and selection, attention over latents with kv_b's key blocks absorbed into the query."""
 
     o = dsa_rows(a, w, lc, pos_dev, b, R, nch, index, host_pos, sparse_np, layer)
-    return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R, site=(layer, "a"))
+    with prof.timed("dsa: out + all-gather", events_only=True):
+        return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R, site=(layer, "a"))
 
 
 def dsa_rows(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers, R: int, nch: int | None,
@@ -693,8 +750,10 @@ def dsa_rows(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
     HL = a.heads
     s = b.lat_s
     rs = slice(lo, lo + R)
-    with prof.timed("dsa: latent write"):
-        latent.latent_write(b.lat[rs], lc, pos_dev)
+    fused = index is not None and _writes_fused(lc)      # TF_GLM_DSA_FUSE writes (patch 0193): with the indexer's
+    if not fused:
+        with prof.timed("dsa: latent write"):
+            latent.latent_write(b.lat[rs], lc, pos_dev)
     # sparse_np: every row is past the dense limit (a captured graph); else the host position decides
     all_sparse = sparse_np is not None or (host_pos is not None and host_pos >= c.dense_limit)
     sparse_rows = index is not None and (all_sparse or (host_pos is not None and host_pos + R - 1 >= c.dense_limit))
@@ -704,7 +763,14 @@ def dsa_rows(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
         with prof.timed("dsa: indexer update"):
             mm(b, b.normed[rs], ix.kw, b.xs[rs], b.ikr[rs])
             glue.router(b.normed[rs], ix.gate, b.igr[rs])
-            sparse.index_update(b.ikr[rs, :c.index_dim], b.igr[rs], ix.ln_w, ix.ln_b, ix.ape, ik, ig, pk, pos_dev)
+            if fused:
+                from . import dsa_fuse
+
+                dsa_fuse.writes(b.lat[rs], lc, b.ikr[rs, :c.index_dim], b.igr[rs], ix.ln_w, ix.ln_b, ix.ape, ik, ig,
+                                pk, pos_dev)
+            else:
+                sparse.index_update(b.ikr[rs, :c.index_dim], b.igr[rs], ix.ln_w, ix.ln_b, ix.ape, ik, ig, pk,
+                                    pos_dev)
     with prof.timed("dsa: absorb"):
         qa = latent.absorb_q(b.q[rs], a.absorb, s.qa[rs], prompt=b.prefill and latent.PROMPT_MMA)
     l2pf.site(layer, "o")
@@ -751,13 +817,14 @@ def dsa_segments(layer: LayerW, w: Weights, lc: torch.Tensor, b: Buffers, R: int
     if a.absorb is None:
         raise ValueError("segmented windows need the latent cache (TF_GLM_LATENT=1)")
     mm(b, b.normed[:R], a.proj, b.xs[:R], b.dp[:R])
-    glue.rmsnorm(b.dp[:R, :c.q_lora], a.q_norm, c.eps, b.qr[:R], b.xs_qr[:R])
-    glue.rmsnorm(b.dp[:R, c.q_lora:], a.kv_norm, c.eps, b.lat[:R], b.xs_lat[:R])
+    _dsa_norms(c, a, b, 0, R)
     HL = a.heads
     mm(b, b.qr[:R], a.q_b, b.xs_qr[:R], b.q[:R].view(R, HL * c.qk_dim))
     s = b.lat_s
-    with prof.timed("dsa: latent write"):
-        latent.seg_latent_write(b.lat[:R], lc, rows)
+    fused = index is not None and _writes_fused(lc)      # TF_GLM_DSA_FUSE writes (patch 0193): with the indexer's
+    if not fused:
+        with prof.timed("dsa: latent write"):
+            latent.seg_latent_write(b.lat[:R], lc, rows)
     tokens = counts = None
     if index is not None:
         ik, ig, pk = index
@@ -765,7 +832,14 @@ def dsa_segments(layer: LayerW, w: Weights, lc: torch.Tensor, b: Buffers, R: int
         with prof.timed("dsa: indexer update"):
             mm(b, b.normed[:R], ix.kw, b.xs[:R], b.ikr[:R])
             glue.router(b.normed[:R], ix.gate, b.igr[:R])
-            sparse.seg_index_update(b.ikr[:R, :c.index_dim], b.igr[:R], ix.ln_w, ix.ln_b, ix.ape, ik, ig, pk, rows)
+            if fused:
+                from . import dsa_fuse
+
+                dsa_fuse.seg_writes(b.lat[:R], lc, b.ikr[:R, :c.index_dim], b.igr[:R], ix.ln_w, ix.ln_b, ix.ape, ik,
+                                    ig, pk, rows)
+            else:
+                sparse.seg_index_update(b.ikr[:R, :c.index_dim], b.igr[:R], ix.ln_w, ix.ln_b, ix.ape, ik, ig, pk,
+                                        rows)
         if select:
             with prof.timed("dsa: select tokens"):
                 mm(b, b.qr[:R], ix.qb, b.xs_qr[:R], b.qi[:R])
@@ -891,6 +965,8 @@ def _mixer(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch: int | 
 
 def _ffn(layer: LayerW, w: Weights, b: Buffers, R: int, done: tuple[int, int] | None = None) -> torch.Tensor | None:
     with prof.timed("moe (total)" if layer.mlp is None else "mlp"):
+        if moe_glue.on():                # TF_GLM_MOE_GLUE: the MoE glue's kernels and second stream (moe_glue.py)
+            return moe_glue.ffn(layer, w, b, R, done)
         return mlp_block(layer, w, b, R, done) if layer.mlp is not None else moe_block(layer, w, b, R, done)
 
 
@@ -909,6 +985,8 @@ def ffn_front(layer: LayerW, w: Weights, b: Buffers):
     if layer.mlp is not None:
         return lambda lo, hi: mlp_front(layer, w, b, lo, hi)
     if layer.moe.shared is not None:
+        if moe_glue.on():                # TF_GLM_MOE_GLUE shared: the fused gate/up there too (the same bits)
+            return lambda lo, hi: moe_glue.shared_rows(layer, w, b, lo, hi)
         return lambda lo, hi: shared_front(layer, w, b, lo, hi)
     return None
 
@@ -935,6 +1013,11 @@ def _hc_post(b: Buffers, R: int, g: torch.Tensor) -> None:
 
     x = b.x[:R]
     _hc_flush(b, R)                      # (never pending here: every hc_post is followed by an hc_pre or a flush)
+    if isinstance(g, twoshot.Split):     # TF_GLM_TWOSHOT_SPLIT: the first rows now, the rest once gathered (_hc_pre)
+        r = g.R1
+        glue.hc_post(x[:r], x[:r], g.view[:, :r], b.post[:r], b.comb[:r])
+        b.hc_split = g
+        return
     if (not b.prefill and getattr(b, "hcx", None) is not None and fuse.asks("hc") and R <= fuse.hc_rows()
             and R <= b.hcx.shape[0] and glue.hc_post_pre_ok(x, g)):
         b.hc_pending = g                 # the gathered partials: read by the next hc_pre, before the next gather
@@ -943,6 +1026,11 @@ def _hc_post(b: Buffers, R: int, g: torch.Tensor) -> None:
 
 
 def _hc_flush(b: Buffers, R: int) -> None:
+    s = getattr(b, "hc_split", None)
+    if s is not None:                    # a split exchange's last rows (their gather has landed)
+        b.hc_split = None
+        s.wait()
+        glue.hc_post(b.x[s.R1:R], b.x[s.R1:R], s.view[:, s.R1:R], b.post[s.R1:R], b.comb[s.R1:R])
     g = getattr(b, "hc_pending", None)
     if g is not None:
         b.hc_pending = None
@@ -951,6 +1039,16 @@ def _hc_flush(b: Buffers, R: int) -> None:
 
 def _hc_pre(b: Buffers, R: int, c, h, norm: torch.Tensor) -> None:
     x = b.x[:R]
+    s = getattr(b, "hc_split", None)
+    if s is not None:                    # TF_GLM_TWOSHOT_SPLIT: the first rows' pre while the rest are gathered, then
+        b.hc_split = None                # the rest's post and pre (row-independent kernels: the unsplit bits)
+        for lo, hi in ((0, s.R1), (s.R1, R)):
+            if lo:
+                s.wait()
+                glue.hc_post(x[lo:hi], x[lo:hi], s.view[:, lo:hi], b.post[lo:hi], b.comb[lo:hi])
+            glue.hc_pre(x[lo:hi], h.fn, h.base, h.scale, norm, b.normed[lo:hi], b.xs[lo:hi], b.post[lo:hi],
+                        b.comb[lo:hi], b.hcpart[lo:hi], c.eps, c.hc_eps, c.hc_iters, prompt=b.prefill)
+        return
     g = getattr(b, "hc_pending", None)
     if g is not None:
         from . import fuse
@@ -1059,6 +1157,7 @@ def _compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, 
             split_layers(w, st, b, R, nch, host_pos, mixer)  # also leaves the taps and b.hidden[:R]
     else:
         b.hc_pending = None
+        b.hc_split, b.hc_split_ok = None, True        # the layers' glue takes split exchanges (TF_GLM_TWOSHOT_SPLIT)
         for layer in w.layers:
             layer_forward(layer, w, st, b, R, nch, host_pos, sparse_np, mixer)
             taps = b.tap_at.get(layer.index, ())
@@ -1067,6 +1166,7 @@ def _compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, 
             for slot in taps:
                 glue.stream_mean(b.x[:R], b.taps[slot][:R])
         _hc_flush(b, R)
+        b.hc_split_ok = False
         glue.stream_mean(b.x[:R], b.hidden[:R])
     if not logits:
         return None

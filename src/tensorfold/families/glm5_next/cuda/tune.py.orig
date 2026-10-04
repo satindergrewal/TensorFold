@@ -86,10 +86,8 @@ CHOICES: dict[str, Callable[[Any], Any]] = {
     "exl3_prompt": _keys(passm=_ints(64, 128)),
     # 4-bit dense matmul of decode rows: the lane matmul's tile config (qmm.cu dispatch_cfg 0..15), -1 the stock tile
     "q4_dec": _int_range(-1, 15),
-    # 4-bit dense matmul of prompt chunks: the prefill tile (qmm_prefill.cu dispatch 0..11), or 32 + v: variant v of
-    # qmm_prefill2.cu (patches 0195 / 0197: other tiles, pipelines and a tail split, 16- and 32-row tiles; the same bits,
-    # checked again at first use)
-    "q4_prefill": _ints(*range(0, 12), *range(32, 56)),
+    # 4-bit dense matmul of prompt chunks: the prefill tile (qmm_prefill.cu dispatch 0..11)
+    "q4_prefill": _int_range(0, 11),
     # BF16 / FP8 dense matmuls of decode rows (qmm._bmm / _fmm): Triton warps and stages, the FP8 column tile
     "b16_dec": _keys(warps=_ints(2, 4, 8), stages=_int_range(1, 8)),
     "f8_dec": _keys(warps=_ints(2, 4, 8), stages=_int_range(1, 8), bn=_ints(16, 32, 64, 128)),

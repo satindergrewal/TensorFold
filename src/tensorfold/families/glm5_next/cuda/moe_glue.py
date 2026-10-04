@@ -64,6 +64,10 @@ MAX_ROWS = 10240                                  # the fused route's rows a cal
 
 _wanted: frozenset | None = None
 _decided: dict[str, bool] = {}
+# The EXL3 expert route this process serves (weights.exl3_route, set by the loader): the glue is GLM's own route's
+# (its fused route builds GLM's plan and its MoE block calls GLM's kernels, exl3_mm); on the universal route
+# (0.6.1's any-width path: no plan) TF_GLM_MOE_GLUE asks for nothing and the MoE blocks run as without it.
+_route: str | None = None
 
 
 def parse(value: str | None) -> frozenset:
@@ -94,20 +98,46 @@ def rowsplit_on() -> bool:
             and (env.get("TF_GLM_PREFILL_LANES", "") or "1").strip() == "2")
 
 
-def wanted() -> frozenset:
+def asked() -> frozenset:
+    """TF_GLM_MOE_GLUE's parts as set (ValueError when not valid), whatever the route."""
+
     global _wanted
     if _wanted is None:
         _wanted = parse(os.environ.get("TF_GLM_MOE_GLUE", ""))
     return _wanted
 
 
+def wanted() -> frozenset:
+    """The parts that run: those asked for, none on the universal EXL3 route (``exl3_route``)."""
+
+    parts = asked()
+    return frozenset() if _route == "universal" else parts
+
+
+def exl3_route(route: str) -> None:
+    """The loader's EXL3 expert route (``glm``, ``universal`` or "" for other formats), before any buffer is made."""
+
+    global _route
+    _route = route or None
+
+
+def not_used() -> str | None:
+    """A line for the start when TF_GLM_MOE_GLUE asks for parts the universal route does not run, else None."""
+
+    if _route == "universal" and asked():
+        return ("TF_GLM_MOE_GLUE: not used on the universal EXL3 route (GLM's own EXL3 kernels only); the MoE blocks "
+                "run as without it")
+    return None
+
+
 def reset(value: str | None = None) -> None:
     """Forget the setting and the kernel decisions (tests); ``value``: set TF_GLM_MOE_GLUE first."""
 
-    global _wanted, _side_stream
+    global _wanted, _side_stream, _route
     if value is not None:
         os.environ["TF_GLM_MOE_GLUE"] = value
     _wanted = None
+    _route = None
     _side_stream = None
     _decided.clear()
     _states.clear()

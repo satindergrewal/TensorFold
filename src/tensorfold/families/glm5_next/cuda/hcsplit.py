@@ -39,7 +39,7 @@ from typing import Callable
 
 import torch
 
-from . import glue
+from . import glue, lane_partials
 
 EXCHANGES = ("p2p", "gather", "ce")
 
@@ -157,14 +157,28 @@ class HcSplit:
         if self.ce_mode:
             from .ce import CeExchange
 
+            from .lane_inputs import direct, row_bytes
             from .moe_glue import narrow_bytes
 
             b = self.b
             taps = max((len(v) for v in getattr(b, "tap_at", {}).values()), default=0)
             store = getattr(self.w.comm, "nccl", self.w.comm).store
-            # TF_GLM_MOE_GLUE rowsplit: room for the picks and weights beside the rows (0 bytes without it)
-            self.ce = CeExchange(self.rank, self.world, store, getattr(b, "alloc_rows", b.rows), b.part.shape[1],
-                                 taps + 1, narrow=narrow_bytes())
+            rows = getattr(b, "alloc_rows", b.rows)
+            # TF_GLM_LANE_DIRECT: the normed rows (and rowsplit's picks and weights) live in the arena, where the
+            # peers write their rows of them in place (``ce.CeExchange.rows(direct=True)``, prompt lanes)
+            homes = {}
+            if direct(self.world):
+                homes["normed"] = b.normed.numel() * b.normed.element_size()
+                if narrow_bytes():
+                    homes.update(pick=b.pick.numel() * b.pick.element_size(), wts=b.wts.numel() * b.wts.element_size())
+            # TF_GLM_MOE_GLUE rowsplit: room for the picks and weights beside the rows (0 bytes without it);
+            # TF_GLM_LANE_INPUTS: an input staging of the widest chosen projection input (0 bytes without it)
+            self.ce = CeExchange(self.rank, self.world, store, rows, b.part.shape[1],
+                                 taps + 1, narrow=narrow_bytes(), inputs=row_bytes(self.w), homes=homes,
+                                 pbf16=lane_partials.on())        # TF_GLM_LANE_PARTIALS=bf16: a bf16 staging
+            for name in homes:                   # the buffers move into the arena (nothing holds the old ones)
+                old = getattr(b, name)
+                setattr(b, name, self.ce.home(name, old.dtype, tuple(old.shape)))
             return
         if self.gather:
             return
@@ -206,6 +220,8 @@ class HcSplit:
         if self.stream is not None and self.active:
             torch.cuda.current_stream().wait_stream(self.stream)
         self.active = False
+        if self.ce is not None:                         # TF_GLM_CE_COUNT=1: the chunk's copy-engine bytes
+            self.ce.report(f"split chunk of {self.R} rows")
 
     def mine(self) -> int:
         return self.rank * self.H
@@ -235,8 +251,11 @@ class HcSplit:
 
         off, n = self.pieces[j]
         b = self.b
+        bf16 = lane_partials.on()
+        if bf16:                                        # TF_GLM_LANE_PARTIALS=bf16: the rows that go, rounded
+            self._round_sent(j)
         if self.ce is not None:                         # copy engines: into each peer's staging block of the piece
-            self.ce.partials(b.part, self.H, off, n, at=self.ce_at + off)
+            self.ce.partials(b.part, self.H, off, n, at=self.ce_at + off, partb=b.partb if bf16 else None)
             return
         lo = self.theirs() + off
         send = self.b.part[lo:lo + n]
@@ -246,6 +265,25 @@ class HcSplit:
         else:
             self.w.comm.exchange([send], [self.got[j]], self.peer)
 
+    def _round_sent(self, j: int) -> None:
+        """TF_GLM_LANE_PARTIALS=bf16 (``lane_partials``): the rows of this rank's partial that piece j sends, rounded
+        to bf16 right before they go, on the exchange's stream after the fill that wrote them: into b.partb for the
+        copy engines (which move bf16 rows), in place for NCCL (fp32 rows that hold bf16 values). This rank's own
+        rows are rounded where hc_post's caller reads them (``_post``), after their own fill."""
+
+        off, n = self.pieces[j]
+        b = self.b
+        if self.ce is not None:
+            for q in self.peers:
+                lo = q * self.H + off
+                lane_partials.to_bf16(b.partb[lo:lo + n], b.part[lo:lo + n])
+            return
+        if self.world > 2 and self.gather:              # the whole partial goes, this rank's rows too
+            lane_partials.round_(b.part[:self.Rp], b.partb[:self.Rp])
+            return
+        for lo in ([p * self.H + off for p in self.peers] if self.world > 2 else [self.theirs() + off]):
+            lane_partials.round_(b.part[lo:lo + n], b.partb[lo:lo + n])
+
     def _swap_rows(self, j: int, outs: list[torch.Tensor], narrow: tuple | list = ()) -> None:
         """Piece j of bf16 row buffers: this rank's rows out, the peers' rows in (gather: in place, whole shares).
         ``narrow``: narrow row buffers moved in the same copy-engine step (TF_GLM_MOE_GLUE rowsplit; ce only)."""
@@ -253,7 +291,8 @@ class HcSplit:
         off, n = self.pieces[j]
         mine, theirs = self.mine() + off, self.theirs() + off
         if self.ce is not None:                         # copy engines: this rank's rows out, the peers' into place
-            self.ce.rows(outs, self.H, off, n, at=self.ce_at + off, narrow=narrow)
+            self.ce.rows(outs, self.H, off, n, at=self.ce_at + off, narrow=narrow,
+                         direct=getattr(self, "direct", False))       # TF_GLM_LANE_DIRECT: prompt lanes only
             return
         if narrow:
             raise RuntimeError("narrow rows travel with the copy-engine exchange only (TF_GLM_HC_EXCHANGE=ce)")
@@ -304,18 +343,22 @@ class HcSplit:
             lo, hi = mine + off, mine + off + n
             if self.stream is not None:
                 main.wait_event(self.ev_part[j])
-            own, got = b.part[lo:hi], self.got[j]
-
-            g0, g1 = (own, got) if self.rank == 0 else (got, own)
+            b = self.b
             x = b.x[lo:hi]
-            glue.hc_post_pair(x, x, g0, g1, b.post[lo:hi], b.comb[lo:hi])
-            for slot in taps:
-                glue.stream_mean(x, b.taps[slot][lo:hi])
-            if final:
-                glue.stream_mean(x, b.hidden[lo:hi])
-            if hc is not None:
-                glue.hc_pre(x, hc.fn, hc.base, hc.scale, norm, b.normed[lo:hi], b.xs[lo:hi], b.post[lo:hi],
-                            b.comb[lo:hi], b.hcpart[lo:hi], c.eps, c.hc_eps, c.hc_iters, prompt=True)
+            own = b.part[lo:hi]
+            if lane_partials.on():                          # TF_GLM_LANE_PARTIALS=bf16: this rank's rows rounded too
+                lane_partials.round_(own, b.partb[lo:hi])
+            if self.world == 2 and not self.blocks:
+                got = self.got[j]
+                g0, g1 = (own, got) if self.rank == 0 else (got, own)
+                glue.hc_post_pair(x, x, g0, g1, b.post[lo:hi], b.comb[lo:hi])
+                for slot in taps:
+                    glue.stream_mean(x, b.taps[slot][lo:hi])
+                if final:
+                    glue.stream_mean(x, b.hidden[lo:hi])
+                if hc is not None:
+                    glue.hc_pre(x, hc.fn, hc.base, hc.scale, norm, b.normed[lo:hi], b.xs[lo:hi], b.post[lo:hi],
+                                b.comb[lo:hi], b.hcpart[lo:hi], c.eps, c.hc_eps, c.hc_iters, prompt=True)
             if self.stream is None:
                 self._swap_rows(j, outs)
                 if front is not None:

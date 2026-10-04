@@ -407,7 +407,8 @@ def dec_tile(n: int, k: int, m: int = 1) -> int | None:
 
 def prefill_tile(n: int, k: int, m: int) -> int:
     """The shared prefill matmul's tile for a prompt chunk's (n, k) matmul of m rows: 0 (128x128, 3 stages), or a
-    launch table's ``q4_prefill`` entry (TF_GLM_TUNE); no tile changes a row's bits (qmm_prefill.cu)."""
+    launch table's ``q4_prefill`` entry (TF_GLM_TUNE; 32 + v: qmm_prefill2's variant v, patch 0195); no tile changes
+    a row's bits (qmm_prefill.cu, qmm_prefill2.cu)."""
 
     t = tune.pick("q4_prefill", tune.shape(n, k), m)
     return 0 if t is None else int(t)

@@ -85,15 +85,49 @@ def signature(history: list[Any], calls: Any) -> str:
     return "sig:" + hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
 
 
-def _keys(history: list[Any], calls: Any) -> list[str]:
+class _HistoryHash:
+    """SHA256 of the original JSON prefix ``[[entry,entry`` without closing it.
+
+    Copying and closing it at each tool step gives exactly ``signature``'s bytes.
+    Reasoning and call ids never enter the shape, including restored reasoning.
+    """
+
+    def __init__(self):
+        self.state = hashlib.sha256(b"[[")
+        self.count = 0
+
+    @staticmethod
+    def _json(value):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+                          default=str).encode("utf-8", "surrogatepass")
+
+    def append(self, message):
+        if not isinstance(message, dict):
+            return
+        entry = [str(message.get("role") or ""), _text(message.get("content")).strip()]
+        if message.get("role") == "assistant" and message.get("tool_calls"):
+            entry.append(_calls(message.get("tool_calls")))
+        self.state.update((b"," if self.count else b"") + self._json(entry))
+        self.count += 1
+
+    def signature(self, calls):
+        state = self.state.copy()
+        state.update(b"]," + self._json(_calls(calls)) + b"]")
+        return "sig:" + state.hexdigest()
+
+
+def _keys(history: list[Any], calls: Any, sig: str | None = None) -> list[str]:
     ids = [c.get("id") for c in calls if isinstance(c, dict)] if isinstance(calls, list) else []
-    return [i for i in ids if isinstance(i, str) and _OUR_ID.match(i)] + [signature(history, calls)]
+    return [i for i in ids if isinstance(i, str) and _OUR_ID.match(i)] + [sig if sig is not None else signature(history, calls)]
 
 
 class KeptReasoning:
     """Recent tool-calling replies' reasoning (LRU, bounded in replies and characters), found by any of its keys."""
 
     def __init__(self, entries: int = 1024, chars: int = 32 << 20) -> None:
+        from tensorfold.cuda.incremental import enabled
+
+        self.incremental = enabled()
         self.entries, self.chars = int(entries), int(chars)
         self.items: OrderedDict[int, tuple[str, tuple[str, ...]]] = OrderedDict()
         self.by_key: dict[str, int] = {}
@@ -143,12 +177,21 @@ class KeptReasoning:
         if not isinstance(messages, list) or not self.items:
             return messages
         out = None
+        running = _HistoryHash() if self.incremental else None
+        hashed = 0
         for i, m in enumerate(messages):
             if not (isinstance(m, dict) and m.get("role") == "assistant" and m.get("tool_calls")
                     and not _text(m.get("reasoning_content")).strip() and not _text(m.get("reasoning")).strip()
                     and "</think>" not in _text(m.get("content"))):
                 continue
-            kept = self._find(_keys(messages[:i], m["tool_calls"]))
+            if running is None:
+                keys = _keys(messages[:i], m["tool_calls"])
+            else:
+                for j in range(hashed, i):
+                    running.append(messages[j])
+                hashed = i
+                keys = _keys([], m["tool_calls"], running.signature(m["tool_calls"]))
+            kept = self._find(keys)
             if kept is not None:
                 out = out if out is not None else list(messages)
                 out[i] = {**m, "reasoning_content": kept}

@@ -711,7 +711,24 @@ def sparse_onepass(qa: torch.Tensor, cache: torch.Tensor, tokens: torch.Tensor, 
     """sparse_attention for a prompt chunk's rows: one program a row (and head group) walks every selected token in
     one online softmax and writes out[r] directly, no fp32 partials; rows with counts 0 are left alone. Other bits
     than sparse_attention's (one chain instead of merged 512-token chunks), the same for any chunking of the rows.
-    ``tile`` / ``launch`` override ONEPASS_TILE / ONEPASS_LAUNCH (benchmarks)."""
+    ``tile`` / ``launch`` override ONEPASS_TILE / ONEPASS_LAUNCH (benchmarks). TF_GLM_SPARSE_FAST=1 (patch 0194,
+    ``attn_fast``) or 2 (patch 0199, warp roles in CUDA): the same bits by a faster kernel, once checked on this GPU."""
+    if _SPARSE_FAST:
+        from . import attn_fast
+
+        if attn_fast.on(qa, cache, tile, launch):
+            attn_fast.run(qa, cache, tokens, counts, out, scale)
+            return
+    _sparse_onepass_ref(qa, cache, tokens, counts, out, scale, tile=tile, launch=launch)
+
+
+_SPARSE_FAST = (__import__("os").environ.get("TF_GLM_SPARSE_FAST", "") or "0").strip() in ("1", "2")   # 0194 / 0199
+
+
+def _sparse_onepass_ref(qa: torch.Tensor, cache: torch.Tensor, tokens: torch.Tensor, counts: torch.Tensor,
+                        out: torch.Tensor, scale: float, *, tile: tuple | None = None,
+                        launch: tuple | None = None) -> None:
+    """sparse_onepass' own kernel launch (the reference of TF_GLM_SPARSE_FAST)."""
     R, H, LW = qa.shape
     if not (qa.is_contiguous() and out.is_contiguous() and tokens.is_contiguous() and cache.is_contiguous()):
         raise ValueError("sparse_onepass: expected contiguous queries, output, token lists and cache")

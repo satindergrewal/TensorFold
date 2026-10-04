@@ -14,7 +14,6 @@ from .qmm_tiles import group_tile
 
 
 @lru_cache(maxsize=1)
-
 def _ext():
     from tensorfold.cuda.build import load
 
@@ -24,26 +23,6 @@ def _ext():
                                                    str(here / "qmm_prefill8.cu")],
                 extra_cuda_cflags=["-O3"], verbose=False)
 
-
-
-GROUP_MODES = ("auto", "all", "0")
-
-
-def group_mode(env=None) -> str:
-    """TENSORFOLD_QMM_GROUP: which reduced group-64 matmuls ``matmul`` runs on the grouped sm_12x kernel
-    (each column keeps qmm.cu's order, so the same bits; only the speed differs). ``auto`` (default): all but the
-    decode rows a caller gives a tile ``variant``; ``all``: those too; ``0``: none."""
-
-    import os
-
-    value = ((os.environ if env is None else env).get("TENSORFOLD_QMM_GROUP", "") or "auto").strip().lower()
-    value = {"1": "all", "on": "all", "off": "0", "none": "0"}.get(value, value)
-    if value not in GROUP_MODES:
-        raise ValueError(f"TENSORFOLD_QMM_GROUP: auto, all or 0, not {value!r}")
-    return value
-
-
-GROUP_MODE = group_mode()
 
 @lru_cache(maxsize=None)
 def _chip(device: int) -> tuple[int, int, int]:
@@ -246,12 +225,6 @@ def prefill_matmul(x: torch.Tensor, q: Q4, *, f32: bool = False, tile: int = 0,
         x = x.clone(memory_format=torch.contiguous_format)
     if out is None:
         out = torch.empty((x.shape[0], q.n), dtype=torch.float32 if f32 else torch.bfloat16, device=x.device)
-    if tile >= 32:                       # qmm_prefill2's variants (patch 0195): the same bits, once checked here
-        from . import qmm_prefill2
-
-        if qmm_prefill2.matmul(x, q, f32, out, tile):
-            return out
-        tile = 0
     _ext().qmm_prefill(x, q.weight, q.scales, q.biases, out, q.n, q.gs, f32, tile)
     return out
 

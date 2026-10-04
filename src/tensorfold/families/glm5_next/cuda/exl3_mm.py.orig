@@ -204,30 +204,6 @@ def prompt_pass() -> int:
     return value
 
 
-@lru_cache(maxsize=1)
-def _dump_counts_path() -> str:
-    """TF_GLM_DUMP_COUNTS=<path>: a diagnostic (off by default). Every prompt window's routed call appends one line
-    to <path>.<pid>: its rows, then each expert's member count (the routing histogram the expert kernels see;
-    tests/K13/bench_k13.py --replay runs those calls). It syncs the GPU each call: for one-off dumps only."""
-
-    return os.environ.get("TF_GLM_DUMP_COUNTS", "")
-
-
-def _dump_counts(pick: torch.Tensor, R: int, E: int) -> None:
-    counts = torch.bincount(pick[:R].reshape(-1).long(), minlength=E + 1)[:E].tolist()   # the shared id E left out
-    with open(f"{_dump_counts_path()}.{os.getpid()}", "a") as f:
-        f.write(f"{R} " + " ".join(map(str, counts)) + "\n")
-
-
-@lru_cache(maxsize=1)
-def _k12_config():
-    """TF_GLM_EXPERT_PROMPT_KERNEL's K12 configuration (exl3_k12.setting), read once a process."""
-
-    from . import exl3_k12
-
-    return exl3_k12.setting()
-
-
 def prompt_stages() -> int:
     """The prompt kernels' cp.async pipeline depth: 3 (GB10's), or a launch table's ``exl3_prompt`` entry "all"
     (TF_GLM_TUNE): 2 to 4, loads only, the same bits."""
@@ -280,25 +256,12 @@ class Scratch:
         self.done = torch.zeros((1 if prompt else (P + P // grouped.TILE + 1) * max(1, width // 128),),
                                 dtype=torch.int32, device=device)
         self.rows, self.slots = rows, slots
-        if prompt and _k12_config() is not None:     # TF_GLM_EXPERT_PROMPT_KERNEL read (and checked) at start
-            from . import exl3_k12
-            exl3_k12.note("K12 prompt expert kernels (exact: the prompt kernels' bits)")
         # a prompt plan's launch order (item_order): room for any plan of up to 1,024 experts in items of >= 16 pairs
         self.order = torch.zeros((P // 16 + 1024 if prompt else 1,), dtype=torch.int32, device=device)
         # decode windows' streamed kernel (TF_GLM_EXL3_STREAM, exl3_stream): its work queue, counts and flags
         from . import exl3_stream
 
         self.stream = None if prompt else exl3_stream.state(rows, slots, dims, device)
-
-
-@lru_cache(maxsize=1)
-def _k1_config() -> tuple[int, bool] | None:
-    """TF_GLM_EXPERT_PROMPT_KERNEL (exl3_k1.py): the K1 prompt kernels' (configuration, int8 gate/up), or None (off,
-    the default)."""
-
-    from . import exl3_k1
-
-    return exl3_k1.setting()
 
 
 def routed(x: torch.Tensor, pick: torch.Tensor, plan: grouped.Plan, ex: Exl3Experts, s: Scratch, y: torch.Tensor,
@@ -309,24 +272,7 @@ def routed(x: torch.Tensor, pick: torch.Tensor, plan: grouped.Plan, ex: Exl3Expe
     slots, P = s.slots, s.rows * s.slots
     D, NI = ex.dims, ex.width
     if plan.tile in (64, 128):                       # a prompt window: the Y^T kernels, an item a pass
-        if _dump_counts_path():                      # TF_GLM_DUMP_COUNTS: the call's per-expert member counts
-            _dump_counts(pick, R, ex.count)
         shx = ex.shared_suh is not None and row_rotation()
-        k1 = _k1_config() if shx else None
-        if k1 is not None:                           # TF_GLM_EXPERT_PROMPT_KERNEL (exl3_k1.py)
-            from . import exl3_k1
-
-            if exl3_k1.supported(ex, D, NI):
-                exl3_k1.routed(x, plan, ex, s, y, R, limit, k1)
-                return
-        k12 = _k12_config()
-        if k12 is not None:                          # TF_GLM_EXPERT_PROMPT_KERNEL=k12... (exl3_k12.py): the same bits
-            from . import exl3_k12
-            why = exl3_k12.unused_reason(ex, D, NI, shx, plan.tile)
-            if why is None:
-                exl3_k12.routed(x, plan, ex, s, y, R, limit, k12)
-                return
-            exl3_k12.note(why)
         if shx:                                      # one rotated input a row, read by all its pairs' gate and up
             ext.rot_rows(x, x.stride(0), ex.shared_suh, s.xg, R, D)
             xg = xu = s.xg
