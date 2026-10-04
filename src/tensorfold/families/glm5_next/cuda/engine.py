@@ -686,7 +686,7 @@ class GlmEngine:
                                f"{settings} (-1: not valid)" + (f"; this rank: {why}" if why else "")
                                + ": give every rank the same valid values")
         if mine[2][0] == 1 and torch.cuda.is_available():  # the GPU sampler built and checked before the first request
-            _gpu_sample.check()
+            _gpu_sample.check(torch.cuda.current_device())
         plan["pool_tokens"] = pool_rows
         if rank == 0 and self.cache_bytes < wanted and parallel == 1:
             print(f"[tensorfold] other conversations' prompts are kept in {self.cache_bytes / 2 ** 30:.1f} GiB, what "
