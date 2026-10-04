@@ -97,12 +97,6 @@ class Health:
                     extra = {}
                 body["streams"].update(extra.pop("streams", {}))
                 body.update(extra)
-            ranked = getattr(scheduler, "health", None)     # a scheduler's own counts (patch 0141: priority lanes)
-            if callable(ranked):
-                try:
-                    body.update(dict(ranked()))
-                except Exception:                         # noqa: BLE001  (a table changing under the read)
-                    pass
         window = getattr(app, "effective_context_window", None)
         if window:
             body["context_length"] = int(window)

@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 
 
 _TOKENIZER_ROUTES = ("/tokenize", "/v1/tokenize", "/detokenize", "/v1/detokenize")
+PRIORITY_HEADER = "X-Priority"          # tensorfold.cuda.priority.HEADER (patch 0141)
 
 
 def usage_of(result: dict[str, Any]) -> dict[str, Any]:
@@ -135,6 +136,14 @@ def make_handler(app: App):
                 return self._json(400, {"error": {"message": str(exc), "type": "invalid_request_error"}})
             except (json.JSONDecodeError, UnicodeDecodeError):
                 return self._json(400, {"error": {"message": "the request body is not JSON", "type": "invalid_request_error"}})
+            # patch 0141: a request's class may come as a header (X-Priority) when the body names none (priority
+            # lanes on: TENSORFOLD_PRIORITY=0 leaves the body as sent)
+            header = self.headers.get(PRIORITY_HEADER)
+            if isinstance(body, dict) and body.get("priority") is None and header and header.strip():
+                from tensorfold.cuda import priority as prio
+
+                if prio.enabled():
+                    body["priority"] = header.strip()
             if tokenizer:                                   # vLLM's /tokenize and /detokenize
                 try:
                     reply = app.detokenize(body) if path.endswith("/detokenize") else app.tokenize(body)

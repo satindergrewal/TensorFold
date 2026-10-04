@@ -32,7 +32,6 @@ import hashlib
 import json
 import os
 import queue
-import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Sequence
@@ -40,8 +39,7 @@ from typing import Any, Callable, Sequence
 import numpy as np
 import torch
 
-from tensorfold.cuda import priority as prio
-from tensorfold.cuda.scheduler import Scheduler, Waiting
+from tensorfold.cuda.scheduler import Scheduler
 from tensorfold.cuda.streams import Stream, next_fill
 
 from . import digest as _digest, multi_prefill
@@ -330,7 +328,6 @@ class Lane:
     decoding: bool = False
     paused: bool = False
     t0: float = 0.0
-    since: float = 0.0                 # rank 0's clock at its last prompt chunk or its admission (priority rules)
     copy_rounds: int = 0
     copy_drafted: int = 0
     copy_accepted: int = 0
@@ -364,14 +361,6 @@ class MultiDecoder:
         self.fill_rows = fill_rows(e.prefill_rows, self.grid)
         self.share = fill_share()
         self.credit = 0.0
-        # patch 0141: priority lanes (cuda.priority; TENSORFOLD_PRIORITY=0: the order as before). Rank 0 decides with
-        # them; rank 1 applies rank 0's messages, so they never reach a request's arithmetic
-        self.clock = time.monotonic                      # the rules' clock (tests drive a simulated one)
-        self.prio = prio.Settings.from_env()
-        self.arbiter = prio.Arbiter(self.prio, self.share, lambda: self.clock()) if self.prio.enabled else None
-        self.starved_last = False                        # the last prompt chunk went to a starving stream
-        self.full_at = None                              # rank 0's clock at the last round of every decoding stream
-        self.rt_seen_at = None                           # rank 0's clock when a realtime request last arrived
         # TF_GLM_MULTI_PREFILL: rank 0 groups filling streams into one chunk (rank 1 applies whatever MFILL it gets)
         self.group = multi_prefill.enabled()
         if self.group:
@@ -447,16 +436,7 @@ class MultiDecoder:
                             "filling": sum(not l.decoding for l in lanes),
                             "paused": sum(l.decoding and l.paused for l in lanes)},
                 "pool_tokens": self.pool.rows, "pool_free_tokens": self.pool.free_rows(),
-                "kept_prompts": len(self.kept), **({"multi_prefill": dict(self.grouped)} if self.group else {}),
-                **({"lanes": self._class_counts(lanes), "arbiter": dict(self.arbiter.counts)}
-                   if self.arbiter is not None else {})}
-
-    @staticmethod
-    def _class_counts(lanes: Sequence[Lane]) -> dict:
-        out = {c: {"filling": 0, "decoding": 0} for c in prio.CLASSES}
-        for l in lanes:
-            out[prio.name(l.s.priority)]["decoding" if l.decoding else "filling"] += 1
-        return out
+                "kept_prompts": len(self.kept), **({"multi_prefill": dict(self.grouped)} if self.group else {})}
 
     def _check(self) -> None:
         if self.broken is not None:
@@ -751,7 +731,6 @@ class MultiDecoder:
                                               else [])
         s.started = time.perf_counter()
         lane.t0 = s.started
-        lane.since = self.clock()
         self.lanes[lane.sid] = lane
 
     def _ctx(self, lane: Lane):
@@ -946,8 +925,6 @@ class MultiDecoder:
         if not filling:
             return None
         decoding = [l for l in self.lanes.values() if l.decoding and not l.paused and not l.s.done]
-        if self.arbiter is not None:
-            return self._ranked_fill(filling, decoding)
         if decoding:
             self.credit += self.share
             if self.credit < 1:
@@ -955,37 +932,6 @@ class MultiDecoder:
             self.credit -= 1
         s = next_fill([l.s for l in filling])
         return self.lanes[s.sid]
-
-    @staticmethod
-    def _rows_left(lane: Lane) -> int:
-        return 0 if lane.head is not None else len(lane.s.prompt) - lane.st.pos
-
-    def _ranked_fill(self, filling: list[Lane], decoding: list[Lane]) -> Lane | None:
-        """Rank 0, priority lanes: the filling stream that advances next (``prio.pick_fill``: a starving one, else the
-        soonest class, the fewest rows left, admission order) when its chunk goes before a decode round
-        (``prio.Arbiter``), else None (a round)."""
-
-        now = self.clock()
-        k, starving = prio.pick_fill([prio.Fill(l.s.priority, self._rows_left(l), l.order, l.since) for l in filling],
-                                     now, self.prio.starve_s, self.starved_last)
-        lane = filling[k]
-        if decoding and self.arbiter.last_round is None:
-            self.arbiter.last_round = now               # the round gap counts from the first decoding stream on
-        if decoding and not self.arbiter.choose(lane.s.priority, self._rows_left(lane), starving,
-                                                min(l.s.priority for l in decoding), bool(self._heads(decoding))):
-            self.starved_last = False                   # a round ran: the next chunk may go to a starving stream
-            return None
-        self.starved_last = starving
-        return lane
-
-    def _heads(self, lanes: Sequence[Lane]) -> list[Lane]:
-        """Rank 0, priority lanes: the realtime streams of ``lanes`` still in their reply's head (fewer than
-        TENSORFOLD_PRIORITY_REALTIME_HEAD tokens written): their rounds hold only them."""
-
-        if self.arbiter is None or not self.prio.rt_head:
-            return []
-        return [l for l in lanes if l.s.priority <= prio.REALTIME and l.decoding and not l.s.done
-                and len(l.s.out) < self.prio.rt_head]
 
     def _iterate(self) -> list[Stream]:
         prof = self.profiles[False] if self.profiles is not None else None      # prompt chunks count there
@@ -997,9 +943,7 @@ class MultiDecoder:
             self._emit(MFILL, [len(group), *[v for l, stop in group for v in (l.sid, stop)]])
             self._flush()
             firsts = self._fill_many(group)
-            now = self.clock()
             for (l, _), first in zip(group, firsts):
-                l.since = now
                 if first is not None:
                     l.s.take([first], self._ends(l))
             self.grouped["chunks"] += 1
@@ -1014,7 +958,6 @@ class MultiDecoder:
             self._emit(FILL, [lane.sid, stop])
             self._flush()
             first = self._fill(lane, stop)
-            lane.since = self.clock()
             if first is not None:
                 lane.s.take([first], self._ends(lane))
             if prof is not None:
@@ -1022,16 +965,6 @@ class MultiDecoder:
             return [lane.s] if lane.s.done else []
         lanes = [l for l in self.lanes.values() if l.decoding and not l.s.done]
         t_begin = time.perf_counter()
-        heads = self._heads(lanes)            # priority lanes: a realtime reply's head decodes in rounds of its own,
-        if heads and self.full_at is None:
-            self.full_at = self.clock()
-        if heads and self.clock() - self.full_at >= self.prio.round_gap_s:
-            heads = []                        # unless the others have had no round for TENSORFOLD_PRIORITY_ROUND_GAP_MS
-        for l in heads:
-            l.paused = not self._grow(l.extent, l.st.pos + self.rows_max, protect=[l.extent])
-        everyone = len(lanes)
-        if any(not l.paused for l in heads):
-            lanes = heads
         for l in lanes:                       # room for this round's widest window, else paused
             l.paused = not self._grow(l.extent, l.st.pos + self.rows_max, protect=[l.extent])
         active = [l for l in lanes if not l.paused]
@@ -1057,10 +990,6 @@ class MultiDecoder:
         if prof is not None:
             prof.mark("message")
         self._round(active, lone=lone)
-        if self.arbiter is not None:
-            self.arbiter.rounded()
-            if len(lanes) == everyone:
-                self.full_at = self.clock()
         return [l.s for l in active if l.s.done]
 
     def _home(self, lane: Lane) -> bool:
@@ -1105,25 +1034,12 @@ class MultiDecoder:
         st.cur = list(lane.st.cur)
         lane.st, lane.slot = st, slot
 
-    def _chunk_rows(self, lane: Lane) -> int:
-        """Rows of the lane's next prompt chunk: TF_GLM_FILL_ROWS while others decode or for a background prompt,
-        else the engine's prompt chunk. Priority lanes: a realtime prompt always takes the whole prompt chunk; while
-        realtime requests arrive, a later class's chunk is at most TENSORFOLD_PRIORITY_REALTIME_ROWS rows (in whole
-        ``fill_unit``s, so every cut stays on the prompt grid)."""
-
-        if self.arbiter is not None and lane.s.priority <= prio.REALTIME:
-            return self.e.prefill_rows
-        busy = any(l.decoding and not l.s.done for l in self.lanes.values())
-        rows = self.fill_rows if busy or lane.s.background else self.e.prefill_rows
-        cap = self.prio.rt_rows if self.arbiter is not None else 0
-        if cap and self.rt_seen_at is not None and self.clock() - self.rt_seen_at <= self.prio.tier_hold_s:
-            rows = min(rows, max(self.unit, cap // self.unit * self.unit))
-        return rows
-
     def _stop(self, lane: Lane) -> int:
         pos, n = lane.st.pos, len(lane.s.prompt)
         stop = next((p for p in lane.stops if p > pos), n)
-        return min(stop, pos + self._chunk_rows(lane))
+        busy = any(l.decoding and not l.s.done for l in self.lanes.values())
+        rows = self.fill_rows if busy or lane.s.background else self.e.prefill_rows
+        return min(stop, pos + rows)
 
     def _group(self, first: Lane) -> list[tuple[Lane, int]] | None:
         """Rank 0, TF_GLM_MULTI_PREFILL=1: the (lane, stop) pieces of this iteration's prompt chunk when it can hold
@@ -1141,19 +1057,8 @@ class MultiDecoder:
             return None
         busy = any(l.decoding and not l.s.done for l in self.lanes.values())
         left = self.fill_rows if busy else self.e.prefill_rows
-        if self.arbiter is not None:
-            # priority lanes: ``first`` (the rules' pick) leads; the others by class, rows left, admission order; a
-            # realtime or interactive prompt shares its chunk only with prompts of its class or sooner (a long
-            # prompt's rows would delay its first token)
-            left = self._chunk_rows(first)
-            top = first.s.priority
-            rest = sorted((l for l in self.lanes.values() if plain(l) and l is not first
-                           and (top > prio.INTERACTIVE or l.s.priority <= top)),
-                          key=lambda l: (l.s.priority, len(l.s.prompt) - l.st.pos, l.order))
-            lanes = [first] + rest
-        else:
-            lanes = sorted((l for l in self.lanes.values() if plain(l)),
-                           key=lambda l: (bool(l.s.background), len(l.s.prompt) - l.st.pos, l.order))
+        lanes = sorted((l for l in self.lanes.values() if plain(l)),
+                       key=lambda l: (bool(l.s.background), len(l.s.prompt) - l.st.pos, l.order))
         out: list[tuple[Lane, int]] = []
         for l in lanes:
             pos, n = l.st.pos, len(l.s.prompt)
@@ -1438,10 +1343,7 @@ class MultiDecoder:
         extent and returns to the queue; it replays later, its sent tokens owed, not sent again. If every stream has
         a grammar or images, the youngest fails instead (returned, to be finished)."""
 
-        if self.arbiter is not None:          # priority lanes: the latest class first, then the youngest
-            lanes = sorted(self.lanes.values(), key=lambda l: (l.s.priority, l.order), reverse=True)
-        else:
-            lanes = sorted(self.lanes.values(), key=lambda l: l.order, reverse=True)
+        lanes = sorted(self.lanes.values(), key=lambda l: l.order, reverse=True)
         lane = next((l for l in lanes if l.constraint is None and l.feed is None), None)
         if lane is None:
             lane = lanes[0]
@@ -1473,8 +1375,6 @@ class MultiDecoder:
         tokens = list(s.out[:s.count])
         out.update(sha256=hashlib.sha256(json.dumps(tokens).encode()).hexdigest()[:16],
                    tokens_per_round=round((len(tokens) - 1) / max(s.rounds, 1), 3), parallel=self.count)
-        if self.arbiter is not None:
-            out.update(priority=prio.name(s.priority), yields=s.yields)
         lane_info = getattr(s, "glm_lane", None)
         if lane_info:
             out.update(lane_info)
@@ -1568,82 +1468,22 @@ class MultiDecoder:
 class GlmScheduler(Scheduler):
     """``cuda.scheduler.Scheduler`` for the GLM decoder: a request's GLM settings ride on its stream (``glm``); a
     request the pool cannot place yet waits at the head of the queue (``MultiDecoder.fits``); streams the decoder gives
-    back (every stream waiting for room) return to the queue to replay.
+    back (every stream waiting for room) return to the queue to replay."""
 
-    Priority lanes (patch 0141, ``cuda.priority``; TENSORFOLD_PRIORITY=0: arrival order, background last, as
-    before): waiting requests by class (aged), then arrival; tiers of slots kept for realtime and interactive
-    requests (TENSORFOLD_PRIORITY_RESERVE_*); a waiting request with no slot it may take gets one from the youngest
-    decoding stream of a later normal or background class, which replays later (``prio.victim``)."""
-
-    def __init__(self, decoder: MultiDecoder, *, max_streams: int, settings: prio.Settings | None = None,
-                 clock: Callable[[], float] | None = None, start: bool = True) -> None:
-        """``settings``: the priority rules (default TENSORFOLD_PRIORITY_*); ``clock``: theirs (default the
-        decoder's, else ``time.monotonic``); ``start``: run the worker thread (tests step ``_iteration``)."""
-
+    def __init__(self, decoder: MultiDecoder, *, max_streams: int) -> None:
         self.held = None
         # TF_GLM_MULTI_PREFILL_WAIT_MS: an idle server's wait for requests arriving with the first (their prompts then
         # share its first chunk); only with TF_GLM_MULTI_PREFILL=1
         self.gather_s = multi_prefill.wait_ms() / 1000.0 if getattr(decoder, "group", False) else 0.0
-        self.prio = settings if settings is not None else getattr(decoder, "prio", None) or prio.Settings.from_env()
-        self.clock = clock if clock is not None else (lambda: getattr(decoder, "clock", time.monotonic)())
-        self.preempted = 0                              # streams that gave their slot to a sooner class
-        self.seen: dict[int, float] = {}                # class -> the clock when a request of it last arrived
-        self.decoder = decoder
-        self.max_streams = max_streams
-        self.waiting = (prio.PriorityWaiting(self.clock, self.prio.admit_age_s) if self.prio.enabled
-                        else Waiting())
-        self.boxes: dict[int, queue.Queue] = {}
-        self.yields = 0
-        self.thread = threading.Thread(target=self._loop, daemon=True)
-        if start:
-            self.thread.start()
-
-    def health(self) -> dict:
-        """/health: waiting requests by class, the reserve, the streams given back to sooner classes."""
-
-        if not self.prio.enabled:
-            return {}
-        rt, it = self.prio.tiers(self.max_streams, self._active())
-        return {"priority": {"default": prio.name(self.prio.default), "waiting": self.waiting.counts(),
-                             "reserved_slots": {"realtime": rt, "interactive": it}, "preempted": self.preempted,
-                             "yields": self.yields}}
-
-    def saw(self, klass: int) -> None:
-        """A request of ``klass`` arrived (its tier of slots holds for TENSORFOLD_PRIORITY_TIER_HOLD_S; a realtime one
-        also caps later classes' prompt chunks for as long, ``MultiDecoder._chunk_rows``)."""
-
-        now = self.clock()
-        self.seen[int(klass)] = now
-        if klass <= prio.REALTIME:
-            self.decoder.rt_seen_at = now
-
-    def _active(self) -> tuple[bool, bool]:
-        """Which tiers of kept slots hold: a request of their class arrived within TENSORFOLD_PRIORITY_TIER_HOLD_S."""
-
-        now, hold = self.clock(), self.prio.tier_hold_s
-        return tuple(k in self.seen and now - self.seen[k] <= hold for k in (prio.REALTIME, prio.INTERACTIVE))
-
-    def _short(self, stream: Stream) -> int:
-        """How many live streams must leave before the waiting ``stream`` may be admitted (its aged class, the classes
-        the live streams were admitted at, the tiers that hold: ``Settings.short``)."""
-
-        live = [getattr(l.s, "admitted_as", l.s.priority) for l in self.decoder.lanes.values()]
-        return self.prio.short(self.waiting.rank(stream), live, self.max_streams, self._active())
+        super().__init__(decoder, max_streams=max_streams)
 
     def submit(self, prompt: list[int], count: int, sampling: Any, draft: bool,
                emit: Callable[[list[int]], bool | None], stop_eos: bool = True, *, vision: Any = None,
-               constraint: Any = None, background: bool = False, glm: dict | None = None,
-               priority: int | None = None) -> dict:
-        """``priority``: the request's class (``cuda.priority``; None: background if ``background`` else the
-        default class)."""
-
+               constraint: Any = None, background: bool = False, glm: dict | None = None) -> dict:
         box: queue.Queue = queue.Queue()
-        if priority is None:
-            priority = prio.BACKGROUND if background else self.prio.default if self.prio.enabled else prio.NORMAL
         stream = Stream(list(prompt), max(1, count), sampling, draft=draft, stop_eos=stop_eos, vision=vision,
-                        constraint=constraint, background=background, priority=int(priority), arrived=self.clock())
+                        constraint=constraint, background=background)
         stream.glm = dict(glm or {})
-        self.saw(stream.priority)
         cancel = [False]
         stream.emit = lambda new: (box.put(("tokens", new)), cancel[0])[1]
         self.waiting.put((stream, box))
@@ -1661,8 +1501,6 @@ class GlmScheduler(Scheduler):
         """Waiting requests into free slots while they fit; ``until`` (a ``time.monotonic`` deadline): an empty queue
         is waited on until then for more arrivals."""
 
-        if self.prio.enabled:
-            return self._admit_ranked(until)
         done: list[Stream] = []
         while self.decoder.live() < self.max_streams:
             if first is not None:
@@ -1693,65 +1531,9 @@ class GlmScheduler(Scheduler):
                 done.append(stream)
         return done
 
-    def _admit_ranked(self, until: float | None = None) -> list[Stream]:
-        """Priority lanes: the waiting request ``PriorityWaiting`` ranks first, while a slot its class may take is free
-        (``Settings.cap``) and the pool has room for it (``MultiDecoder.fits``); it waits, first in line, otherwise.
-        ``until`` (a deadline on ``self.clock``): an empty queue is waited on until then for more arrivals."""
-
-        done: list[Stream] = []
-        while True:
-            item = self.waiting.best()
-            if item is None:
-                left = until - self.clock() if until is not None else 0.0
-                if left > 0 and self.decoder.live() < self.max_streams and self.waiting.wait(left):
-                    continue
-                break
-            stream, box = item
-            if self._short(stream):
-                break                                # no slot for its class: it waits (``_yield`` may free one)
-            if not self.decoder.fits(stream):
-                break                                # waits, first in line, for room
-            self.boxes[id(stream)] = box
-            stream.admitted_as = self.waiting.rank(stream)      # its aged class: tiers and ``prio.victim`` count it
-            try:
-                self.decoder.admit(stream)
-            except NoRoom:
-                self.boxes.pop(id(stream))
-                break                                # still first in line (it never left the queue)
-            except Exception as exc:                 # noqa: BLE001  (this request fails, the others go on)
-                self.waiting.remove(item)
-                self.boxes.pop(id(stream)).put(("error", exc))
-                continue
-            self.waiting.remove(item)
-            if stream.done:
-                done.append(stream)
-        return done
-
     def _yield(self) -> None:
-        """``Scheduler._yield``, the stream's GLM settings carried to its replay. Priority lanes: the request ranked
-        first, when no slot its class may take is free, gets one from ``prio.victim`` (a later normal or background
-        class, by its own class: waiting time does not make a request preempt)."""
+        """``Scheduler._yield``, the stream's GLM settings carried to its replay."""
 
-        if self.prio.enabled:
-            item = self.waiting.best()
-            if item is None:
-                return
-            waiter = item[0]
-            need = self._short(waiter)
-            if not need:
-                return
-            gone = prio.victims(list(self.decoder.streams.values()), waiter.priority, self.prio.max_yields, need)
-            for stream in gone:              # exactly the slots it needs (none when fewer can be freed)
-                box = self.boxes.pop(id(stream))
-                self.decoder.finish([stream])
-                self.yields += 1
-                self.preempted += 1
-                again = stream.continued()
-                again.glm = getattr(stream, "glm", {})
-                again.yields = stream.yields + 1
-                again.arrived = self.clock()     # waits as a new arrival: it never outranks the request it yielded to
-                self.waiting.put((again, box))
-            return
         if self.decoder.live() < self.max_streams or not self.waiting.foreground():
             return
         live = list(self.decoder.streams.values())
@@ -1793,14 +1575,8 @@ class GlmScheduler(Scheduler):
     def _iteration(self) -> None:
         self._yield()
         idle = not self.decoder.live() and self.held is None
-        if self.prio.enabled:                                       # idle: wait for a request (left in the queue)
-            first = None
-            if idle:
-                self.waiting.wait()
-            until = self.clock() + self.gather_s if idle and self.gather_s > 0 else None
-        else:
-            first = self.waiting.get() if idle else None            # idle: wait for a request
-            until = time.monotonic() + self.gather_s if idle and self.gather_s > 0 else None
+        first = self.waiting.get() if idle else None                # idle: wait for a request
+        until = time.monotonic() + self.gather_s if idle and self.gather_s > 0 else None
         done = self._admit(first, until)
         try:
             done += self.decoder.round()

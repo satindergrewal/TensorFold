@@ -674,9 +674,15 @@ def dsa_rows(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
                             hb=latent.head_block(R), starts=b.att_starts if b.prefill else None)
     if sparse_rows:
         with prof.timed("dsa: select tokens"):
-            mm(b, b.qr[rs], ix.qb, b.xs_qr[rs], b.qi[rs])
-            tokens, counts = sparse.select_tokens(b.qi[rs], b.ikr[rs, c.index_dim:], pk, host_pos, R,
-                                                  pk.shape[0] - 2, pos_dev, bucket=sparse_np)
+            if index_split.applies(w, b, R, host_pos, all_sparse, sparse_np):
+                # TF_GLM_INDEX_SPLIT (patch 0120): each rank selects its blocks of rows, the pools all-gathered
+                tokens, counts = index_split.select(w, b, b.qr[rs], b.xs_qr[rs], ix.qb, b.qi[rs],
+                                                    b.ikr[rs, c.index_dim:], pk, host_pos, R, pk.shape[0] - 2,
+                                                    pos_dev, lambda x, q, xs, out: mm(b, x, q, xs, out))
+            else:
+                mm(b, b.qr[rs], ix.qb, b.xs_qr[rs], b.qi[rs])
+                tokens, counts = sparse.select_tokens(b.qi[rs], b.ikr[rs, c.index_dim:], pk, host_pos, R,
+                                                      pk.shape[0] - 2, pos_dev, bucket=sparse_np)
         with prof.timed("dsa: sparse attention"):
             if b.prefill and latent.SPARSE_ONEPASS:     # prompt rows: one pass a row, no partials (their own bits)
                 latent.sparse_onepass(qa, lc, tokens, counts, ol, scale)

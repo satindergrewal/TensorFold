@@ -545,10 +545,6 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
         prof.report(len(prompt) - begin)
     if not sample:
         return None
-    from . import digest as _digest
-
-    if _digest.ON and not replay:                        # TF_GLM_PREFILL_DIGEST (patch 0121): a test setting
-        _digest.prompt_digest(w, st, len(prompt), last)
     if keep_head:
         e.head = last.clone()
     if e.constraint is not None:                         # the first token's row, under the reply's grammar

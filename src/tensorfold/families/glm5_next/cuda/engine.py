@@ -304,8 +304,11 @@ def round_costs(costs: dict) -> tuple[float, ...]:
     return tuple(v + costs["block"] + 0.0 + costs["taps_row"] * 1 for v in costs["verify"])
 
 
-PARALLEL_MOST = 4                     # --parallel: concurrent requests at most (the segmented kernels' streams)
-MULTI_WINDOW = 32                     # --parallel: rows of every stream's verify windows together (multi.MAX_WINDOW)
+from .segments import window_rows as _window_rows  # noqa: E402
+
+PARALLEL_MOST = 64                    # --parallel: concurrent requests at most (was 4; segments.MAX_SEGS follows --parallel)
+MULTI_WINDOW = _window_rows()         # --parallel: rows of every stream's verify windows together (multi.MAX_WINDOW;
+                                      # TF_GLM_MULTI_WINDOW, default 32)
 
 
 def slot_bytes(t: dict, world: int = 2, rows: int = MAX_ROWS) -> int:
@@ -421,6 +424,10 @@ class GlmEngine:
         if not 1 <= parallel <= PARALLEL_MOST:
             raise ValueError(f"--parallel: 1 to {PARALLEL_MOST} requests at once for GLM-5.3-Flash, not {parallel}")
         self.parallel = parallel
+        if parallel > 4:                      # the segment tables and grids hold --parallel streams
+            from . import segments as seg_mod
+
+            seg_mod.MAX_SEGS = max(seg_mod.MAX_SEGS, parallel)
         self.policy = "0" if serial_only else policy
         self.serial_only = serial_only
         self.comm = comm if comm is not None else open_comm(rank, 2, master, port)
@@ -717,6 +724,7 @@ class GlmEngine:
                       f"{self.multi.fill_rows} rows while others decode (TF_GLM_FILL_ROWS, TF_GLM_FILL_SHARE "
                       f"{self.multi.share:g}){'; waiting prompts share prompt chunks (TF_GLM_MULTI_PREFILL)' if self.multi.group else ''}; "
                       f"{self.multi.tune.describe()}", flush=True)
+                print(f"[tensorfold] --parallel {parallel}: {self.scheduler.prio.describe(parallel)}", flush=True)
                 if self.multi.row_ms is not None:
                     print("[tensorfold] --parallel batched window ms by rows: " +
                           " ".join(f"{i + 1}:{ms:.1f}" for i, ms in enumerate(self.multi.row_ms)), flush=True)
@@ -1078,8 +1086,9 @@ class GlmEngine:
         return stats
 
     def generate(self, prompt: list[int], max_tokens: int, sampling, on_tokens, draft: bool = True,
-                 constraint=None, *, vision=None, background: bool = False) -> dict[str, Any]:
-        """Mirror one rank-0 request on rank 1; draft=False uses serial decoding and fresh prefill as the reference drafted replies must equal; ``vision``: an image prompt's prepared pictures (``GlmPrepared``); ``background``: under --parallel, after the other requests and yielding to them."""
+                 constraint=None, *, vision=None, background: bool = False,
+                 priority: int | None = None) -> dict[str, Any]:
+        """Mirror one rank-0 request on rank 1; draft=False uses serial decoding and fresh prefill as the reference drafted replies must equal; ``vision``: an image prompt's prepared pictures (``GlmPrepared``); ``background``: under --parallel, after the other requests and yielding to them; ``priority``: under --parallel, the request's class (``tensorfold.cuda.priority``, patch 0141; None: from ``background``)."""
 
         if len(prompt) >= self.limit:
             raise ValueError(f"prompt of {len(prompt)} tokens: this engine serves contexts up to {self.limit}")
@@ -1095,7 +1104,8 @@ class GlmEngine:
                 raise ValueError("image inputs require starting this server with --vision")
             stats = self.scheduler.submit(list(prompt), max_tokens, sampling, bool(draft) and not self.serial_only,
                                           on_tokens, stop_eos=stop_eos, vision=vision, constraint=constraint,
-                                          background=background, glm={"code": code, "spec": spec})
+                                          background=background, glm={"code": code, "spec": spec},
+                                          priority=priority)
             stats.update(policy=spec, drafts=draft)
             return stats
         positions: list[int] = []

@@ -43,6 +43,15 @@ class Stream:
     prefill_s: float = 0.0
     started: float = 0.0
     finished: float = 0.0
+    priority: int = -1                                    # class (cuda.priority: 0 realtime .. 3 background); -1: from
+                                                          # ``background`` (3 if set, else 2)
+    arrived: float = 0.0                                  # time.monotonic() at submit (a replay keeps its request's)
+    yields: int = 0                                       # times the request gave its slot back (each replays)
+
+    def __post_init__(self) -> None:
+        if self.priority < 0:
+            self.priority = 3 if self.background else 2
+        self.background = self.priority >= 3
 
     def take(self, new: list[int], eos: Sequence[int] = ()) -> None:
         """Append a round's tokens and emit them; the stream ends at its count, an end token or a stop."""
@@ -82,7 +91,8 @@ class Stream:
 
         return Stream(self.prompt, self.count, self.sampling, draft=self.draft, stop_eos=self.stop_eos, emit=self.emit,
                       background=self.background, probabilities=self.probabilities,
-                      carry=self.stats(), owed=[*self.out, *self.owed])
+                      carry=self.stats(), owed=[*self.out, *self.owed], priority=self.priority, arrived=self.arrived,
+                      yields=self.yields)
 
 
 def next_fill(filling: list[Stream]) -> Stream:
