@@ -21,14 +21,26 @@ _FORMATS = tuple(MEDIA_TYPES.values())
 _MEDIA = {"image", "images", "image_url", "input_image", "audio", "input_audio", "video", "video_url"}
 
 
+def _env_int(name: str, default: int) -> int:
+    """An environment override for a decode limit: positive integers only, the default when unset or bad."""
+
+    import os
+
+    try:
+        value = int(os.environ.get(name, ""))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
 @dataclass(frozen=True, slots=True)
 class ImageLimits:
     max_images: int = 4
     max_encoded_bytes: int = 10 * 1024 * 1024
     max_total_encoded_bytes: int = 20 * 1024 * 1024
-    max_dimension: int = 8192
-    max_pixels: int = 16 * 1024 * 1024
-    max_total_pixels: int = 32 * 1024 * 1024
+    max_dimension: int = _env_int("TENSORFOLD_VISION_MAX_DIMENSION", 8192)
+    max_pixels: int = _env_int("TENSORFOLD_VISION_MAX_PIXELS", 16 * 1024 * 1024)
+    max_total_pixels: int = _env_int("TENSORFOLD_VISION_MAX_TOTAL_PIXELS", 32 * 1024 * 1024)
     timeout_seconds: float = 10.0
     total_timeout_seconds: float = 30.0
     max_redirects: int = 3
