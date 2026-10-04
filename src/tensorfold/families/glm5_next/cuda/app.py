@@ -6,23 +6,27 @@ from pathlib import Path
 from typing import Any, Callable
 
 from tensorfold.cuda.server import App, PreparedRequest, RequestError
-from tensorfold.families.glm5_next.prompts import clear_thinking, thinking_off
 from tensorfold.server.errors import CONTEXT_LIMIT
+from tensorfold.families.glm5_next.cuda.kept_reasoning import KeptReasoning
+from tensorfold.families.glm5_next.prompts import agent_history, thinking_off
 
 
 class ThinkingOffTemplate:
-    """The checkpoint template as GLM-5.3's thinking-off template renders it (``prompts.thinking_off``), with earlier
-    turns' reasoning kept unless the request's ``chat_template_kwargs.clear_thinking`` says otherwise
-    (``prompts.clear_thinking``)."""
+    """The checkpoint's chat template, rendered as GLM-5.3's thinking-off template renders it when thinking is off
+    (``prompts.thinking_off``, as the Mac's tokenizer renders it), an agent's history made renderable first
+    (``prompts.agent_history``), with the reasoning of tool-calling steps the client dropped put back (``kept``,
+    ``kept_reasoning.KeptReasoning``; None: off)."""
 
-    def __init__(self, inner, clear: bool | None = None) -> None:
+    def __init__(self, inner, kept: KeptReasoning | None = None) -> None:
         self.inner = inner
         self.efforts = getattr(inner, "efforts", frozenset())
-        self.clear = clear_thinking() if clear is None else clear
+        self.kept = kept
 
-    def render(self, messages, *, tools, enable_thinking, extra=None) -> str:
-        extra = {"clear_thinking": self.clear, **(extra or {})}       # a request's own value wins
-        text = self.inner.render(messages, tools=tools, enable_thinking=enable_thinking, extra=extra)
+    def render(self, messages, *, tools, enable_thinking, extra=None, allow_images: bool = False) -> str:
+        if self.kept is not None:
+            messages = self.kept.restore(messages)
+        text = self.inner.render(agent_history(messages), tools=tools, enable_thinking=enable_thinking, extra=extra,
+                                 allow_images=allow_images)
         return text if enable_thinking else thinking_off(text)
 
 
@@ -72,7 +76,7 @@ class GlmApp(App):
         if need <= limit:
             return super().check(body, prepared=prepared)
         detail = f"{prompt} prompt tokens plus max_tokens {int(asked)}" if asked else f"a {prompt}-token prompt"
-        # OpenAI's wording, so prepare refuses it as context_length_exceeded (clients compact on it)
+        # v0.6.0 (68c6e35, Apache-2.0): OpenAI's wording, so prepare refuses it as context_length_exceeded
         return (f"{CONTEXT_LIMIT} {limit} tokens: this request needs a {need}-token context ({detail}), which exceeds "
                 f"the context window this server was started for; shorten the prompt or reply"
                 f"{self._restart(need, ' both ranks')}")

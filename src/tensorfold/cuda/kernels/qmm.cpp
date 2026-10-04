@@ -77,6 +77,8 @@ void qmm_cfg(const at::Tensor& x, const at::Tensor& xs, const at::Tensor& w, con
     }
     qmm_cfg_cuda(x, xs, w, scales, biases, out, p, static_cast<int>(n), static_cast<int>(sk), f32,
                  static_cast<int>(cfg));
+}
+
 // Up to four packed 4-bit weights against one x in one sm_12x launch, each with its own K split (its own bits).
 void qmm_group(const at::Tensor& x, const at::Tensor& xs, const std::vector<at::Tensor>& ws,
                const std::vector<at::Tensor>& scales, const std::vector<at::Tensor>& biases,

@@ -167,16 +167,6 @@ def split_images(messages: list[dict[str, Any]], *, limits: ImageLimits = DEFAUL
                 sources.append(video_source(part.get("video_url"), DEFAULT_VIDEO_LIMITS, allow_urls))
                 parts.append({"type": "video"})
             elif kind == "image_url":
-                if role != "user":
-                    raise ImageInputError("video_url parts are supported only in user messages")
-                if any(part.get(key) for key in _MEDIA - {"video_url"}):
-                    raise ImageInputError("video_url parts cannot contain other media")
-                videos = sum(type(s).__name__ == "VideoSource" for s in sources)
-                if videos >= DEFAULT_VIDEO_LIMITS.max_videos:
-                    raise ImageInputError(f"a request supports at most {DEFAULT_VIDEO_LIMITS.max_videos} videos")
-                sources.append(video_source(part.get("video_url"), DEFAULT_VIDEO_LIMITS, allow_urls))
-                parts.append({"type": "video"})
-            elif kind == "image_url":
                 if role not in ("user", "tool"):
                     raise ImageInputError("image_url parts are supported only in user and tool messages")
                 if any(part.get(key) for key in _MEDIA - {"image_url"}):
