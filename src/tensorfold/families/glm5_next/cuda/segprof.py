@@ -314,14 +314,14 @@ def install() -> None:
 
     timed0, mm0, gather0 = prof.timed, forward.mm, forward.gather
 
-    def timed(name: str):
+    def timed(name: str, *args, **kwargs):
         p = ACTIVE
         kind = p.kind_of(name) if p is not None and p.kinds is not None else None
         if kind is None:
-            return timed0(name)
+            return timed0(name, *args, **kwargs)
         stack = ExitStack()
         stack.enter_context(p.seg(kind))
-        stack.enter_context(timed0(name))
+        stack.enter_context(timed0(name, *args, **kwargs))
         return stack
 
     def mm(b, x, q, xs, out, f32: bool = False):
