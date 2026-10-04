@@ -612,7 +612,8 @@ void kda_chain_wide_cuda(const at::Tensor& P, int64_t p_stride, int64_t b_off, c
                          const at::Tensor& state_in, const at::Tensor& a_log, const at::Tensor& dt_bias,
                          const at::Tensor& norm_w, double eps, double lower, int64_t rows, at::Tensor& out,
                          at::Tensor& state_out, at::Tensor& k_save, at::Tensor& v_save, at::Tensor& g_save,
-                         at::Tensor& b_save, at::Tensor& q_tmp, at::Tensor& y_tmp, int64_t warps, int64_t tr) {
+                         at::Tensor& b_save, at::Tensor& q_tmp, at::Tensor& y_tmp, int64_t warps, int64_t tr,
+                         const c10::optional<at::Tensor>& xs) {
     auto stream = at::cuda::getCurrentCUDAStream();
     const int H = (int)a_log.numel();
     const dim3 grid((unsigned)rows, (unsigned)H);
@@ -640,7 +641,8 @@ void kda_chain_wide_segments_cuda(const at::Tensor& seg, int64_t nseg, const at:
                                   const at::Tensor& a_log, const at::Tensor& dt_bias, const at::Tensor& norm_w,
                                   double eps, double lower, int64_t rows, at::Tensor& out, at::Tensor& k_save,
                                   at::Tensor& v_save, at::Tensor& g_save, at::Tensor& b_save, at::Tensor& q_tmp,
-                                  at::Tensor& y_tmp, int64_t warps, int64_t tr) {
+                                  at::Tensor& y_tmp, int64_t warps, int64_t tr,
+                                  const c10::optional<at::Tensor>& xs) {
     auto stream = at::cuda::getCurrentCUDAStream();
     const int H = (int)a_log.numel();
     const dim3 grid((unsigned)rows, (unsigned)H);
@@ -667,18 +669,11 @@ void kda_chain_wide_segments_cuda(const at::Tensor& seg, int64_t nseg, const at:
 void kda_replay_layers_segments_cuda(const at::Tensor& seg, int64_t nseg, at::Tensor& rec, int64_t slot_stride,
                                      int64_t parity_stride, int64_t layer_stride, const at::Tensor& k_save,
                                      const at::Tensor& v_save, const at::Tensor& g_save, const at::Tensor& b_save,
-                                  const at::Tensor& a_log, const at::Tensor& dt_bias, const at::Tensor& norm_w,
-                                  double eps, double lower, int64_t rows, at::Tensor& out, at::Tensor& k_save,
-                                  at::Tensor& v_save, at::Tensor& g_save, at::Tensor& b_save, at::Tensor& q_tmp,
-                                  at::Tensor& y_tmp, int64_t warps, int64_t tr, const c10::optional<at::Tensor>& xs) {
+                                     int64_t kv_stride, int64_t b_stride, int64_t layers, int64_t heads) {
     auto stream = at::cuda::getCurrentCUDAStream();
     replay_layers_seg_kernel<<<(unsigned)(nseg * layers * heads), 1024, 0, stream>>>(
         (int)heads, (int)layers, ptr<int>(seg), ptr<float>(rec), (size_t)slot_stride, (size_t)parity_stride,
         (size_t)layer_stride, ptr<float>(k_save), ptr<__nv_bfloat16>(v_save), ptr<float>(g_save), ptr<float>(b_save),
         (size_t)kv_stride, (size_t)b_stride);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-    out_kernel<<<grid, DV, 0, stream>>>(H, ptr<__nv_bfloat16>(y_tmp), ptr<__nv_bfloat16>(G), (int)g_stride,
-                                        ptr<__nv_bfloat16>(norm_w), (float)eps, ptr<__nv_bfloat16>(out),
-                                        xs.has_value() ? xs->data_ptr<float>() : nullptr);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

@@ -19,12 +19,13 @@ TF_GLM_INDEX_SPLIT_CHECK=1 also runs the unsplit selection and stops the server 
 it costs the full selection again and a device sync a layer).
 
 When: prompt chunks only (eager, ``host_pos`` known), every row of the piece past the dense limit, at least two
-blocks (R > SELECT_ROWS), the piece's first position at least TF_GLM_INDEX_SPLIT_FROM (default 16,384: shorter
-contexts score few pools, where the gather costs more than it saves), two or more ranks. Every rank decides from the
-same numbers, so they all take the same branch; the startup comparison holds the settings (``code``).
+blocks of 64+ rows (``split_block``), the piece's first position at least TF_GLM_INDEX_SPLIT_FROM (default
+16,384: shorter contexts score few pools, where the gather costs more than it saves), two or more ranks. Every rank
+decides from the same numbers, so they all take the same branch; the startup comparison holds the settings (``code``).
 
-Where the gather runs: on the row split's second stream when a prompt chunk runs split with overlap
-(``hcsplit.HcSplit``), so every NCCL call of the chunk stays on one stream in one order; else on the current stream."""
+Where the gather runs: on the row split's second stream when a prompt chunk runs split with overlap and NCCL
+exchanges (``hcsplit.HcSplit``), so every NCCL call of the chunk stays on one stream in one order; else (no overlap,
+or copy-engine exchanges, which take no NCCL call) on the current stream."""
 
 from __future__ import annotations
 
@@ -80,21 +81,45 @@ def settings() -> IndexSplit:
 def applies(w, b, R: int, host_pos: int | None, all_sparse: bool, sparse_np: int | None) -> bool:
     """Whether a piece of R rows from ``host_pos`` selects split (the same answer on every rank)."""
 
-    from .sparse import SELECT_ROWS
-
     s = settings()
     world = int(getattr(w, "world", 1))
+    # at least two selection blocks of 64+ rows (``split_block``; patch 0127: from 128 rows, so a 1,024-row chunk's
+    # 512-row lanes split too)
     return (s.on and world > 1 and getattr(w, "comm", None) is not None and b.prefill and sparse_np is None
-            and host_pos is not None and all_sparse and host_pos >= s.start and R > SELECT_ROWS)
+            and host_pos is not None and all_sparse and host_pos >= s.start and R >= 128
+            and R > split_block(R, world))
 
 
 def _side_stream(b):
-    """The row split's second stream while a split prompt chunk runs (its NCCL calls go there), else None."""
+    """The row split's second stream while a split prompt chunk runs and its exchanges are NCCL calls (every NCCL call
+    of the chunk then stays on that stream, in one order on every rank), else None: the current stream. With the
+    copy-engine transport the split's exchanges take no NCCL call, so the gather need not queue behind them (behind
+    the other lane's exchange, with TF_GLM_PREFILL_LANES)."""
 
     sp = getattr(b, "split", None)
-    if sp is not None and getattr(sp, "active", False) and getattr(sp, "stream", None) is not None:
-        return sp.stream
-    return None
+    if sp is None or not getattr(sp, "active", False) or getattr(sp, "stream", None) is None:
+        return None
+    if getattr(sp, "ce", None) is not None:              # TF_GLM_HC_EXCHANGE=ce
+        return None
+    comm = getattr(sp.w, "comm", None)
+    if not getattr(sp, "gather", False) and getattr(getattr(comm, "nccl", comm), "ce", None) is not None:
+        return None                                       # TENSORFOLD_EXCHANGE=ce under the p2p exchanges
+    return sp.stream
+
+
+def split_block(R: int, world: int) -> int:
+    """Rows of the split's selection blocks for a piece of R rows (patch 0125): the piece's rows a rank, rounded up to
+    64, at most SELECT_ROWS (512), so a 1,024-row piece still gives each of four ranks a block; SELECT_ROWS itself
+    when that would leave a last block under 64 rows. Every block size gives a row the same pools (blocks of 64 rows
+    or more take the same kernels and constexprs; a shorter block takes the decode-sized path, which selects the same
+    pools, as the unsplit chunk's own short last block already does: tests/test_index_split_cpu.py covers both ways);
+    the rule only keeps the split's blocks on the prompt kernels."""
+
+    from .sparse import SELECT_ROWS
+
+    b = min(SELECT_ROWS, max(64, -(-(-(-int(R) // int(world))) // 64) * 64))
+    tail = int(R) % b
+    return SELECT_ROWS if 0 < tail < 64 else b
 
 
 def deal(blocks: int, world: int, rank: int) -> tuple[list[int], int]:
@@ -114,7 +139,7 @@ def select(w, b, qr: torch.Tensor, xs_qr: torch.Tensor, qb, qi: torch.Tensor, wt
 
     s = settings()
     world, rank = int(w.world), int(w.rank)
-    sel = PromptSelect(qi, wts, pk, host_pos, R, np_max, pos_dev)
+    sel = PromptSelect(qi, wts, pk, host_pos, R, np_max, pos_dev, block=split_block(R, world))
     starts = list(sel.blocks())
     mine, slots = deal(len(starts), world, rank)
     if s.check:

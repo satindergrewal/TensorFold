@@ -73,6 +73,7 @@ class Piece:
     tokens: list[int]
     drafter: Any = None
     head: bool = False
+    reads: Any = None                            # where its DFlash2 context is read later (default: the piece's end)
     lo: int = field(default=0, init=False)       # its first row in the chunk
 
     @property
@@ -177,9 +178,16 @@ def prefill_pieces(e, pieces: Sequence[Piece]) -> list[torch.Tensor | None]:
             heads.append(mm(b, b.fnormed[r:r + 1], w.head, b.fxs[r:r + 1], b.logits[:1]).clone())
         else:
             heads.append(None)
+    from .draft_skip import skip_rows
+
     for p in pieces:
         if p.drafter is not None:
-            p.drafter.add_taps(torch.cat([t[p.lo:p.lo + p.rows] for t in b.taps], dim=1))
+            start = p.st.pos
+            k = skip_rows(p.drafter, start, p.rows, p.reads if p.reads is not None else (start + p.rows,))
+            if k:
+                p.drafter.skip_taps(k)
+            if k < p.rows:
+                p.drafter.add_taps(torch.cat([t[p.lo + k:p.lo + p.rows] for t in b.taps], dim=1))
     for p in pieces:
         commit(w, p.st, b, p.rows, p.rows)
     return heads

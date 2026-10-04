@@ -157,14 +157,11 @@ class HcSplit:
         if self.ce_mode:
             from .ce import CeExchange
 
-            from .moe_glue import narrow_bytes
-
             b = self.b
             taps = max((len(v) for v in getattr(b, "tap_at", {}).values()), default=0)
             store = getattr(self.w.comm, "nccl", self.w.comm).store
-            # TF_GLM_MOE_GLUE rowsplit: room for the picks and weights beside the rows (0 bytes without it)
             self.ce = CeExchange(self.rank, self.world, store, getattr(b, "alloc_rows", b.rows), b.part.shape[1],
-                                 taps + 1, narrow=narrow_bytes())
+                                 taps + 1)
             return
         if self.gather:
             return
@@ -238,25 +235,12 @@ class HcSplit:
         if self.ce is not None:                         # copy engines: into each peer's staging block of the piece
             self.ce.partials(b.part, self.H, off, n, at=self.ce_at + off)
             return
-        lo = self.theirs() + off
-        send = self.b.part[lo:lo + n]
-        if self.gather:
-            d = send.shape[1]
-            self.all_gather(send.reshape(-1), self.b.gath[2 * off * d:2 * (off + n) * d])
-        else:
-            self.w.comm.exchange([send], [self.got[j]], self.peer)
 
-    def _swap_rows(self, j: int, outs: list[torch.Tensor], narrow: tuple | list = ()) -> None:
-        """Piece j of bf16 row buffers: this rank's rows out, the peers' rows in (gather: in place, whole shares).
-        ``narrow``: narrow row buffers moved in the same copy-engine step (TF_GLM_MOE_GLUE rowsplit; ce only)."""
-
-        off, n = self.pieces[j]
         mine, theirs = self.mine() + off, self.theirs() + off
         if self.ce is not None:                         # copy engines: this rank's rows out, the peers' into place
-            self.ce.rows(outs, self.H, off, n, at=self.ce_at + off, narrow=narrow)
+            self.ce.rows(outs, self.H, off, n, at=self.ce_at + off)
             return
-        if narrow:
-            raise RuntimeError("narrow rows travel with the copy-engine exchange only (TF_GLM_HC_EXCHANGE=ce)")
+
         if self.gather:                                 # one piece: rank order is row order
             for t in outs:
                 self.all_gather(t[mine:mine + n].reshape(-1), t[:self.Rp].reshape(-1))

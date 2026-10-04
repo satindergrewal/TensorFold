@@ -46,7 +46,6 @@ from tensorfold.cuda.scheduler import Scheduler, Waiting
 from tensorfold.cuda.streams import Stream, next_fill
 
 from . import digest as _digest, multi_prefill
-from . import prof as _prefill_prof
 from .multi_tune import MultiSettings, RoundProfile, allocate, reach_of, sample_packed, scaled_confidence
 from .pool import ALIGN, Pool, align_up
 from .segments import window_rows
@@ -791,12 +790,6 @@ class MultiDecoder:
         """The lane's slot's DFlash2 context."""
         return self.drafts.contexts[lane.slot]
 
-    @staticmethod
-    def _reads(lane: Lane) -> list[int]:
-        """Where the lane's DFlash2 context is read later in its prompt: every point its state is kept at, and the
-        prompt's end (TF_GLM_DRAFT_PROMPT_SKIP skips the taps of rows no such point's window reaches)."""
-        return sorted(set(lane.stops) | {len(lane.s.prompt)})
-
     # -- kept prompts ------------------------------------------------------------------------------------------------------
     def _kept_by_id(self, kid: int):
         for c in self.kept:
@@ -1232,24 +1225,14 @@ class MultiDecoder:
             if replay:
                 out, lane.head = lane.head, None
             else:
-                _prefill_prof.active = _prefill_prof.ENABLED     # TF_GLM_PROFILE: the prompt chunks of --parallel too
-                try:
-                    out = prefill_chunk(e, prompt, start, stop - start,
-                                        drafter=self._ctx(lane) if lane.dflash else None, reads=self._reads(lane),
-                                        feed=lane.feed, mtp=False, head=stop == n)
-                finally:
-                    _prefill_prof.active = False
-                if _prefill_prof.ENABLED:
-                    self._prof_rows = getattr(self, "_prof_rows", 0) + stop - start
-                    if stop == n:                 # one report a prompt (its chunks and any chunk between them)
-                        _prefill_prof.report(self._prof_rows)
-                        self._prof_rows = 0
+                out = prefill_chunk(e, prompt, start, stop - start, drafter=self._ctx(lane) if lane.dflash else None,
+                                    feed=lane.feed, mtp=False, head=stop == n)
             if stop < n:
                 if stop in lane.stops:
                     self._keep(lane, stop)
                 return None
             if _digest.ON and not replay:                 # TF_GLM_PREFILL_DIGEST (patch 0121): a test setting
-                _digest.prompt_digest(self.w, lane.st, n, out[:1], self._ctx(lane) if lane.dflash else None)
+                _digest.prompt_digest(self.w, lane.st, n, out[:1])
             if lane.point == n and not replay:
                 self._keep(lane, n, head=out[:1].clone())    # before a grammar's mask writes into the row
             logits = out[:1]
@@ -1296,8 +1279,7 @@ class MultiDecoder:
             if not start < stop <= n or stop - start > e.prefill_rows:
                 raise RuntimeError(f"stream {lane.sid}: a prompt chunk {start} .. {stop} of {n}")
             pieces.append(multi_prefill.Piece(lane.st, list(lane.s.prompt[start:stop]),
-                                              drafter=self._ctx(lane) if lane.dflash else None, head=stop == n,
-                                              reads=self._reads(lane)))
+                                              drafter=self._ctx(lane) if lane.dflash else None, head=stop == n))
         t = time.perf_counter()
         heads = multi_prefill.prefill_pieces(e, pieces)
         parts, who = [], []
@@ -1308,7 +1290,7 @@ class MultiDecoder:
                     self._keep(lane, stop)
                 continue
             if _digest.ON:                                # TF_GLM_PREFILL_DIGEST (patch 0121): a test setting
-                _digest.prompt_digest(self.w, lane.st, n, out[:1], self._ctx(lane) if lane.dflash else None)
+                _digest.prompt_digest(self.w, lane.st, n, out[:1])
             if lane.point == n:
                 self._keep(lane, n, head=out[:1].clone())    # before a grammar's mask writes into the row
             logits = out[:1]

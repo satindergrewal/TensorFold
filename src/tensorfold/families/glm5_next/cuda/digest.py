@@ -7,7 +7,8 @@ mod 2^64: any single changed bit changes it). It reads state only (and syncs the
 no reply; leave it off in service.
 
 The lines read
-  [tensorfold] prefill digest rank R tokens N logits <hex> kda <hex> conv <hex> latent <hex> pools <hex>"""
+  [tensorfold] prefill digest rank R tokens N logits <hex> kda <hex> conv <hex> latent <hex> pools <hex> draft <hex>
+(draft: DFlash2's window rows a draft at N reads, when the prompt drafts; "-" otherwise)."""
 
 from __future__ import annotations
 
@@ -57,10 +58,16 @@ class _Acc:
         return f"{a:016x}{b:016x}"
 
 
-def prompt_digest(w, st, n: int, logits: torch.Tensor | None) -> None:
-    """Print rank w.rank's digests of the prompt of ``n`` tokens just prefilled into ``st`` (its stream's state)."""
+def prompt_digest(w, st, n: int, logits: torch.Tensor | None, drafter=None) -> None:
+    """Print rank w.rank's digests of the prompt of ``n`` tokens just prefilled into ``st`` (its stream's state);
+    with ``drafter`` (its DFlash2 context) also of the drafter's window rows a draft at n reads."""
 
-    parts = {name: _Acc() for name in ("logits", "kda", "conv", "latent", "pools")}
+    parts = {name: _Acc() for name in ("logits", "kda", "conv", "latent", "pools", "draft")}
+    if drafter is not None and int(getattr(drafter, "context_end", -1)) == n:
+        from .multi import draft_window
+
+        for t in draft_window(drafter, n):
+            parts["draft"].add(t)
     parts["logits"].add(logits)
     for li in range(len(st.cur)):
         parts["kda"].add(st.rec[st.cur[li], li])

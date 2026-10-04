@@ -85,9 +85,6 @@ def _dattn_seg_kernel(Q, K, V, OUT, POS, SLOT, window, scale, L, SLOT_ROWS,
     tl.store(OUT + (seg * N + qr[:, None]) * (NH * HD) + qh[:, None] * HD + d[None, :], out.to(tl.bfloat16))
 
 
-TABLE_RING = 64        # pinned context-update tables in the ring (TF_GLM_DRAFT_PROMPT_SKIP): a 4,096-row chunk's launches
-
-
 class DraftContext:
     """One stream's DFlash2 context: its slot of the shared ring pool (``kc`` / ``vc`` per layer are views
     [kv heads, ring rows, head_dim]) and where its committed rows end. Stands in for a solo ``Drafter`` wherever one
@@ -111,17 +108,6 @@ class DraftContext:
     def add_taps(self, taps: torch.Tensor) -> None:
         """This stream's committed rows' taps alone (a prompt's chunks): ``MultiDrafter.commit`` of one stream."""
         self.owner.commit([(self, taps)])
-
-    def skip_taps(self, n: int) -> None:
-        """Advance this stream's context end (and its device mirror) over n committed rows without their context
-        update: rows no later block pass reads (TF_GLM_DRAFT_PROMPT_SKIP, ``draft_skip``)."""
-
-        if n <= 0:
-            return
-        if self.context_end + n > self.capacity:
-            raise ValueError("drafter context past its capacity")
-        self.pos_dev += n
-        self.context_end += n
 
     def propose(self, pending: int, depth: int, sampling: Sampling | None, confidence: float = 0.0, *,
                 beta: float = 0.0, round_ms: tuple[float, ...] | None = None) -> list[int]:
@@ -177,13 +163,6 @@ class MultiDrafter:
         self.t_meta = torch.zeros((2 * T + 2 * streams,), dtype=torch.int64, device=self.dev)
         self.t_host = torch.zeros((2 * T + 2 * streams,), dtype=torch.int64, pin_memory=pinned)
         self.t_ready = torch.cuda.Event() if pinned else None
-        # TF_GLM_DRAFT_PROMPT_SKIP: a ring of pinned tables, each waited on only when it comes round again (a prompt
-        # chunk's updates then queue behind its forward instead of waiting for it on the host one launch at a time)
-        from .draft_skip import ON as ring_on
-
-        self.t_ring = ([(torch.zeros((2 * T + 2 * streams,), dtype=torch.int64, pin_memory=pinned),
-                         torch.cuda.Event() if pinned else None) for _ in range(TABLE_RING)] if ring_on else None)
-        self.t_next = 0
         self.tap_in = torch.zeros((T, d.tap_in.shape[1]), dtype=torch.bfloat16, device=self.dev)
         m = n - 1
         self.cand_n = d.gathered * streams * m * 2 * d.top_k
@@ -351,15 +330,9 @@ class MultiDrafter:
     # -- the context ---------------------------------------------------------------------------------------------
     def _launch_taps(self, pieces: list[tuple[DraftContext, torch.Tensor, int]]) -> None:
         St, Tm = self.streams, self.t_max
-        if self.t_ring is not None:                      # TF_GLM_DRAFT_PROMPT_SKIP: the ring's next table
-            h, ready = self.t_ring[self.t_next]
-            self.t_next = (self.t_next + 1) % len(self.t_ring)
-            if ready is not None:
-                ready.synchronize()                      # its last update's table has left it (a ring ago)
-        else:
-            if self.t_ready is not None:
-                self.t_ready.synchronize()               # the last update's table has left t_host
-            h, ready = self.t_host, self.t_ready
+        if self.t_ready is not None:
+            self.t_ready.synchronize()                   # the last update's table has left t_host
+        h = self.t_host
         h[2 * Tm:2 * Tm + St].fill_(St)
         h[2 * Tm + St:].zero_()
         off = 0
@@ -380,8 +353,8 @@ class MultiDrafter:
             h[off:T] = 0
             h[Tm + off:Tm + T] = St * self.cap + torch.arange(off, T, dtype=torch.int64)
         self.t_meta.copy_(h, non_blocking=True)
-        if ready is not None:
-            ready.record()
+        if self.t_ready is not None:
+            self.t_ready.record()
         if g is not None:
             g.replay()
         else:

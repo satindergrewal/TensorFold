@@ -122,7 +122,6 @@ class Engine:
         self.w = w
         self.grid = grid
         w.meta["long_context"] = long_context
-        w.meta["prompt_grid"] = grid                         # prompt chunks' grid (``lanes`` cut on it)
         from . import l2pf
 
         pf = l2pf.Settings.from_env()                        # TF_GLM_L2PF: installed before any graph capture
@@ -549,7 +548,7 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
     from . import digest as _digest
 
     if _digest.ON and not replay:                        # TF_GLM_PREFILL_DIGEST (patch 0121): a test setting
-        _digest.prompt_digest(w, st, len(prompt), last, drafter)
+        _digest.prompt_digest(w, st, len(prompt), last)
     if keep_head:
         e.head = last.clone()
     if e.constraint is not None:                         # the first token's row, under the reply's grammar
@@ -560,13 +559,11 @@ def prefill(e: Engine, prompt: Sequence[int], sampling: Sampling | None, *, mtp:
 
 
 def prefill_chunk(e: Engine, prompt: Sequence[int], start: int, R: int, *, drafter=None, feed=None,
-                  mtp: bool = False, head: bool = True, reads: Sequence[int] | None = None) -> torch.Tensor | None:
+                  mtp: bool = False, head: bool = True) -> torch.Tensor | None:
     """Commit prompt rows start .. start + R (at e.st.pos == start): the chunk's forward, DFlash2's taps, the MTP
     head's rows (``mtp``: the next tokens are the prompt's), the commit; a copy of the head's logits of its last
     row, taken before anything else reuses the buffers, with ``head``, else None. ``prefill`` runs a prompt as these;
-    so do concurrent streams' prompt steps (``multi``), one chunk at a time. ``reads``: where DFlash2's context of
-    this prompt is read later (its end, the default, and every point a state is kept at): with
-    TF_GLM_DRAFT_PROMPT_SKIP the taps of rows no such point's window reaches are skipped (``draft_skip``)."""
+    so do concurrent streams' prompt steps (``multi``), one chunk at a time."""
 
     w, st, b = e.w, e.st, e.pbuf
     chunk = list(prompt[start:start + R])
@@ -576,13 +573,7 @@ def prefill_chunk(e: Engine, prompt: Sequence[int], start: int, R: int, *, draft
     out = out.clone() if head else None
     e.last_hidden = b.fnormed[R - 1:R].clone()
     if drafter is not None:
-        from .draft_skip import skip_rows
-
-        k = skip_rows(drafter, start, R, reads if reads is not None else (len(prompt),))
-        if k:
-            drafter.skip_taps(k)
-        if k < R:
-            drafter.add_taps(torch.cat([t[k:R] for t in b.taps], dim=1) if k else e.tap_rows(R, b))
+        drafter.add_taps(e.tap_rows(R, b))
     if mtp:
         nxt = list(prompt[start + 1:start + R + 1])
         if nxt:

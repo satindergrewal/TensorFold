@@ -412,17 +412,6 @@ class Drafter:
             self.vc[i].index_copy_(1, idx, v)
         self.pos_dev += n
 
-    def skip_taps(self, n: int) -> None:
-        """Advance the context end over n committed rows without their context update: rows no later block pass
-        reads (TF_GLM_DRAFT_PROMPT_SKIP, ``draft_skip``)."""
-
-        if n <= 0:
-            return
-        if self.context_end + n > self.capacity:
-            raise ValueError("drafter context past its capacity")
-        self.pos_dev += n
-        self.context_end += n
-
     @torch.no_grad()
     def add_taps(self, taps: torch.Tensor) -> None:
         """Committed rows' taps [n, 5 * D] (bf16) at positions context_end, context_end + 1, ..."""

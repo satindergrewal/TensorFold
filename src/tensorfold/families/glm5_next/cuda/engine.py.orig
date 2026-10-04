@@ -576,9 +576,12 @@ class GlmEngine:
         from .index_split import settings as index_split_settings     # patch 0120: TF_GLM_INDEX_SPLIT*
 
         mine += index_split_settings().code()
-        from . import lanes as lanes_mod                              # patch 0123: TF_GLM_PREFILL_LANES*
+        from . import lanes as lanes_mod                # patches 0123, 0128: TF_GLM_PREFILL_LANES*, TF_GLM_KDA_OVERLAP
 
         mine += lanes_mod.code()
+        from . import draft_skip as draft_skip_mod                    # patch 0124: TF_GLM_DRAFT_PROMPT_SKIP
+
+        mine += draft_skip_mod.code()
         from . import draft_skip as draft_skip_mod                    # patch 0124: TF_GLM_DRAFT_PROMPT_SKIP
 
         mine += draft_skip_mod.code()
@@ -670,11 +673,12 @@ class GlmEngine:
         if rank == 0 and index_split_settings().on and world > 1:
             print(f"[tensorfold] {index_split_settings().describe()}", flush=True)
             print(f"[tensorfold] {draft_skip_mod.describe()}", flush=True)
-        from . import moe_glue as moe_glue_mod
         if rank == 0 and moe_glue_mod.on():
             print(f"[tensorfold] {moe_glue_mod.describe()}", flush=True)
         if rank == 0 and parallel > 1 and self.drafter is not None and dflash2_fast.settings().on:
             print(f"[tensorfold] {dflash2_fast.settings().describe()}", flush=True)
+        if rank == 0 and draft_skip_mod.ON and self.drafter is not None:
+            print(f"[tensorfold] {draft_skip_mod.describe()}", flush=True)
         if rank == 0 and lanes_mod.LANES > 1:
             print(f"[tensorfold] {lanes_mod.describe()}"
                   + ("" if self.e.pbuf.split is not None else ": not used, it needs TF_GLM_HC_SPLIT=1"), flush=True)
@@ -738,9 +742,6 @@ class GlmEngine:
         self.model_dir = Path(model_dir)
         self.request = threading.local()    # the calling request's policy and stop-at-EOS (``app.GlmApp``)
         # kept conversations (decode.Snapshot, least recently used first) and the live caches' ids; states and saved rows stay within cache_bytes
-        if rank == 0 and moe_glue_mod.on():
-            print(f"[tensorfold] {moe_glue_mod.describe()}", flush=True)
-
         self.cache: list = []
         self.live: list[int] = []
         self.cache_entries = int(os.environ.get("TF_GLM_CACHE_ENTRIES", "8"))
@@ -757,14 +758,10 @@ class GlmEngine:
                       f"{self.multi.fill_rows} rows while others decode (TF_GLM_FILL_ROWS, TF_GLM_FILL_SHARE "
                       f"{self.multi.share:g}){'; waiting prompts share prompt chunks (TF_GLM_MULTI_PREFILL)' if self.multi.group else ''}; "
                       f"{self.multi.tune.describe()}", flush=True)
-            print(f"[tensorfold] {index_split_settings().describe()}", flush=True)
-        if rank == 0 and draft_skip_mod.ON and self.drafter is not None:
-            print(f"[tensorfold] {draft_skip_mod.describe()}", flush=True)
-        if rank == 0 and moe_glue_mod.on():
-            print(f"[tensorfold] {moe_glue_mod.describe()}", flush=True)
-        if rank == 0 and lanes_mod.LANES > 1:
-            print(f"[tensorfold] {lanes_mod.describe()}"
-                  + ("" if self.e.pbuf.split is not None else ": not used, it needs TF_GLM_HC_SPLIT=1"), flush=True)
+                print(f"[tensorfold] --parallel {parallel}: {self.scheduler.prio.describe(parallel)}", flush=True)
+                if self.multi.row_ms is not None:
+                    print("[tensorfold] --parallel batched window ms by rows: " +
+                          " ".join(f"{i + 1}:{ms:.1f}" for i, ms in enumerate(self.multi.row_ms)), flush=True)
         if hasattr(self.comm, "settle"):                # startup is over: RoCE gathers go without a barrier first
             self.comm.settle()
 

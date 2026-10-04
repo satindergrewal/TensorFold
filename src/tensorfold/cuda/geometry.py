@@ -282,6 +282,12 @@ def exl3_expert_scratch(rows: int, slots: int, d: int, width: int, *, prompt: bo
             + 4)
 
 
+def even_share(world: int):
+    """A ``share(family, total)`` of even splits (the two-rank engine's): total // world."""
+
+    return lambda family, total: int(total) // int(world)
+
+
 def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560, latent: bool = False,
                  prefill_rows: int = PREFILL_ROWS, mtp: bool | None = None, onepass: bool = False,
                  exl3_prompt: bool = True, prompt_split_k: bool = True, kv: str = "bf16") -> Geometry:

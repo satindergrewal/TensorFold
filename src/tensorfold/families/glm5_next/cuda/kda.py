@@ -16,7 +16,7 @@ def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_glm_kda_v2a4", sources=[str(here / "kda.cpp"), str(here / "kda.cu")],
+    return load(name="tensorfold_glm_kda_v2a5", sources=[str(here / "kda.cpp"), str(here / "kda.cu")],
                 extra_cuda_cflags=["-O3", "--fmad=false"], verbose=False)
 
 
@@ -122,7 +122,7 @@ def chain(p: torch.Tensor, b_off: int, a: torch.Tensor, g: torch.Tensor, conv_st
         warps, tr = step_launch(a_log.numel(), int(rows))
         _ext().chain_wide(p, p.stride(0), int(b_off), a, a.stride(0), g, g.stride(0), conv_state, conv_w, state_in,
                           a_log, dt_bias, norm_w, float(eps), float(lower), int(rows), scratch.out, state_out,
-                          scratch.k, scratch.v, scratch.g, scratch.b, q_tmp, y_tmp, warps, tr)
+                          scratch.k, scratch.v, scratch.g, scratch.b, q_tmp, y_tmp, warps, tr, xs)
         return scratch.out[:rows]
     _ext().chain(p, p.stride(0), int(b_off), a, a.stride(0), g, g.stride(0), conv_state, conv_w, state_in, a_log,
                  dt_bias, norm_w, float(eps), float(lower), int(rows), scratch.out, state_out, scratch.k, scratch.v,
@@ -187,7 +187,7 @@ def chain_segments(seg: torch.Tensor, p: torch.Tensor, b_off: int, a: torch.Tens
     warps, tr = step_launch(a_log.numel(), int(rows))
     _ext().chain_wide_segments(seg, p, p.stride(0), int(b_off), a, a.stride(0), g, g.stride(0), conv, conv_w, rec,
                                a_log, dt_bias, norm_w, float(eps), float(lower), int(rows), scratch.out, scratch.k,
-                               scratch.v, scratch.g, scratch.b, q_tmp, y_tmp, warps, tr)
+                               scratch.v, scratch.g, scratch.b, q_tmp, y_tmp, warps, tr, xs)
     return scratch.out[:rows]
 
 

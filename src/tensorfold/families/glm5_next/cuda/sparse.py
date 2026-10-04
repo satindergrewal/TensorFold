@@ -387,13 +387,15 @@ class PromptSelect:
     same kernels, grids, constexprs and arguments: patch 0120 only cut the loop body in two)."""
 
     def __init__(self, qi: torch.Tensor, wts: torch.Tensor, pk: torch.Tensor, pos: int, R: int, np_max: int,
-                 pos_dev: torch.Tensor) -> None:
+                 pos_dev: torch.Tensor, block: int | None = None) -> None:
         self.qi, self.wts, self.R, self.pos_dev = qi, wts, int(R), pos_dev
         self.dev = qi.device
         self.NP = pool_count(pos, R, np_max)
         # rows go through in blocks of SELECT_ROWS: every block scores the chunk's NP pools (the same columns, so the
-        # same bits a row), and the fp32 scores take SELECT_ROWS rows, not the chunk's, of the capacity-sized memory
-        self.B = min(R, SELECT_ROWS)
+        # same bits a row), and the fp32 scores take SELECT_ROWS rows, not the chunk's, of the capacity-sized memory.
+        # ``block`` (the index split's, patch 0125): smaller blocks of at least 64 rows; the same kernels, constexprs
+        # and per-row arithmetic (a row's scores, selection and tokens read only its own query, weights and position)
+        self.B = min(R, block or SELECT_ROWS)
         self.buf = torch.empty((self.B * pool_bucket(pos, R, np_max),), dtype=torch.float32, device=self.dev)
         self.H = wts.shape[1]
         self.D = qi.shape[1] // self.H
