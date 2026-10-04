@@ -9,8 +9,8 @@
 //     the query scale and the mask past the row's count, and hands the 16 x 32 tile to the PV warps (shared memory);
 //   - four PV warps each own 128 output columns: the tile's softmax (every PV warp computes the whole tile's, from
 //     the scores), the rescale of their output columns and the PV product over those columns, and they gather the
-//     tiles ahead (each its 128-column slice of the 32 key rows; fp8 codes widened to bf16 as _sparse_onepass widens
-//     them) into one of two tile buffers.
+//     tiles ahead (each its 128-column slice of the 32 key rows; fp8 codes widened to the bf16 values _sparse_onepass
+//     widens them to, by integer ops and one exact multiply: e4m3x4_bf16) into one of two tile buffers.
 // So the scores of tile p + 1 are computed while the PV warps run tile p, nothing is computed twice, and the query is
 // loaded from memory once a row. mbarriers order the two roles (tile full, scores full, scores consumed).
 //
@@ -158,14 +158,21 @@ __device__ __forceinline__ float shfl_xor(float v, int m) {
     return d;
 }
 
-// Two e4m3 codes (the low byte first) -> bf16x2, by _sparse_onepass' own instructions (exact: e4m3 fits f16 and bf16)
-__device__ __forceinline__ uint32_t e4m3x2_bf16x2(uint32_t pair) {
-    uint32_t d;
-    const uint16_t h = static_cast<uint16_t>(pair);
-    asm("{\n .reg .b32 a;\n .reg .f16 a0, a1;\n .reg .b16 b0, b1;\n cvt.rn.f16x2.e4m3x2 a, %1;\n mov.b32 {a0, a1}, a;\n"
-        " cvt.bf16.f16 b0, a0;\n cvt.bf16.f16 b1, a1;\n mov.b32 %0, {b0, b1};\n}"
-        : "=r"(d) : "h"(h));
-    return d;
+// Four e4m3 codes (byte k of w) -> two bf16x2 words ((c0, c1), (c2, c3)), with the bits _sparse_onepass' conversion
+// gives (cvt.rn.f16x2.e4m3x2 then cvt.bf16.f16: both exact) for every code a cache holds (patch 0291).
+// The reference's conversion instructions run on the GPU's conversion pipe (F2FP / F2F, about 16 results a clock an
+// SM), which a tile's 16,384 codes hold for ~1,000+ cycles; here integer ops place each code's bits in a bf16 whose
+// value is the code's times 2^-120 (sign to bit 15, exponent field e, mantissa bits m << 4: an e4m3 subnormal lands on
+// a bf16 subnormal), and one packed bf16 multiply by 2^120 scales it back: a power of two, no rounding, the code's
+// exact value. NaN codes (0x7F, 0xFF) differ, and a cache never holds them: kv8 writes codes within +-256 (0x78).
+__device__ __forceinline__ void e4m3x4_bf16(uint32_t w, uint32_t& lo, uint32_t& hi) {
+    const uint32_t L = (w << 4) & 0xF0F0F0F0u;                         // byte k: c_k's e0 m2 m1 m0 0 0 0 0
+    const uint32_t H = ((w >> 4) & 0x07070707u) | (w & 0x80808080u);   // byte k: c_k's s 0 0 0 0 e3 e2 e1
+    const uint32_t p0 = __byte_perm(L, H, 0x5140);                     // (c0, c1) as bf16x2 bits, x 2^-120
+    const uint32_t p1 = __byte_perm(L, H, 0x7362);                     // (c2, c3)
+    // x 2^120 (bf16 0x7B80); the -0 addend keeps a product's zero sign
+    asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(lo) : "r"(p0), "r"(0x7B807B80u), "r"(0x80008000u));
+    asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(hi) : "r"(p1), "r"(0x7B807B80u), "r"(0x80008000u));
 }
 
 __device__ __forceinline__ uint4 ldg16(const void* p) {
@@ -293,14 +300,10 @@ __device__ __forceinline__ void slice_store(const Slice<FP8>& s, Smem& sm, uint3
         if (FP8) {
             const int row = (lane >> 3) + 4 * i, c = lane & 7;          // 16 codes -> two 16-byte bf16 chunks
             uint4 lo, hi;
-            lo.x = e4m3x2_bf16x2(s.v[i].x);
-            lo.y = e4m3x2_bf16x2(s.v[i].x >> 16);
-            lo.z = e4m3x2_bf16x2(s.v[i].y);
-            lo.w = e4m3x2_bf16x2(s.v[i].y >> 16);
-            hi.x = e4m3x2_bf16x2(s.v[i].z);
-            hi.y = e4m3x2_bf16x2(s.v[i].z >> 16);
-            hi.z = e4m3x2_bf16x2(s.v[i].w);
-            hi.w = e4m3x2_bf16x2(s.v[i].w >> 16);
+            e4m3x4_bf16(s.v[i].x, lo.x, lo.y);
+            e4m3x4_bf16(s.v[i].y, lo.z, lo.w);
+            e4m3x4_bf16(s.v[i].z, hi.x, hi.y);
+            e4m3x4_bf16(s.v[i].w, hi.z, hi.w);
             sts16(chunk_addr(tb, row, 16 * j + 2 * c), lo);
             sts16(chunk_addr(tb, row, 16 * j + 2 * c + 1), hi);
         } else {

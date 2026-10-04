@@ -630,7 +630,8 @@ void kda_chain_wide_cuda(const at::Tensor& P, int64_t p_stride, int64_t b_off, c
 #undef STEP
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     out_kernel<<<grid, DV, 0, stream>>>(H, ptr<__nv_bfloat16>(y_tmp), ptr<__nv_bfloat16>(G), (int)g_stride,
-                                        ptr<__nv_bfloat16>(norm_w), (float)eps, ptr<__nv_bfloat16>(out));
+                                        ptr<__nv_bfloat16>(norm_w), (float)eps, ptr<__nv_bfloat16>(out),
+                                        xs.has_value() ? xs->data_ptr<float>() : nullptr);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -641,8 +642,7 @@ void kda_chain_wide_segments_cuda(const at::Tensor& seg, int64_t nseg, const at:
                                   const at::Tensor& a_log, const at::Tensor& dt_bias, const at::Tensor& norm_w,
                                   double eps, double lower, int64_t rows, at::Tensor& out, at::Tensor& k_save,
                                   at::Tensor& v_save, at::Tensor& g_save, at::Tensor& b_save, at::Tensor& q_tmp,
-                                  at::Tensor& y_tmp, int64_t warps, int64_t tr,
-                                  const c10::optional<at::Tensor>& xs) {
+                                  at::Tensor& y_tmp, int64_t warps, int64_t tr, const c10::optional<at::Tensor>& xs) {
     auto stream = at::cuda::getCurrentCUDAStream();
     const int H = (int)a_log.numel();
     const dim3 grid((unsigned)rows, (unsigned)H);

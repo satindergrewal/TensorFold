@@ -53,9 +53,7 @@ def wanted() -> frozenset:
 
     global _wanted
     if _wanted is None:
-        # this fork: fusions default OFF - the hand-merged Aevonix kernel sources are not yet first-use-verified
-        # on the mixed path; set TF_GLM_FUSE=on/all to try them (their checks gate each fusion either way)
-        v = (os.environ.get("TF_GLM_FUSE", "") or "off").strip().lower()
+        v = (os.environ.get("TF_GLM_FUSE", "") or "on").strip().lower()
         if v in ("1", "on"):
             _wanted = frozenset(DEFAULT)
         elif v == "all":

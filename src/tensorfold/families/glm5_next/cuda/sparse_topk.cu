@@ -15,7 +15,8 @@
 //      positions by prefix counts.
 // When bin b1 holds more than CAP pools (scores bunched, e.g. -inf rows), the low bits are resolved by two more
 // reads (12 and 8 bits) and the row classified again; rows over 65,536 pools (no room for the bitmaps) take a final
-// ordered read instead of the bitmaps. Every path gives the same pools: the set is defined by the order keys.
+// ordered read instead of the bitmaps. Every path gives the same pools: the set is defined by the order keys. Rows are
+// read 16 bytes at a time when every row starts on 16 bytes (NP a multiple of 4), else 4 bytes (patch 0290).
 //
 // Licensed under the Apache License, Version 2.0. Builds on TensorFold (Ash Hart and the TensorFold contributors) and on
 // the GLM-5.3-Flash recipe and patches 0001-0056 by MiaAI-Lab.
@@ -108,6 +109,24 @@ __device__ __forceinline__ void find_bin(const unsigned* hist, int nbins, unsign
     above = static_cast<unsigned>(*out_above);
 }
 
+// V consecutive scores from pool i (zeros past NP, flagged): V = 4 takes 16-byte loads (every row 16-byte aligned:
+// NP a multiple of 4 and an aligned base), V = 1 any row.
+template <int V>
+__device__ __forceinline__ void load_v(const float* __restrict__ row, int i, int NP, float (&e)[V]) {
+    if constexpr (V == 4) {
+        float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+        if (i < NP) v = *reinterpret_cast<const float4*>(row + i);
+        e[0] = v.x;
+        e[1] = v.y;
+        e[2] = v.z;
+        e[3] = v.w;
+    } else {
+        static_assert(V == 1, "4- or 1-wide loads");
+        e[0] = i < NP ? row[i] : 0.f;
+    }
+}
+
+template <int V>
 __global__ void __launch_bounds__(THREADS) topk_rows_kernel(const float* __restrict__ scores, int64_t* __restrict__ out,
                                                            int NP) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
@@ -117,7 +136,8 @@ __global__ void __launch_bounds__(THREADS) topk_rows_kernel(const float* __restr
     int64_t* dst = out + static_cast<size_t>(blockIdx.x) * TK;
     const int W = (NP + 31) / 32;
     const bool bitmap = W <= MAXW;
-    const int span = ((NP + THREADS * 4 - 1) / (THREADS * 4)) * (THREADS * 4);   // every lane runs every step
+    constexpr int STEP = THREADS * V;                // pools a step of the CTA
+    const int span = ((NP + STEP - 1) / STEP) * STEP;   // every lane runs every step
 
     // 1. the histogram of the top 12 bits
     for (int i = tid; i < NB; i += THREADS) sm.hist[i] = 0;
@@ -126,13 +146,11 @@ __global__ void __launch_bounds__(THREADS) topk_rows_kernel(const float* __restr
     if (tid == 0) sm.ccount = 0;
     __syncthreads();
 #pragma unroll 4
-    for (int i = tid * 4; i < span; i += THREADS * 4) {               // (unrolled: several loads in flight)
-        float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
-        if (i < NP) v = *reinterpret_cast<const float4*>(row + i);       // NP % 4 == 0 (the caller checks)
-        hist_add(sm.hist, order_key(v.x) >> 20, i < NP);
-        hist_add(sm.hist, order_key(v.y) >> 20, i < NP);
-        hist_add(sm.hist, order_key(v.z) >> 20, i < NP);
-        hist_add(sm.hist, order_key(v.w) >> 20, i < NP);
+    for (int i = tid * V; i < span; i += STEP) {                      // (unrolled: several loads in flight)
+        float e[V];
+        load_v<V>(row, i, NP, e);
+#pragma unroll
+        for (int c = 0; c < V; ++c) hist_add(sm.hist, order_key(e[c]) >> 20, i + c < NP);
     }
     __syncthreads();
     int b1;
@@ -142,12 +160,11 @@ __global__ void __launch_bounds__(THREADS) topk_rows_kernel(const float* __restr
 
     // 2. classify: above b1 selected; b1's keys kept as candidates
 #pragma unroll 2
-    for (int i = tid * 4; i < span; i += THREADS * 4) {
-        float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
-        if (i < NP) v = *reinterpret_cast<const float4*>(row + i);
-        const float e[4] = {v.x, v.y, v.z, v.w};
+    for (int i = tid * V; i < span; i += STEP) {
+        float e[V];
+        load_v<V>(row, i, NP, e);
 #pragma unroll
-        for (int c = 0; c < 4; ++c) {
+        for (int c = 0; c < V; ++c) {
             const unsigned key = order_key(e[c]);
             const int b = static_cast<int>(key >> 20);
             const bool ok = i + c < NP;
@@ -201,12 +218,11 @@ __global__ void __launch_bounds__(THREADS) topk_rows_kernel(const float* __restr
     } else {                                         // bin b1 bunched: bits 19..8, then 7..0, from the row again
         for (int i = tid; i < NB; i += THREADS) sm.hist[i] = 0;
         __syncthreads();
-        for (int i = tid * 4; i < span; i += THREADS * 4) {
-            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
-            if (i < NP) v = *reinterpret_cast<const float4*>(row + i);
-            const float e[4] = {v.x, v.y, v.z, v.w};
+        for (int i = tid * V; i < span; i += STEP) {
+            float e[V];
+            load_v<V>(row, i, NP, e);
 #pragma unroll
-            for (int c = 0; c < 4; ++c) {
+            for (int c = 0; c < V; ++c) {
                 const unsigned key = order_key(e[c]);
                 hist_add(sm.hist, (key >> 8) & 4095u, i + c < NP && static_cast<int>(key >> 20) == b1);
             }
@@ -219,12 +235,11 @@ __global__ void __launch_bounds__(THREADS) topk_rows_kernel(const float* __restr
         const unsigned pre = (static_cast<unsigned>(b1) << 12) | static_cast<unsigned>(d1);    // the key's top 24 bits
         for (int i = tid; i < 256; i += THREADS) sm.hist[i] = 0;
         __syncthreads();
-        for (int i = tid * 4; i < span; i += THREADS * 4) {
-            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
-            if (i < NP) v = *reinterpret_cast<const float4*>(row + i);
-            const float e[4] = {v.x, v.y, v.z, v.w};
+        for (int i = tid * V; i < span; i += STEP) {
+            float e[V];
+            load_v<V>(row, i, NP, e);
 #pragma unroll
-            for (int c = 0; c < 4; ++c) {
+            for (int c = 0; c < V; ++c) {
                 const unsigned key = order_key(e[c]);
                 hist_add(sm.hist, key & 255u, i + c < NP && (key >> 8) == pre);
             }
@@ -280,13 +295,12 @@ __global__ void __launch_bounds__(THREADS) topk_rows_kernel(const float* __restr
         }
     } else {                                         // no room for the bitmaps: the row once more, in order
         unsigned done_sel = 0, done_tie = 0;         // over the previous steps (the same in every thread)
-        for (int i = tid * 4; i < span; i += THREADS * 4) {
-            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
-            if (i < NP) v = *reinterpret_cast<const float4*>(row + i);
-            const float e[4] = {v.x, v.y, v.z, v.w};
+        for (int i = tid * V; i < span; i += STEP) {
+            float e[V];
+            load_v<V>(row, i, NP, e);
             unsigned s4 = 0, t4 = 0;
 #pragma unroll
-            for (int c = 0; c < 4; ++c) {
+            for (int c = 0; c < V; ++c) {
                 const unsigned key = order_key(e[c]);
                 const bool ok = i + c < NP;
                 s4 |= (ok && key > thr) ? (1u << c) : 0u;
@@ -298,7 +312,7 @@ __global__ void __launch_bounds__(THREADS) topk_rows_kernel(const float* __restr
             unsigned seen = done_tie + tb;
             unsigned pos = done_sel + sb + min(seen, need);
 #pragma unroll
-            for (int c = 0; c < 4; ++c) {
+            for (int c = 0; c < V; ++c) {
                 const bool s = (s4 >> c) & 1u, t = (t4 >> c) & 1u;
                 const bool take = s || (t && seen < need);
                 if (t) ++seen;
@@ -314,15 +328,25 @@ __global__ void __launch_bounds__(THREADS) topk_rows_kernel(const float* __restr
 
 int topk_rows_smem() { return static_cast<int>(sizeof(TkSmem)); }
 
-void topk_rows_cuda(const at::Tensor& scores, at::Tensor& out) {
+template <int V>
+void topk_launch(const at::Tensor& scores, at::Tensor& out) {
     const int R = static_cast<int>(scores.size(0)), NP = static_cast<int>(scores.size(1));
     static bool configured = false;
     if (!configured) {
-        C10_CUDA_CHECK(cudaFuncSetAttribute(topk_rows_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        C10_CUDA_CHECK(cudaFuncSetAttribute(topk_rows_kernel<V>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                             sizeof(TkSmem)));
         configured = true;
     }
-    topk_rows_kernel<<<R, THREADS, sizeof(TkSmem), at::cuda::getCurrentCUDAStream()>>>(
+    topk_rows_kernel<V><<<R, THREADS, sizeof(TkSmem), at::cuda::getCurrentCUDAStream()>>>(
         scores.data_ptr<float>(), out.data_ptr<int64_t>(), NP);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// Any contiguous [R, NP >= 512] fp32 rows: 16-byte loads when every row starts on 16 bytes, else 4-byte loads
+void topk_rows_cuda(const at::Tensor& scores, at::Tensor& out) {
+    const bool v4 = scores.size(1) % 4 == 0 && reinterpret_cast<uintptr_t>(scores.data_ptr()) % 16 == 0;
+    if (v4)
+        topk_launch<4>(scores, out);
+    else
+        topk_launch<1>(scores, out);
 }

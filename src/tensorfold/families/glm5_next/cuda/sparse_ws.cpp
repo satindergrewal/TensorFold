@@ -37,13 +37,12 @@ void sparse_ws(const at::Tensor& qa, const at::Tensor& cache, const at::Tensor& 
     sparse_ws_cuda(qa, cache, tokens, counts, out, rs, fp8, scale);
 }
 
-// scores [R, NP] fp32 (rows NP apart, NP a multiple of 4 and at least 512, 16-byte aligned) -> out [R, 512] int64:
-// each row's 512 best pools (order keys, ties to the lower pool), ascending: _select_rows' output (sparse_topk.cu).
+// scores [R, NP] fp32 (contiguous rows, NP at least 512) -> out [R, 512] int64: each row's 512 best pools (order keys,
+// ties to the lower pool), ascending: _select_rows' output (sparse_topk.cu).
 void topk_rows(const at::Tensor& scores, at::Tensor& out) {
     TORCH_CHECK(scores.is_cuda() && scores.scalar_type() == at::kFloat && scores.dim() == 2 && scores.is_contiguous(),
                 "topk_rows: contiguous fp32 scores [R, NP]");
-    TORCH_CHECK(scores.size(1) >= 512 && scores.size(1) % 4 == 0 &&
-                reinterpret_cast<uintptr_t>(scores.data_ptr()) % 16 == 0, "topk_rows: rows of 4 x n >= 512, aligned");
+    TORCH_CHECK(scores.size(1) >= 512 && scores.size(1) <= (1LL << 30), "topk_rows: rows of 512 pools or more");
     TORCH_CHECK(out.is_cuda() && out.scalar_type() == at::kLong && out.dim() == 2 && out.size(0) == scores.size(0) &&
                 out.size(1) == 512 && out.is_contiguous(), "topk_rows: out [R, 512] int64");
     if (scores.size(0) == 0) return;

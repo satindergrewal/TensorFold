@@ -199,9 +199,9 @@ class NCCL:
                       + " ".join(f"{k}={v}" for k, v in settings.items()) + " (TF_NCCL_EXCHANGE_ENV); "
                       "all-gathers on the first", flush=True)
 
-    def _check(self, code: int) -> None:
+    def _check(self, code: int, lib: ctypes.CDLL | None = None) -> None:
         if code != 0:
-            raise RuntimeError(f"NCCL error {code}: {self.lib.ncclGetErrorString(code).decode()}")
+            raise RuntimeError(f"NCCL error {code}: {(lib or self.lib).ncclGetErrorString(code).decode()}")
 
     def all_gather(self, send: torch.Tensor, recv: torch.Tensor) -> None:
         """recv [world * n] <- every rank's send [n], in rank order (contiguous tensors, same dtype)."""

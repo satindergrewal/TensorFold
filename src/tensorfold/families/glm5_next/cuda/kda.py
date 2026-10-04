@@ -16,7 +16,7 @@ def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_glm_kda_v2a5", sources=[str(here / "kda.cpp"), str(here / "kda.cu")],
+    return load(name="tensorfold_glm_kda_v2a3", sources=[str(here / "kda.cpp"), str(here / "kda.cu")],
                 extra_cuda_cflags=["-O3", "--fmad=false"], verbose=False)
 
 

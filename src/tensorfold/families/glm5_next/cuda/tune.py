@@ -18,8 +18,9 @@ default launch. A table entry takes precedence over the kernel's own environment
 TF_GLM_Q4_TILE, ...) for the shapes and row counts it lists; everything it does not list keeps the setting or default.
 
 Every value is checked at load against the kernel's list of same-bit choices (``CHOICES``): a value outside it, or a
-malformed file, refuses the start, so a table can only pick among configurations that keep the bits. The checksum of
-the whole file's tables joins the settings every rank compares at start (``code``), so all ranks read one file.
+malformed or unreadable file, refuses the start, so a table can only pick among configurations that keep the bits.
+The checksum of the whole file's tables joins the settings every rank compares at start (``code``; -1 for a bad file,
+which every rank then refuses together: a lookup before that check gets the defaults instead of raising alone).
 
 Row buckets: a kernel's entry for a shape is one value for every row count, or a dict {"<rows>": value} whose keys
 are the upper bounds of row buckets; a call of R rows takes the smallest bound >= R (none: the default).
@@ -67,8 +68,8 @@ def _int_range(lo: int, hi: int) -> Callable[[Any], int]:
 def _exl3(check: Callable[[Any], dict]) -> Callable[[Any], dict]:
     def both(v: Any) -> dict:
         out = check(v)
-        if out.get("wn", 1) == 4 and out.get("ld", 0) != 0:
-            raise ValueError("4 warps along N only with the 32-bit loads (ld 0)")
+        if out.get("wn", 1) == 4 and out.get("ld") != 0:      # explicit: an entry merges over TF_GLM_EXL3_LOADS
+            raise ValueError("4 warps along N only with the 32-bit loads: give ld 0 with wn 4")
         return out
     return both
 
@@ -82,8 +83,8 @@ CHOICES: dict[str, Callable[[Any], Any]] = {
     "exl3_dec_gu": _exl3(_keys(ld=_ints(0, 1, 2, 3), wn=_ints(1, 2, 4), fuse=_ints(0, 2), xrow=_ints(0, 1))),
     # decode EXL3 experts, down: loads, warps along N, epilogue fused (1) or its own kernel (0)
     "exl3_dec_dn": _exl3(_keys(ld=_ints(0, 1, 2, 3), wn=_ints(1, 2, 4), fuse=_ints(0, 1))),
-    # prompt EXL3 experts: members a pass (exl3_mm.prompt_pass)
-    "exl3_prompt": _keys(passm=_ints(64, 128)),
+    # prompt EXL3 experts: members a pass (exl3_mm.prompt_pass), cp.async pipeline depth (exl3_mm.prompt_stages)
+    "exl3_prompt": _keys(passm=_ints(64, 128), stages=_ints(2, 3, 4)),
     # 4-bit dense matmul of decode rows: the lane matmul's tile config (qmm.cu dispatch_cfg 0..15), -1 the stock tile
     "q4_dec": _int_range(-1, 15),
     # 4-bit dense matmul of prompt chunks: the prefill tile (qmm_prefill.cu dispatch 0..11), or 32 + v: variant v of
@@ -97,10 +98,14 @@ CHOICES: dict[str, Callable[[Any], Any]] = {
     "kda_step": _keys(warps=_ints(1, 2, 4, 8), tr=_ints(8, 16)),
     # L2 prefetch: programs one wave of a 4-bit decode matmul holds (l2pf.ONE_WAVE; GB10's 192 = 4 x 48 SMs)
     "l2pf": _keys(one_wave=_int_range(1, 1 << 16)),
+    # the multi-stream indexer's score programs a segment (sparse.SEG_SCORE_GRID: a grid stride over pool blocks, each
+    # block scored alone, so any count gives the same bits), keyed by index heads x head width
+    "sparse_scores": _keys(grid=_int_range(1, 1 << 16)),
 }
 
 _lock = threading.Lock()
-_loaded: tuple[str, dict, int] | None = None        # (path, this GPU's kernels, crc of the file's tables)
+_loaded: tuple[str, dict, int] | None = None        # (path, this GPU's kernels, crc of the file's tables; -1: bad)
+_error: str | None = None
 _record: dict | None = None
 _said = False
 _PATH = os.environ.get("TF_GLM_TUNE", "")            # read once: lookups run on every eager prompt matmul
@@ -112,9 +117,9 @@ def reset(path: str | None = None, record_path: str | None = None, device: dict 
     """Forget the loaded table: the next lookup reads ``path`` (default: TF_GLM_TUNE again) for ``device`` (default:
     the current GPU, ``device_key``). For tests and the harness."""
 
-    global _loaded, _record, _said, _PATH, _RECORD, _DEVICE
+    global _loaded, _record, _said, _PATH, _RECORD, _DEVICE, _error
     with _lock:
-        _loaded, _record, _said = None, None, False
+        _loaded, _record, _said, _error = None, None, False, None
         _PATH = os.environ.get("TF_GLM_TUNE", "") if path is None else path
         _RECORD = os.environ.get("TF_GLM_TUNE_RECORD", "") if record_path is None else record_path
         _DEVICE = device
@@ -195,27 +200,49 @@ def parse(doc: Any, where: str) -> list[tuple[dict, dict]]:
 
 
 def load(path: str | None = None) -> dict:
-    """This GPU's kernels from the table file ``path`` (default TF_GLM_TUNE); {} when off or no table matches."""
+    """This GPU's kernels from the table file ``path`` (default TF_GLM_TUNE); {} when off or no table matches.
+    A bad file raises ValueError here (and ``code`` is -1); ``pick`` gets the defaults instead."""
 
-    global _loaded, _said
+    _load(path)
+    if _error is not None:
+        raise ValueError(_error)
+    return _loaded[1]
+
+
+def error() -> str | None:
+    """Why the table file was refused (None: it was not)."""
+
+    _load(None)
+    return _error
+
+
+def _load(path: str | None) -> dict:
+    global _loaded, _said, _error
     path = _PATH if path is None else path
     with _lock:
         if _loaded is not None and _loaded[0] == path:
             return _loaded[1]
         if path.strip().lower() in OFF:
-            _loaded = (path, {}, 0)
+            _loaded, _error = (path, {}, 0), None
             return {}
         try:
-            with open(path, encoding="utf-8") as f:
-                doc = json.load(f)
-        except (OSError, json.JSONDecodeError) as exc:
-            raise ValueError(f"TF_GLM_TUNE={path}: cannot read the launch table ({exc})") from None
-        tables = parse(doc, f"TF_GLM_TUNE={path}")
+            try:
+                with open(path, encoding="utf-8") as f:
+                    doc = json.load(f)
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ValueError(f"TF_GLM_TUNE={path}: cannot read the launch table ({exc})") from None
+            tables = parse(doc, f"TF_GLM_TUNE={path}")
+        except ValueError as exc:
+            _loaded, _error = (path, {}, -1), str(exc)
+            if not _said:
+                _said = True
+                _say(f"{exc}: the start is refused (every rank's launch tables are compared at start)")
+            return {}
         canon = json.dumps([[d, k] for d, k in tables], sort_keys=True, separators=(",", ":"), default=str)
         crc = (zlib.crc32(canon.encode()) & 0x7FFFFFFF) or 1
         dev = device_key()
         kernels = next((k for d, k in tables if same_device(d, dev)), {})
-        _loaded = (path, kernels, crc)
+        _loaded, _error = (path, kernels, crc), None
         if not _said:
             _said = True
             what = "no GPU" if dev is None else f"{dev['name']} ({dev['sms']} SMs, sm_{dev['capability'][0]}" \
@@ -229,9 +256,9 @@ def load(path: str | None = None) -> dict:
 
 
 def code() -> int:
-    """The checksum of the table file's tables (0: off), for the settings every rank compares at start."""
+    """The checksum of the table file's tables (0: off, -1: a bad file), for the settings every rank compares."""
 
-    load()
+    _load(None)
     return _loaded[2] if _loaded is not None else 0
 
 
@@ -241,7 +268,7 @@ def pick(kernel: str, key: str, rows: int | None = None) -> Any:
     if _RECORD:
         record(kernel, key, rows)
     loaded = _loaded
-    table = loaded[1] if loaded is not None and loaded[0] == _PATH else load()
+    table = loaded[1] if loaded is not None and loaded[0] == _PATH else _load(None)
     entry = table.get(kernel, {}).get(key) if table else None
     if isinstance(entry, dict) and entry and all(isinstance(b, int) for b in entry):
         if rows is None:
@@ -293,5 +320,5 @@ def shape(*dims: int) -> str:
     return "x".join(str(int(d)) for d in dims)
 
 
-__all__ = ["CALLS_FORMAT", "CHOICES", "FORMAT", "code", "device_key", "load", "parse", "pick", "record", "reset",
-           "same_device", "shape", "validate_device", "validate_kernels"]
+__all__ = ["CALLS_FORMAT", "CHOICES", "FORMAT", "code", "device_key", "error", "load", "parse", "pick", "record",
+           "reset", "same_device", "shape", "validate_device", "validate_kernels"]
