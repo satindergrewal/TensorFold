@@ -33,6 +33,7 @@ class ImageLimits:
     total_timeout_seconds: float = 30.0
     max_redirects: int = 3
     max_url_chars: int = 4096
+    max_visual_tokens: int = 4096        # the tokens a request's images share (CUDA Qwen: --vision-image-tokens)
 
     def __post_init__(self) -> None:
         for name in self.__dataclass_fields__:
@@ -45,6 +46,13 @@ class ImageLimits:
 
 
 DEFAULT_LIMITS = ImageLimits()
+
+
+def _count_error(limits: ImageLimits) -> ImageInputError:
+    return ImageInputError(
+        f"a request supports at most {limits.max_images} images across the full message history, "
+        "including prior turns; remove older image content, start a new conversation, or restart the server "
+        "with --vision-max-images N to raise the count limit (other image limits still apply)")
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,8 +124,8 @@ def _check_source(source: ImageSource, limits: ImageLimits, allow_urls: bool = F
 def split_images(messages: list[dict[str, Any]], *, limits: ImageLimits = DEFAULT_LIMITS, allow_urls: bool = False,
                  allow_videos: bool = False, max_videos: int | None = None
                  ) -> tuple[list[dict[str, Any]], list[ImageSource]]:
-    """Preserve ordered parts, replacing user image URLs with processor image markers; ``allow_videos``: also
-    ``video_url`` parts (``VideoSource`` among the sources, a video marker in the template), at most ``max_videos``
+    """Preserve ordered parts, replacing user and tool-result image URLs with processor image markers; ``allow_videos``:
+    also ``video_url`` parts (``VideoSource`` among the sources, a video marker in the template), at most ``max_videos``
     (default: the shared video limits')."""
     if not isinstance(messages, list) or not messages:
         raise ImageInputError("messages must be a non-empty list")
@@ -129,7 +137,7 @@ def split_images(messages: list[dict[str, Any]], *, limits: ImageLimits = DEFAUL
         if not isinstance(role, str) or role not in {"system", "developer", "user", "assistant", "tool"}:
             raise ImageInputError("invalid message role")
         if any(message.get(key) for key in _MEDIA):
-            raise ImageInputError("images must be image_url parts in user message content")
+            raise ImageInputError("images must be image_url parts in user or tool message content")
         content = message.get("content")
         if content is None or isinstance(content, str):
             output.append(dict(message))
@@ -160,11 +168,21 @@ def split_images(messages: list[dict[str, Any]], *, limits: ImageLimits = DEFAUL
                 parts.append({"type": "video"})
             elif kind == "image_url":
                 if role != "user":
-                    raise ImageInputError("image_url parts are supported only in user messages")
+                    raise ImageInputError("video_url parts are supported only in user messages")
+                if any(part.get(key) for key in _MEDIA - {"video_url"}):
+                    raise ImageInputError("video_url parts cannot contain other media")
+                videos = sum(type(s).__name__ == "VideoSource" for s in sources)
+                if videos >= DEFAULT_VIDEO_LIMITS.max_videos:
+                    raise ImageInputError(f"a request supports at most {DEFAULT_VIDEO_LIMITS.max_videos} videos")
+                sources.append(video_source(part.get("video_url"), DEFAULT_VIDEO_LIMITS, allow_urls))
+                parts.append({"type": "video"})
+            elif kind == "image_url":
+                if role not in ("user", "tool"):
+                    raise ImageInputError("image_url parts are supported only in user and tool messages")
                 if any(part.get(key) for key in _MEDIA - {"image_url"}):
                     raise ImageInputError("image_url parts cannot contain other media")
                 if sum(isinstance(s, ImageSource) for s in sources) >= limits.max_images:
-                    raise ImageInputError(f"a request supports at most {limits.max_images} images")
+                    raise _count_error(limits)
                 source = _source(part.get("image_url"), limits, allow_urls)
                 sources.append(source)
                 parts.append({"type": "image", "detail": source.detail})
@@ -233,7 +251,7 @@ def load_images(sources: list[ImageSource], *, limits: ImageLimits = DEFAULT_LIM
                 ) -> list[ImageInput]:
     """Bound encoded bytes and decoded pixels across all images in one request."""
     if not isinstance(sources, (list, tuple)) or len(sources) > limits.max_images:
-        raise ImageInputError(f"a request supports at most {limits.max_images} images")
+        raise _count_error(limits)
     total_bytes, total_pixels = 0, 0
     deadline = time.monotonic() + limits.total_timeout_seconds
     output = []

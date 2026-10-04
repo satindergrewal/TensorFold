@@ -11,12 +11,23 @@ import torch
 
 from tensorfold.cuda import experts as grouped
 
-from .exl3_mm import Exl3Experts, words as exl3_words
+from tensorfold.cuda.exl3.experts import Exl3RoutedExperts as Exl3Experts
+from .exl3_mm import words as exl3_words
 from . import latent
 from .qmm import (B16, F8, Q4, as_i32, dense_kind, draft_quantize4, kvb_kind, make_b16, make_f8, make_q4, stack_b16,
                   stack_f8, stack_q4)
 
 PREFIX = "model.language_model."
+
+
+def bits_of(quant: dict) -> int:
+    """The checkpoint's one bit width; a mixed-bit encode (bits such as "mixed_k34_per_tensor") is refused by name."""
+
+    bits = quant.get("bits", 4)
+    if isinstance(bits, int) or (isinstance(bits, str) and bits.isdigit()):
+        return int(bits)
+    raise ValueError(f"this checkpoint's quantization bits are {bits!r}: GLM-5.3 on CUDA reads one bit width a "
+                     "checkpoint, so mixed-bit EXL3 encodes are not supported yet")
 
 
 @dataclass
@@ -374,23 +385,24 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
             t = {proj: rd.get(base + f"experts.{e}.{proj}.trellis") for proj in ("gate_proj", "up_proj", "down_proj")}
             widths.update(t[proj].shape[-1] for proj in t)
             per.append(t)
-        if len(widths) == 1:                     # uniform rate: the stacked path
-            parts = {}
-            for proj in ("gate_proj", "up_proj", "down_proj"):
-                ts = [exl3_words(per[e][proj]) for e in range(cfg.experts)]
-                us = [rd.get(base + f"experts.{e}.{proj}.suh") for e in range(cfg.experts)]
-                vs = [rd.get(base + f"experts.{e}.{proj}.svh") for e in range(cfg.experts)]
-                parts[proj] = (torch.stack(ts).to(dev), torch.stack(us).to(dev), torch.stack(vs).to(dev))
-            (gt, sg, vg), (ut, su, vu), (dt, sd, vd) = parts["gate_proj"], parts["up_proj"], parts["down_proj"]
-            return Exl3Experts(gt, ut, dt, sg, su, vg, vu, sd, vd, cfg.experts, int(vg.shape[1]), int(vd.shape[1]))
+        if len(widths) == 1:                     # uniform rate: the stacked trellises through prepare_stacked
+            gt = torch.stack([exl3_words(per[e]["gate_proj"]) for e in range(cfg.experts)]).to(dev)
+            ut = torch.stack([exl3_words(per[e]["up_proj"]) for e in range(cfg.experts)]).to(dev)
+            dt = torch.stack([exl3_words(per[e]["down_proj"]) for e in range(cfg.experts)]).to(dev)
+            sg = torch.stack([rd.get(base + f"experts.{e}.gate_proj.suh") for e in range(cfg.experts)]).to(dev)
+            su = torch.stack([rd.get(base + f"experts.{e}.up_proj.suh") for e in range(cfg.experts)]).to(dev)
+            vg = torch.stack([rd.get(base + f"experts.{e}.gate_proj.svh") for e in range(cfg.experts)]).to(dev)
+            vu = torch.stack([rd.get(base + f"experts.{e}.up_proj.svh") for e in range(cfg.experts)]).to(dev)
+            sd = torch.stack([rd.get(base + f"experts.{e}.down_proj.suh") for e in range(cfg.experts)]).to(dev)
+            vd = torch.stack([rd.get(base + f"experts.{e}.down_proj.svh") for e in range(cfg.experts)]).to(dev)
+            return x3.prepare_stacked(gt, ut, dt, sg, su, vg, vu, sd, vd, "mcg")
+
         # mixed rates (MiaAi-Lab k3/k4 per-tensor): per-expert widths through the x3 ABI
         def triples(proj):
-            out = []
-            for e in range(cfg.experts):
-                t = per[e][proj]
-                out.append((t.to(dev), rd.get(base + f"experts.{e}.{proj}.suh").to(dev),
-                            rd.get(base + f"experts.{e}.{proj}.svh").to(dev)))
-            return out
+            return [(per[e][proj].to(dev),
+                     rd.get(base + f"experts.{e}.{proj}.suh").to(dev),
+                     rd.get(base + f"experts.{e}.{proj}.svh").to(dev)) for e in range(cfg.experts)]
+
         print(f"[tensorfold] moe {p}: mixed trellis widths {sorted(widths)} - per-expert-width path", flush=True)
         return x3.prepare(triples("gate_proj"), triples("up_proj"), triples("down_proj"), "mcg", device=dev)
 
