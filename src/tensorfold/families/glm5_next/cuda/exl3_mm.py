@@ -121,7 +121,7 @@ def dec_gateup(x: torch.Tensor, pick: torch.Tensor, plan: grouped.Plan, ex: "Exl
         xg, xu = s.xg, s.xu
     fused = 2 if int(cfg["fuse"]) == 2 else 0
     ext.dec(xg, xu, ex.gt, ex.ut, plan.items, plan.counts, plan.members, s.z, 2, D, NI, P, 4, items, slots,
-            fused, xrow, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, float(limit), s.done, int(cfg["ld"]))
+            fused, xrow, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, float(limit), s.done, int(cfg["ld"]), int(cfg["wn"]))
     if not fused:
         ext.gateup_epilogue(s.z, pick, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, R, P, NI, 4, slots, float(limit))
 
@@ -137,7 +137,7 @@ def dec_down(pick: torch.Tensor, plan: grouped.Plan, ex: "Exl3Experts", s: "Scra
         items = grouped.max_items(R * slots, plan.experts)
     fused = 1 if int(cfg["fuse"]) == 1 else 0
     ext.dec(s.xd, s.xd, ex.dt, ex.dt, plan.items, plan.counts, plan.members, s.z, 1, NI, D, P, 1, items, slots,
-            fused, False, ex.svh_d, ex.svh_d, ex.svh_d, y, 0.0, s.done, int(cfg["ld"]))
+            fused, False, ex.svh_d, ex.svh_d, ex.svh_d, y, 0.0, s.done, int(cfg["ld"]), int(cfg["wn"]))
     if not fused:
         ext.down_epilogue(s.z, pick, ex.svh_d, y, R, P, D, 1, slots)
 
