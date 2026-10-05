@@ -643,9 +643,12 @@ class App:
             stats = {**(stats or {}), "token_ids": [int(t) for t in out]}
         logprobs = (self._probability_decoder.format(probabilities.emitted(out), ends)
                     if probabilities is not None else None)
-        # the calls already sent as deltas; the handler sends the rest (a call the streamer could not follow)
-        streamed = calls_stream.sent if calls_stream is not None else 0   # .index/.streamed: an older streamer API
-        return {"final": final, "calls": calls, "finish": finish, "content": content, "reasoning": reasoning,
+        # the calls already sent as deltas; the handler sends the rest (a call the streamer could not follow).
+        # Both numbers ride the result: http.py re-emits any call at or past calls_streamed, and clients
+        # concatenate argument deltas - a re-emitted streamed call doubles its JSON and breaks their parsing
+        streamed = calls_stream.sent if calls_stream is not None else 0
+        return {"final": final, "calls": calls, "call_deltas": call_deltas, "calls_streamed": streamed,
+                "finish": finish, "content": content, "reasoning": reasoning,
                 "stop_sequence": matched_stop(raw_text, stops.strings),
                 **({"logprobs": logprobs} if logprobs is not None else {}),
                 "prompt_tokens": len(prompt), "completion_tokens": len(out), "cached_tokens": (cached or [0])[0],
