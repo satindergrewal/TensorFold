@@ -347,22 +347,15 @@ __global__ void down_epilogue_kernel(const float* __restrict__ Z, const int* __r
 //      ld.global.nc.L1::no_allocate.v4 (lane l: bytes 16 l .. of each 512 B of a step, NT / 4 loads a lane), PD
 //      steps in flight, through a 1 KB staging area in the warp's own slice of `red` (two __syncwarp a step), read
 //      back as word `lane` of each tile.
-// WN (data movement only): WN warps along N share a block's NT tiles, NT / WN each, for every one of the
-//   W warps along K: warp (wk, wn) runs k tiles kt0 .. of K warp wk on tiles wn * NT / WN .. of the block, so each
-//   output's chain is the one of K warp wk at WN = 1, and the K warps are added in the same order (red[wk]). WN times
-//   the warps in flight a block at the same grid (the GB10-sized grid leaves a 188-SM card's SMs half empty). LD 1
-//   then stages through its own shared array (red's warp slices hold WN warps' sums).
-template <int NT, int W, int STEPS, int FUSE, bool XROW, int LD = 0, int PD = 1, int WN = 1>
-__global__ void __launch_bounds__(W * WN * 32) dec_kernel(
+template <int NT, int W, int STEPS, int FUSE, bool XROW, int LD = 0, int PD = 1>
+__global__ void __launch_bounds__(W * 32) dec_kernel(
     const half* __restrict__ X0, const half* __restrict__ X1, const uint32_t* __restrict__ T0,
     const uint32_t* __restrict__ T1, const int* __restrict__ items, const int* __restrict__ counts,
     const int* __restrict__ members, float* __restrict__ Z, int K, int N, int P, int SK, int E, int slots,
     const half* __restrict__ sv0, const half* __restrict__ sv1, const half* __restrict__ su2, void* __restrict__ out,
     float limit, int* __restrict__ done) {
     static_assert(FUSE == 0 || NT * 16 == 128, "a fused epilogue needs one 128-column Hadamard block a program");
-    static_assert(NT % WN == 0, "WN warps along N split the block's tiles evenly");
-    constexpr int NTW = NT / WN;                         // n tiles a warp
-    static_assert(LD == 0 || (NTW % 4 == 0 && PD >= 1 && STEPS % PD == 0), "LD 1: NT / WN a multiple of 4, PD | STEPS");
+    static_assert(LD == 0 || (NT % 4 == 0 && PD >= 1 && STEPS % PD == 0), "LD 1: NT a multiple of 4, PD | STEPS");
     const int item = blockIdx.x, nblock = blockIdx.y;
     int e, first, cnt;
     if constexpr (LD == 0) {
@@ -378,17 +371,14 @@ __global__ void __launch_bounds__(W * WN * 32) dec_kernel(
     const half* X = mat ? X1 : X0;
     const uint32_t* T = mat ? T1 : T0;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int wk = WN == 1 ? warp : warp % W, wn = WN == 1 ? 0 : warp / W;   // K warp, N warp
     const int g = lane >> 2, t = lane & 3;
     const int KT = K >> 4, NTILES = N >> 4;
 
     __shared__ int rows_sh[16];
     __shared__ __align__(16) float red[W][16][NT * 16];
-    // LD 1 with WN > 1: each warp's staging area (WN = 1 stages in red[warp], which only that warp writes)
-    __shared__ __align__(16) uint32_t stg[(LD == 1 && WN > 1) ? W * WN : 1][(LD == 1 && WN > 1) ? NTW * 32 : 4];
-    constexpr int NV = NTW / 4;                          // LD 1: 16-byte loads a lane a k step
-    uint4 rv[LD == 1 ? PD : 1][(LD == 1 && NV > 0) ? NV : 1];
-    const uint32_t* tbase = T + (((size_t)e * KT + split * (KT / SK) + wk * STEPS) * NTILES + nblock * NT + wn * NTW) * 32;
+    constexpr int NV = NT / 4;                           // LD 1: 16-byte loads a lane a k step
+    uint4 rv[LD == 1 ? PD : 1][LD == 1 ? NV : 1];
+    const uint32_t* tbase = T + (((size_t)e * KT + split * (KT / SK) + warp * STEPS) * NTILES + nblock * NT) * 32;
     const size_t kstep = (size_t)NTILES * 32;            // words from one k tile to the next
     if constexpr (LD == 1) {
 #pragma unroll
@@ -403,12 +393,12 @@ __global__ void __launch_bounds__(W * WN * 32) dec_kernel(
     const half* x0 = X + (size_t)xr0 * K + 2 * t;
     const half* x1 = X + (size_t)xr1 * K + 2 * t;
     const int nt0 = nblock * NT;
-    const int kt0 = split * (KT / SK) + wk * STEPS;
-    const uint32_t* tile = T + (((size_t)e * KT + kt0) * NTILES + nt0 + wn * NTW) * 32 + lane;
+    const int kt0 = split * (KT / SK) + warp * STEPS;
+    const uint32_t* tile = T + (((size_t)e * KT + kt0) * NTILES + nt0) * 32 + lane;
 
-    float acc[NTW][2][4];
+    float acc[NT][2][4];
 #pragma unroll
-    for (int i = 0; i < NTW; ++i)
+    for (int i = 0; i < NT; ++i)
 #pragma unroll
         for (int h = 0; h < 2; ++h)
 #pragma unroll
@@ -422,13 +412,13 @@ __global__ void __launch_bounds__(W * WN * 32) dec_kernel(
             ra[d][0] = load_pair(x0 + k, r0 >= 0); ra[d][1] = load_pair(x1 + k, r1 >= 0);
             ra[d][2] = load_pair(x0 + k + 8, r0 >= 0); ra[d][3] = load_pair(x1 + k + 8, r1 >= 0);
         }
-        uint32_t* stage = WN == 1 ? reinterpret_cast<uint32_t*>(&red[warp][0][0]) : &stg[warp][0];
+        uint32_t* stage = reinterpret_cast<uint32_t*>(&red[warp][0][0]);
         for (int kb = 0; kb < STEPS; kb += PD) {
 #pragma unroll
             for (int d = 0; d < PD; ++d) {
                 const int s = kb + d;
                 const bool more = s + PD < STEPS;
-                uint32_t a[4], words[NTW];
+                uint32_t a[4], words[NT];
 #pragma unroll
                 for (int c = 0; c < 4; ++c) a[c] = ra[d][c];
                 __syncwarp();                            // every lane has read the previous step back
@@ -444,9 +434,9 @@ __global__ void __launch_bounds__(W * WN * 32) dec_kernel(
                 }
                 __syncwarp();
 #pragma unroll
-                for (int i = 0; i < NTW; ++i) words[i] = stage[i * 32 + lane];
+                for (int i = 0; i < NT; ++i) words[i] = stage[i * 32 + lane];
 #pragma unroll
-                for (int i = 0; i < NTW; ++i) {
+                for (int i = 0; i < NT; ++i) {
                     uint32_t b0[2], b1[2];
                     decode_tile(words[i], lane, b0, b1);
                     mma16816(acc[i][0], a, b0);
@@ -457,27 +447,27 @@ __global__ void __launch_bounds__(W * WN * 32) dec_kernel(
         __syncwarp();                                    // the staging area becomes red[warp] below
     } else {
     // grouped_kernel's PF loop as it is (a runtime loop: unrolling it measured slower)
-    uint32_t words[NTW], a[4];
+    uint32_t words[NT], a[4];
 #pragma unroll
-    for (int i = 0; i < NTW; ++i) words[i] = __ldg(tile + i * 32);
+    for (int i = 0; i < NT; ++i) words[i] = __ldg(tile + i * 32);
     {
         const int k = kt0 * 16;
         a[0] = load_pair(x0 + k, r0 >= 0); a[1] = load_pair(x1 + k, r1 >= 0);
         a[2] = load_pair(x0 + k + 8, r0 >= 0); a[3] = load_pair(x1 + k + 8, r1 >= 0);
     }
     for (int kt = kt0; kt < kt0 + STEPS; ++kt) {
-        uint32_t nw[NTW], na[4];
+        uint32_t nw[NT], na[4];
         const bool more = kt + 1 < kt0 + STEPS;
         if (more) {
             const uint32_t* next = tile + (size_t)NTILES * 32;
 #pragma unroll
-            for (int i = 0; i < NTW; ++i) nw[i] = __ldg(next + i * 32);
+            for (int i = 0; i < NT; ++i) nw[i] = __ldg(next + i * 32);
             const int k = (kt + 1) * 16;
             na[0] = load_pair(x0 + k, r0 >= 0); na[1] = load_pair(x1 + k, r1 >= 0);
             na[2] = load_pair(x0 + k + 8, r0 >= 0); na[3] = load_pair(x1 + k + 8, r1 >= 0);
         }
 #pragma unroll
-        for (int i = 0; i < NTW; ++i) {
+        for (int i = 0; i < NT; ++i) {
             uint32_t b0[2], b1[2];
             decode_tile(words[i], lane, b0, b1);
             mma16816(acc[i][0], a, b0);
@@ -485,7 +475,7 @@ __global__ void __launch_bounds__(W * WN * 32) dec_kernel(
         }
         if (more) {
 #pragma unroll
-            for (int i = 0; i < NTW; ++i) words[i] = nw[i];
+            for (int i = 0; i < NT; ++i) words[i] = nw[i];
 #pragma unroll
             for (int c = 0; c < 4; ++c) a[c] = na[c];
         }
@@ -494,14 +484,14 @@ __global__ void __launch_bounds__(W * WN * 32) dec_kernel(
     }
 
 #pragma unroll
-    for (int i = 0; i < NTW; ++i)
+    for (int i = 0; i < NT; ++i)
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
-            const int col = (wn * NTW + i) * 16 + h * 8 + 2 * t;
-            red[wk][g][col] = acc[i][h][0];
-            red[wk][g][col + 1] = acc[i][h][1];
-            red[wk][g + 8][col] = acc[i][h][2];
-            red[wk][g + 8][col + 1] = acc[i][h][3];
+            const int col = i * 16 + h * 8 + 2 * t;
+            red[warp][g][col] = acc[i][h][0];
+            red[warp][g][col + 1] = acc[i][h][1];
+            red[warp][g + 8][col] = acc[i][h][2];
+            red[warp][g + 8][col + 1] = acc[i][h][3];
         }
     __syncthreads();
 
@@ -509,7 +499,7 @@ __global__ void __launch_bounds__(W * WN * 32) dec_kernel(
         // down_epilogue_kernel on this block's sums: v = 0 + (the warps' sums in warp order), rotated, times svh
         const half* svh_d = sv0;
         float* y = reinterpret_cast<float*>(out);
-        for (int i = warp; i < cnt; i += W * WN) {
+        for (int i = warp; i < cnt; i += W) {
             const int p = rows_sh[i];
             const int n = nt0 * 16 + 4 * lane;
             float v[4];
@@ -529,10 +519,10 @@ __global__ void __launch_bounds__(W * WN * 32) dec_kernel(
         }
         return;
     } else {
-        constexpr int OUT = 16 * NT * 16 / (W * WN * 32);
+        constexpr int OUT = 16 * NT * 16 / (W * 32);
 #pragma unroll
         for (int j = 0; j < OUT; ++j) {
-            const int idx = threadIdx.x + j * W * WN * 32;
+            const int idx = threadIdx.x + j * W * 32;
             const int row = idx / (NT * 16), col = idx % (NT * 16);
             const int r = rows_sh[row];
             float s = red[0][row][col];
@@ -556,7 +546,7 @@ __global__ void __launch_bounds__(W * WN * 32) dec_kernel(
             const half* svh_u = sv1;
             const half* suh_d = su2;
             half* xd = reinterpret_cast<half*>(out);
-            for (int i = warp; i < cnt; i += W * WN) {
+            for (int i = warp; i < cnt; i += W) {
                 const int p = rows_sh[i];
                 const int n = nt0 * 16 + 4 * lane;
                 float gv[4], uv[4];
@@ -1006,40 +996,31 @@ void exl3_dec_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor&
                    const at::Tensor& items, const at::Tensor& counts, const at::Tensor& members, at::Tensor& Z,
                    int64_t mats, int64_t K, int64_t N, int64_t P, int64_t SK, int64_t max_items, int64_t E,
                    int64_t slots, int64_t fuse, bool xrow, const at::Tensor& sv0, const at::Tensor& sv1,
-                       const at::Tensor& items, const at::Tensor& counts, const at::Tensor& members, at::Tensor& Z,
-                       int64_t mats, int64_t K, int64_t N, int64_t P, int64_t SK, int64_t max_items, int64_t E,
-                       int64_t slots, int64_t fuse, bool xrow, const at::Tensor& sv0, const at::Tensor& sv1,
-                       const at::Tensor& su2, at::Tensor& out, double limit, at::Tensor& done, int64_t ld,
-                       int64_t wn) {
-    constexpr int NT = 8, W = 4;
-    constexpr int PD4 = STEPS % 4 == 0 ? 4 : 2;
+                   const at::Tensor& su2, at::Tensor& out, double limit, at::Tensor& done, int64_t ld) {
+    constexpr int NT = 8, W = 4, STEPS = 16;
+    TORCH_CHECK(ld >= 0 && ld <= 3, "decode expert kernel: loads 0 (32-bit), 1 / 2 / 3 (16-byte, 1 / 2 / 4 steps ahead)");
+    TORCH_CHECK(K % (16 * SK * W) == 0 && K / (16 * SK * W) == STEPS && N % (16 * NT) == 0,
+                "decode expert kernel: 16 k steps a warp");
+    TORCH_CHECK(fuse != 1 || (SK == 1 && mats == 1), "the fused down epilogue takes one split of one matrix");
+    TORCH_CHECK(fuse != 2 || mats == 2, "the fused gate/up epilogue takes gate and up");
     dim3 grid((unsigned)max_items, (unsigned)(N / (16 * NT)), (unsigned)(mats * SK));
     auto stream = at::cuda::getCurrentCUDAStream();
     auto h = [](const at::Tensor& t) { return reinterpret_cast<const half*>(t.data_ptr()); };
     auto w = [](const at::Tensor& t) { return reinterpret_cast<const uint32_t*>(t.data_ptr()); };
-#define DEC1(F_, XR_, LD_, PD_, WN_)                                                                              \
-    dec_kernel<NT, W, STEPS, F_, XR_, LD_, PD_, WN_><<<grid, W * (WN_) * 32, 0, stream>>>(                        \
+#define DEC1(F_, XR_, LD_, PD_)                                                                                   \
+    dec_kernel<NT, W, STEPS, F_, XR_, LD_, PD_><<<grid, W * 32, 0, stream>>>(                                     \
         h(X0), h(X1), w(T0), w(T1), items.data_ptr<int>(), counts.data_ptr<int>(), members.data_ptr<int>(),       \
         Z.data_ptr<float>(), (int)K, (int)N, (int)P, (int)SK, (int)E, (int)slots, h(sv0), h(sv1), h(su2),         \
         out.data_ptr(), (float)limit, done.data_ptr<int>())
-#define DECW(F_, XR_, LD_, PD_)                                                                                   \
-    do { if (wn == 2) { DEC1(F_, XR_, LD_, PD_, 2); } else { DEC1(F_, XR_, LD_, PD_, 1); } } while (0)
 #define DEC(F_, XR_)                                                                                              \
-    do {                                                                                                          \
-        if (ld == 0) { if (wn == 4) { DEC1(F_, XR_, 0, 1, 4); } else { DECW(F_, XR_, 0, 1); } }                   \
-        else if (ld == 1) { DECW(F_, XR_, 1, 1); }                                                                \
-        else if (ld == 2) { DECW(F_, XR_, 1, 2); }                                                                \
-        else { DECW(F_, XR_, 1, PD4); }                                                                           \
-    } while (0)
-    if constexpr (STEPS == 16) {                     // every matrix: gate/up (fuse 0 / 2, xrow) and two ranks' down
-        if (fuse == 0) { if (xrow) { DEC(0, true); } else { DEC(0, false); } }
-        else if (fuse == 1) { if (xrow) { DEC(1, true); } else { DEC(1, false); } }
+    if (ld == 0) DEC1(F_, XR_, 0, 1);                                                                             \
+    else if (ld == 1) DEC1(F_, XR_, 1, 1);                                                                        \
+    else if (ld == 2) DEC1(F_, XR_, 1, 2);                                                                        \
     else DEC1(F_, XR_, 1, 4)
     if (fuse == 0) { if (xrow) { DEC(0, true); } else { DEC(0, false); } }
     else if (fuse == 1) { if (xrow) { DEC(1, true); } else { DEC(1, false); } }
     else { if (xrow) { DEC(2, true); } else { DEC(2, false); } }
 #undef DEC
-#undef DECW
 #undef DEC1
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -1049,23 +1030,8 @@ void exl3_dec_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor&
 template <int PM, int NW, int PS = PSTAGES>
 static void prompt_launch(const at::Tensor& Xg, const at::Tensor& Xu, const at::Tensor& Tg, const at::Tensor& Tu,
                           const at::Tensor& Td, const at::Tensor& items, const at::Tensor& counts,
-                   const at::Tensor& items, const at::Tensor& counts, const at::Tensor& members, at::Tensor& Z,
-                   int64_t mats, int64_t K, int64_t N, int64_t P, int64_t SK, int64_t max_items, int64_t E,
-                   int64_t slots, int64_t fuse, bool xrow, const at::Tensor& sv0, const at::Tensor& sv1,
-                   const at::Tensor& su2, at::Tensor& out, double limit, at::Tensor& done, int64_t ld, int64_t wn) {
-    constexpr int NT = 8, W = 4;
-    TORCH_CHECK(ld >= 0 && ld <= 3, "decode expert kernel: loads 0 (32-bit), 1 / 2 / 3 (16-byte, 1 / 2 / 4 steps ahead)");
-    TORCH_CHECK(wn == 1 || wn == 2 || (wn == 4 && ld == 0),
-                "decode expert kernel: 1 or 2 warps along N (4 with the 32-bit loads), not ", wn);
-    TORCH_CHECK(K % (16 * SK * W) == 0 && N % (16 * NT) == 0, "decode expert kernel: whole k steps a warp");
-    TORCH_CHECK(fuse != 1 || (SK == 1 && mats == 1), "the fused down epilogue takes one split of one matrix");
-    TORCH_CHECK(fuse != 2 || mats == 2, "the fused gate/up epilogue takes gate and up");
-    const int64_t steps = K / (16 * SK * W);
-#define ARGS X0, X1, T0, T1, items, counts, members, Z, mats, K, N, P, SK, max_items, E, slots, fuse, xrow, sv0, sv1, \
-             su2, out, limit, done, ld, wn
-    if (steps == 16) dec_launch<16>(ARGS);
-    else if (steps == 12) dec_launch<12>(ARGS);
-    else if (steps == 10) dec_launch<10>(ARGS);
+                          const at::Tensor& members, const at::Tensor& svh_g, const at::Tensor& svh_u,
+                          const at::Tensor& suh_d, const at::Tensor& svh_d, at::Tensor& xd, at::Tensor& y, int64_t D,
                           int64_t N, int64_t E, int64_t max_items, double limit, int64_t slots, bool shx,
                           const int* order) {
     constexpr size_t SMEM = prompt_smem<PM, 2, PS>(), SMEM_SHX = prompt_smem<PM, 1, PS>();

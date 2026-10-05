@@ -493,6 +493,16 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
             vd = torch.stack([rd.get(base + f"experts.{e}.down_proj.svh") for e in range(cfg.experts)]).to(dev)
             return x3.prepare_stacked(gt, ut, dt, sg, su, vg, vu, sd, vd, "mcg")
 
+        import os as _os
+        if _os.environ.get("TF_GLM_PAIR", "1") == "0":   # the original single universal object (regression mode)
+            def triples_all(proj):
+                return [(per[e][proj].to(dev),
+                         rd.get(base + f"experts.{e}.{proj}.suh").to(dev),
+                         rd.get(base + f"experts.{e}.{proj}.svh").to(dev)) for e in range(cfg.experts)]
+            print(f"[tensorfold] moe {p}: mixed trellis widths {sorted(widths)} - TF_GLM_PAIR=0, universal only",
+                  flush=True)
+            return x3.prepare(triples_all("gate_proj"), triples_all("up_proj"), triples_all("down_proj"),
+                              "mcg", device=dev)
         # mixed rates (MiaAi-Lab k3/k4 per-tensor): the width-64 experts stack into the tuned
         # kernels' object (exl3_mm), the rest keep the universal per-expert path; PairedExperts
         # (exl3_pair) runs a window over both (the fast group's writes and the slow group's are
@@ -515,21 +525,31 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
             ut = torch.stack([exl3_words(per[e]["up_proj"]) for e in wide]).to(dev)
             dt = torch.stack([exl3_words(per[e]["down_proj"]) for e in wide]).to(dev)
             D, I = per[wide[0]]["gate_proj"].shape[0] * 16, per[wide[0]]["gate_proj"].shape[1] * 16
+            def sentinel_row(t: torch.Tensor) -> torch.Tensor:
+                # the kernels index the scale rows by pick without a bound check (every non-last slot
+                # a valid id by design); a foreign-slot sentinel reads this extra harmless row
+                out = torch.empty((t.shape[0] + 1, *t.shape[1:]), dtype=t.dtype, device=t.device)
+                out[:t.shape[0]].copy_(t)
+                out[t.shape[0]].copy_(t[0])
+                return out
+
             fast = exl3_mm.Exl3Experts(gt=gt, ut=ut, dt=dt,
-                                       suh_g=scale_stack("gate_proj", "suh", wide),
-                                       suh_u=scale_stack("up_proj", "suh", wide),
-                                       svh_g=scale_stack("gate_proj", "svh", wide),
-                                       svh_u=scale_stack("up_proj", "svh", wide),
-                                       suh_d=scale_stack("down_proj", "suh", wide),
-                                       svh_d=scale_stack("down_proj", "svh", wide),
+                                       suh_g=sentinel_row(scale_stack("gate_proj", "suh", wide)),
+                                       suh_u=sentinel_row(scale_stack("up_proj", "suh", wide)),
+                                       svh_g=sentinel_row(scale_stack("gate_proj", "svh", wide)),
+                                       svh_u=sentinel_row(scale_stack("up_proj", "svh", wide)),
+                                       suh_d=sentinel_row(scale_stack("down_proj", "suh", wide)),
+                                       svh_d=sentinel_row(scale_stack("down_proj", "svh", wide)),
                                        count=len(wide), width=I, dims=D)
         slow = None
-        if narrow:
-            def triples(proj):
-                return [(per[e][proj].to(dev),
-                         rd.get(base + f"experts.{e}.{proj}.suh").to(dev),
-                         rd.get(base + f"experts.{e}.{proj}.svh").to(dev)) for e in narrow]
-            slow = x3.prepare(triples("gate_proj"), triples("up_proj"), triples("down_proj"), "mcg", device=dev)
+        if narrow:                    # the narrow experts' own copies (the wide bytes live in the stacked fast group)
+            def triples(ids):
+                return {proj: [(per[e][proj].to(dev),
+                                rd.get(base + f"experts.{e}.{proj}.suh").to(dev),
+                                rd.get(base + f"experts.{e}.{proj}.svh").to(dev)) for e in ids]
+                        for proj in projs}
+            t = triples(narrow)
+            slow = x3.prepare(t["gate_proj"], t["up_proj"], t["down_proj"], "mcg", device=dev)
 
         lut_fast = torch.full((cfg.experts + 1,), -1, dtype=torch.int32)
         lut_slow = torch.full((cfg.experts + 1,), -1, dtype=torch.int32)
