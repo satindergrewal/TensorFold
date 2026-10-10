@@ -67,7 +67,7 @@ fn runtime(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     return cuda;
 }
 
-fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, draft_ids: *std.Build.Module) struct { core: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, tokenizer: *std.Build.Module, heat: *std.Build.Module } {
+fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, draft_ids: *std.Build.Module) struct { core: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, glm: *std.Build.Module, tokenizer: *std.Build.Module, heat: *std.Build.Module } {
     const tokenizer = b.createModule(.{ .root_source_file = b.path("zig/src/core/tokenizer/tokenizer.zig"), .target = target, .optimize = optimize, .link_libc = true });
     const core = b.createModule(.{ .root_source_file = b.path("zig/src/core/root.zig"), .target = target, .optimize = optimize, .link_libc = true });
     core.addImport("tokenizer", tokenizer);
@@ -79,7 +79,10 @@ fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin
     nemotron.addImport("lanes", lanes);
     nemotron.addImport("heat", heat);
     nemotron.addImport("nemotron_draft_ids", draft_ids);
-    return .{ .core = core, .lanes = lanes, .nemotron = nemotron, .tokenizer = tokenizer, .heat = heat };
+    const glm = b.createModule(.{ .root_source_file = b.path("zig/src/families/glm/cuda.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    glm.addImport("cuda", cuda);
+    glm.addImport("core", core);
+    return .{ .core = core, .lanes = lanes, .nemotron = nemotron, .glm = glm, .tokenizer = tokenizer, .heat = heat };
 }
 
 /// Linux targets: fatbins (-Dnvcc builds them, -Dfatbins embeds prebuilt ones), `tensorfold` and `tf-cuda-test`.
@@ -116,6 +119,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     runner.addImport("cuda", cuda);
     runner.addImport("lanes", mods.lanes);
     runner.addImport("nemotron", mods.nemotron);
+    runner.addImport("glm", mods.glm);
     runner.addImport("core", mods.core);
     b.installArtifact(b.addExecutable(.{ .name = "tf-cuda-test", .root_module = runner }));
     nativeServer(b, target, optimize, cuda, mods.lanes, mods.nemotron, mods.tokenizer, build_options, true).root_module.strip = strip;
