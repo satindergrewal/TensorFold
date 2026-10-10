@@ -29,7 +29,8 @@ const kernels = [_]Kernel{
     .{ .name = "nemotron_mamba", .flags = glue },
     .{ .name = "nemotron_attention", .flags = glue },
     .{ .name = "nemotron_keyed", .flags = glue },
-    .{ .name = "fp8_lane", .flags = &.{"-O3"} }, // nvfp4/qmmf.cu's FP8G device code, tensorfold_nvfp4_v3
+    .{ .name = "fp8_lane", .flags = &.{"-O3"} }, // nvfp4/qmmf.cu
+    .{ .name = "exl3", .flags = &.{"-O3"} }, // ours: EXL3 trellis decode GEMM, mixed K3/K4's FP8G device code, tensorfold_nvfp4_v3
     .{ .name = "torch_argmax", .src = "torch_ops/argmax", .flags = torch_ops },
     .{ .name = "torch_topk", .src = "torch_ops/topk", .flags = torch_ops },
     .{ .name = "torch_pointwise", .src = "torch_ops/pointwise", .flags = torch_ops },
