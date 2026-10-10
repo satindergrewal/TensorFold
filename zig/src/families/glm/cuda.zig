@@ -5,8 +5,10 @@
 pub const Config = @import("config.zig").Config;
 pub const Kind = @import("config.zig").Kind;
 pub const weights = @import("cuda_weights.zig");
+pub const hc = @import("cuda_hc.zig");
 
 test {
     _ = Config;
     _ = weights;
+    _ = hc;
 }

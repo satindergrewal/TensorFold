@@ -16,6 +16,7 @@ const grouped_tests = @import("grouped_tests.zig");
 const fp8_tests = @import("fp8_tests.zig");
 const exl3_tests = @import("exl3_tests.zig");
 const glm_tests = @import("glm_tests.zig");
+const glm_hc_tests = @import("glm_hc_tests.zig");
 const carveout_tests = @import("carveout_tests.zig");
 
 const usage =
@@ -42,6 +43,7 @@ const usage =
     \\  fp8-lane <dir>            block-FP8 projections against the Python lane matmul's bytes (oracle/fp8_lane.py)
     \\  exl3 <dir>                EXL3 trellis kernels against core/exl3_format on the mixed checkpoint
     \\  glm-load <dir> [LO] [HI]   the GLM CUDA weights load and shape checks
+    \\  glm-hc                     the hyper-connection boundary kernels vs a scalar reference
     \\  carveout [MiB] [card]     GB10 display memory: round trips and bandwidth (SKIP without the card)
     \\
 ;
@@ -95,6 +97,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "fp8-lane")) return fp8_tests.lane(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "exl3")) return exl3_tests.run(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "glm-load")) return glm_tests.load(gpu, try arg(rest, 0), rest[1..]);
+    if (std.mem.eql(u8, cmd, "glm-hc")) return glm_hc_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "sample")) return sample_tests.draws(gpu);
     if (std.mem.eql(u8, cmd, "glue")) return glue_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "window-profile")) return window_profile.run(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2));
