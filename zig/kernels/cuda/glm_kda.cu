@@ -71,7 +71,7 @@ extern "C" __global__ void kda_step(const __nv_bfloat16* __restrict__ qkv, const
                                     float* __restrict st_out, __nv_bfloat16* __restrict y) {
     const int h = blockIdx.x;
     const int t = threadIdx.x; // the state row dv
-    __shared__ float sq[D], sk[D], red[32];
+    __shared__ float sq[D], skD[D], kvec[D], qvec[D], graw[D], red[8];
     float st[D];
     const float* sh = st_in + (size_t)h * D * D;
     for (int i = 0; i < D; ++i) st[i] = sh[(size_t)t * D + i];
@@ -81,45 +81,44 @@ extern "C" __global__ void kda_step(const __nv_bfloat16* __restrict__ qkv, const
     for (int r = 0; r < rows; ++r) {
         const size_t qb = (size_t)r * 3 * W + (size_t)h * D;
         // q, k, v: the conv'd sigmoid values
-        float vq = __bfloat162float(qkv[qb + t]);
-        float vk = __bfloat162float(qkv[qb + W + t]);
-        float vv = __bfloat162float(qkv[qb + 2 * W + t]);
-        // the gate from f_b's out and dtb; the L2 norms need all threads first
+        const float vq = __bfloat162float(qkv[qb + t]);
+        const float vk = __bfloat162float(qkv[qb + W + t]);
+        const float vv = __bfloat162float(qkv[qb + 2 * W + t]);
         const float sa = __bfloat162float(fg[(size_t)r * W + (size_t)h * D + t]);
-        const float av = bf(sa) + dtb[(size_t)h * D + t];
-        const float sg = expf(lb * sig_precise(a_h * av));
+        graw[t] = bf(sa); // the gate raw, bf as stored; dk-indexed in the state, dv in the out
         const float beta = sig_precise(__bfloat162float(bv[(size_t)r * H + h]));
 
-        sq[t] = vq; // the values; the norm squares them
-        sk[t] = vk;
+        // the L2 norms over the raw values; then everyone's normalized vector
+        sq[t] = vq;
+        skD[t] = vk;
         __syncthreads();
-        // the L2 norms: one thread sums the shared arrays (D=128, cheap and order-fixed)
         if (t == 0) {
             float pq2 = 0.0f, pk2 = 0.0f;
             for (int i = 0; i < D; ++i) {
                 pq2 = fmaf(sq[i], sq[i], pq2);
-                pk2 = fmaf(sk[i], sk[i], pk2);
+                pk2 = fmaf(skD[i], skD[i], pk2);
             }
             red[0] = rsqrtf(pq2 + 1e-6f);
             red[1] = rsqrtf(pk2 + 1e-6f);
         }
         __syncthreads();
         const float rq = red[0], rk = red[1];
-        const float q = bf((vq * rq) * qscale);
-        const float k = bf(vk * rk);
+        qvec[t] = bf((vq * rq) * qscale); // the dk-shared q, k
+        kvec[t] = bf(vk * rk);
+        __syncthreads();
 
-        // the state row update, the out: this thread's dv
+        // this dv's state row: the dk gate, the key dot, the delta, the out
         float kv = 0.0f, oo = 0.0f;
         for (int i = 0; i < D; ++i) {
-            st[i] *= sg;
-            kv = fmaf(st[i], k, kv);
+            const float g = expf(lb * sig_precise(a_h * (graw[i] + dtb[(size_t)h * D + i])));
+            st[i] *= g;
+            kv = fmaf(st[i], kvec[i], kv);
         }
         const float delta = (vv - kv) * beta;
         for (int i = 0; i < D; ++i) {
-            st[i] = fmaf(k, delta, st[i]);
-            oo = fmaf(st[i], q, oo);
+            st[i] = fmaf(kvec[i], delta, st[i]);
+            oo = fmaf(st[i], qvec[i], oo);
         }
-        // the out norm needs all sy: two-pass via shared
         __shared__ float syv[D];
         syv[t] = bf(oo);
         __syncthreads();
@@ -140,7 +139,7 @@ extern "C" __global__ void kda_step(const __nv_bfloat16* __restrict__ qkv, const
             __syncthreads();
             pon = red[2];
         }
-        const float gate = sig_precise(bf(__bfloat162float(fg[(size_t)r * W + W + (size_t)h * D + t])));
+        const float gate = sig_precise(graw[t]); // the dv gate: the bf raw's sigmoid
         float x = syv[t] * pon;
         x = __bfloat162float(onw[(size_t)h * D + t]) * x;
         x *= gate;
