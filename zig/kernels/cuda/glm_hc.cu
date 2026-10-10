@@ -36,9 +36,6 @@ extern "C" __global__ void hc_expand_mix(
     const int j = blockIdx.x;
     const int r = blockIdx.y;
     const int t = threadIdx.x;
-    __shared__ float red[PARTS];
-    if (t < PARTS) red[t] = 0.0f;
-    __syncthreads();
 
     const size_t rb = (size_t)r * F;
     const float* c = comb + (size_t)r * S * S;
@@ -62,10 +59,27 @@ extern "C" __global__ void hc_expand_mix(
         for (int m = 0; m < MIX; ++m)
             pm[m] = fmaf(__bfloat162float(fn[(size_t)m * F + f]), v, pm[m]);
     }
-    for (int m = 0; m < MIX; ++m) atomicAdd(&red[m], pm[m]);
-    atomicAdd(&red[MIX], ss);
-    __syncthreads();
-    if (t < PARTS) part[((size_t)r * SLICES + j) * PARTS + t] = red[t];
+    // deterministic fixed-order reduce: warp shuffle down, then warps in index order
+    {
+        const int lane = t & 31, warp = t >> 5;
+        #pragma unroll
+        for (int m = 0; m < MIX; ++m)
+            for (int off = 16; off > 0; off >>= 1) pm[m] += __shfl_down_sync(0xffffffff, pm[m], off);
+        for (int off = 16; off > 0; off >>= 1) ss += __shfl_down_sync(0xffffffff, ss, off);
+        __shared__ float wred[8][PARTS];
+        if (lane == 0) {
+            #pragma unroll
+            for (int m = 0; m < MIX; ++m) wred[warp][m] = pm[m];
+            wred[warp][MIX] = ss;
+        }
+        __syncthreads();
+        if (t < PARTS) {
+            float v = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < 8; ++w) v += wred[w][t];
+            part[((size_t)r * SLICES + j) * PARTS + t] = v;
+        }
+    }
 }
 
 // ─── split: the slices' sums, the mixes' norm, pre/post z's, the comb's

@@ -14,6 +14,7 @@ pub const Kernels = struct {
         var k: Kernels = .{ .mod = mod, .attn_fn = undefined };
         errdefer k.deinit();
         k.attn_fn = try mod.function("dsa_attention");
+        try k.attn_fn.allowDynamicShared(32 * 512 * 4);
         return k;
     }
 
@@ -30,6 +31,6 @@ pub const Kernels = struct {
         a.add(meta);
         a.add(out);
         a.add(@as(i32, @intCast(heads)));
-        try cuda.launch.launch(k.attn_fn, .{ .grid = .{ .y = @intCast(rows * heads) }, .block = .{ .x = 1024 } }, s, &a);
+        try cuda.launch.launch(k.attn_fn, .{ .grid = .{ .y = @intCast(rows * heads) }, .block = .{ .x = 1024 }, .shared = 32 * 512 * 4 }, s, &a);
     }
 };

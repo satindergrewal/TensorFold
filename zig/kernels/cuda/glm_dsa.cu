@@ -57,8 +57,6 @@ extern "C" __global__ void dsa_attention(
 
     __shared__ float sm[WARPS];
     __shared__ float sl[WARPS];
-    __shared__ float acc[HDIM]; // the merged numerator, atomic-added
-    __shared__ float lsum;      // the merged denominator
 
     // this lane's 16 q dims, pre-scaled
     float qr[VPC];
@@ -97,24 +95,35 @@ extern "C" __global__ void dsa_attention(
             for (int j = 0; j < VPC; ++j) o[j] *= factor;
         }
     }
-    if (threadIdx.x == 0) lsum = 0.0f;
-    for (int d = threadIdx.x; d < HDIM; d += blockDim.x) acc[d] = 0.0f;
     sl[warp] = l;
     sm[warp] = m;
     __syncthreads();
 
-    // the block's M, then each warp rescales its own partial and adds in
+    // the block's M, then a FIXED-ORDER merge: warp w writes its plane, one
+    // warp sums the planes in warp order (no atomics: bit-reproducible)
     float M = -3.402823466e38f;
     for (int d2 = threadIdx.x; d2 < WARPS; d2 += blockDim.x) M = fmaxf(M, sm[d2]);
     M = block_max(M);
     const float fac = __expf(sm[warp] - M);
     __syncthreads();
-    for (int j = 0; j < VPC; ++j) atomicAdd(&acc[lane * VPC + j], o[j] * fac);
-    if (lane == 0) atomicAdd(&lsum, l * fac);
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        const float inv = lsum == 0.0f ? 0.0f : 1.0f / lsum;
-        for (int d2 = 0; d2 < HDIM; ++d2) out[(size_t)gid * HDIM + d2] = __float2bfloat16(acc[d2] * inv);
+    {
+        extern __shared__ float plane[]; // [WARPS][HDIM] dynamic
+        float* mine = plane + (size_t)warp * HDIM;
+        for (int j = 0; j < VPC; ++j) mine[lane * VPC + j] = o[j] * fac;
+        if (lane == 0) sl[warp] = l * fac; // reuse as the plane's l sum
+        __syncthreads();
+        if (warp == 0) {
+            float ls = 0.0f;
+            #pragma unroll 8
+            for (int w2 = 0; w2 < WARPS; ++w2) ls += sl[w2];
+            const float inv = ls == 0.0f ? 0.0f : 1.0f / ls;
+            for (int d2 = 0; d2 < HDIM; ++d2) {
+                float v = 0.0f;
+                #pragma unroll 8
+                for (int w2 = 0; w2 < WARPS; ++w2) v += plane[(size_t)w2 * HDIM + d2];
+                out[(size_t)gid * HDIM + d2] = __float2bfloat16(v * inv);
+            }
+        }
     }
 }
 

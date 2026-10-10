@@ -110,24 +110,32 @@ fn runSplit(gpu: Gpu, dir: []const u8, split_at: usize) !void {
     try ea.forward(&ids, rows);
     try ea.stream.synchronize();
     // the handoff state through the host: x (both planes), branch, post, comb
+    // download the handoff under A's context BEFORE B's context becomes current
+    const Handoff = struct { x0: []u8, x1: []u8, branch: []u8, post: []u8, comb: []u8 };
+    var ho: Handoff = undefined;
+    ho.x0 = try check.download(gpu, ea.x[0]);
+    ho.x1 = try check.download(gpu, ea.x[1]);
+    ho.branch = try check.download(gpu, ea.branch);
+    ho.post = try check.download(gpu, ea.post);
+    ho.comb = try check.download(gpu, ea.comb);
+    const xi_hand = ea.xi;
     var ctx1 = try cuda.Context.init(gpu.d, 1);
     defer ctx1.deinit();
     var eb = try glm.engine.Engine.init(a, gpu.io, gpu.d, dir, .{ .blocks_lo = split_at, .blocks_hi = 45, .cont = true });
     defer eb.deinit();
-    // stage: download under A's context, upload under B's
-    const parts = [_]struct { src: cuda.DeviceBuffer, dst: *cuda.DeviceBuffer, name: []const u8 }{
-        .{ .src = ea.x[0], .dst = &eb.x[0], .name = "x0" },
-        .{ .src = ea.x[1], .dst = &eb.x[1], .name = "x1" },
-        .{ .src = ea.branch, .dst = &eb.branch, .name = "branch" },
-        .{ .src = ea.post, .dst = &eb.post, .name = "post" },
-        .{ .src = ea.comb, .dst = &eb.comb, .name = "comb" },
-    };
-    for (parts) |pt| {
-        const bytes = try check.download(gpu, pt.src);
-        defer a.free(bytes);
-        try pt.dst.upload(0, bytes);
+    try eb.x[0].upload(0, ho.x0);
+    try eb.x[1].upload(0, ho.x1);
+    try eb.branch.upload(0, ho.branch);
+    try eb.post.upload(0, ho.post);
+    try eb.comb.upload(0, ho.comb);
+    defer {
+        a.free(ho.x0);
+        a.free(ho.x1);
+        a.free(ho.branch);
+        a.free(ho.post);
+        a.free(ho.comb);
     }
-    eb.xi = ea.xi;
+    eb.xi = xi_hand;
     try eb.forward(&ids, rows);
     try eb.stream.synchronize();
     const lg = try check.download(gpu, eb.logits);
@@ -148,5 +156,19 @@ fn runSplit(gpu: Gpu, dir: []const u8, split_at: usize) !void {
     defer a.free(pk);
     const pv = std.mem.bytesAsSlice(u32, @as([]align(1) u8, pk));
     check.pass("glm fwd SPLIT 0..{d}..46: sum {d:.1} max {d:.2} at {d}; picks {d},{d},{d},{d}", .{ split_at, sum, mx, mx_at, pv[0], pv[1], pv[2], pv[3] });
+    {
+        // deterministic-fingerprint: active rows' first 4 logits + row sums
+        var ir: usize = 0;
+        while (ir < rows) : (ir += 1) {
+            var rs: f64 = 0;
+            var jr: usize = 0;
+            while (jr < eb.c.vocab) : (jr += 1) {
+                const h2: u16 = std.mem.readInt(u16, lg[(ir * eb.c.vocab + jr) * 2 ..][0..2], .little);
+                rs += @as(f32, @bitCast(@as(u32, h2) << 16));
+            }
+            const f0: u16 = std.mem.readInt(u16, lg[(ir * eb.c.vocab) * 2 ..][0..2], .little);
+            std.debug.print("  split row{d}: first {d:.3} rowsum {d:.1}" ++ "\n", .{ ir, @as(f32, @bitCast(@as(u32, f0) << 16)), rs });
+        }
+    }
     _ = ea.deinit();
 }
