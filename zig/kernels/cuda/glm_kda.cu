@@ -57,7 +57,7 @@ extern "C" __global__ void kda_conv(const __nv_bfloat16* __restrict__ p, int ps,
         acc = fmaf(xv, __bfloat162float(cw[(size_t)j * 3 * W + i]), acc);
     }
     const float xb = bf(acc);
-    qkv[(size_t)r * 3 * W + i] = __float2bfloat16(xb * bf(xb * sig_precise(xb)));
+    qkv[(size_t)r * 3 * W + i] = __float2bfloat16(xb * bf(sig_precise(xb))); // silu: the sigmoid rounded, then the bf16 product
 }
 
 // The recurrent step over the whole window; grid H, block D (a state row each).
@@ -84,7 +84,7 @@ extern "C" __global__ void kda_step(const __nv_bfloat16* __restrict__ qkv, const
         const float vq = __bfloat162float(qkv[qb + t]);
         const float vk = __bfloat162float(qkv[qb + W + t]);
         const float vv = __bfloat162float(qkv[qb + 2 * W + t]);
-        const float sa = __bfloat162float(fg[(size_t)r * W + (size_t)h * D + t]);
+        const float sa = __bfloat162float(fg[(size_t)r * 2 * W + (size_t)h * D + t]);
         graw[t] = bf(sa); // the gate raw, bf as stored; dk-indexed in the state, dv in the out
         const float beta = sig_precise(__bfloat162float(bv[(size_t)r * H + h]));
 
@@ -122,24 +122,11 @@ extern "C" __global__ void kda_step(const __nv_bfloat16* __restrict__ qkv, const
         __shared__ float syv[D];
         syv[t] = bf(oo);
         __syncthreads();
+        // every thread sums the whole array: identical, no reduce needed
         float po = 0.0f;
         for (int i = 0; i < D; ++i) po = fmaf(syv[i], syv[i], po);
-        // block reduce po
-        float pon;
-        {
-            const int lane = t & 31, warp = t >> 5;
-            for (int off = 16; off > 0; off >>= 1) po += __shfl_down_sync(0xffffffff, po, off);
-            if (lane == 0) red[2 + warp] = po;
-            __syncthreads();
-            if (t == 0) {
-                float a2 = 0.0f;
-                for (int w_ = 0; w_ < 4; ++w_) a2 += red[2 + w_];
-                red[2] = rsqrtf(a2 / (float)D + eps);
-            }
-            __syncthreads();
-            pon = red[2];
-        }
-        const float gate = sig_precise(__bfloat162float(fg[(size_t)r * W + W + (size_t)h * D + t])); // g_b's, dv-indexed
+        const float pon = rsqrtf(po / (float)D + eps);
+        const float gate = sig_precise(__bfloat162float(fg[(size_t)r * 2 * W + W + (size_t)h * D + t])); // g_b's, dv-indexed
         float x = syv[t] * pon;
         x = __bfloat162float(onw[(size_t)h * D + t]) * x;
         x *= gate;
