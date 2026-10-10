@@ -66,7 +66,7 @@ extern "C" __global__ void dsa_attention(
     #pragma unroll
     for (int j = 0; j < VPC; ++j) qr[j] = scale[0] * __bfloat162float(qp[j]);
 
-    float m = -INFINITY, l = 0.0f, o[VPC];
+    float m = -3.402823466e38f, l = 0.0f, o[VPC]; // finite: all-invalid warps keep expf(0)
     #pragma unroll
     for (int j = 0; j < VPC; ++j) o[j] = 0.0f;
 
@@ -104,7 +104,7 @@ extern "C" __global__ void dsa_attention(
     __syncthreads();
 
     // the block's M, then each warp rescales its own partial and adds in
-    float M= -INFINITY;
+    float M = -3.402823466e38f;
     for (int d2 = threadIdx.x; d2 < WARPS; d2 += blockDim.x) M = fmaxf(M, sm[d2]);
     M = block_max(M);
     const float fac = __expf(sm[warp] - M);

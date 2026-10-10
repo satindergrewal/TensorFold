@@ -19,7 +19,7 @@ constexpr int KPOOL = 4;
 // block per thread, dots over 128 dims in fp32 from bf16.
 extern "C" __global__ void index_scores(const __nv_bfloat16* __restrict__ q_i, // [rows, q_stride] at the indexer offset
                                         int q_stride,
-                                        const float* __restrict__ iw, // [rows, HEADS]
+                                        const __nv_bfloat16* __restrict__ iw, // [rows, heads] bf16
                                         const __nv_bfloat16* __restrict__ pool, // [pool_rows, DIM]
                                         float* __restrict__ scores, // [rows, s_stride]
                                         int s_stride, int rows, int p0, int heads) {
@@ -35,7 +35,7 @@ extern "C" __global__ void index_scores(const __nv_bfloat16* __restrict__ q_i, /
         const __nv_bfloat16* qh = qr + (size_t)h * DIM;
         float dot = 0.0f;
         for (int d = 0; d < DIM; ++d) dot = fmaf(__bfloat162float(qh[d]), __bfloat162float(pr[d]), dot);
-        total = fmaf(iw[(size_t)row * heads + h], fmaxf(dot, 0.0f), total);
+        total = fmaf(__bfloat162float(iw[(size_t)row * heads + h]), fmaxf(dot, 0.0f), total);
     }
     scores[(size_t)row * s_stride + blk] = total;
 }

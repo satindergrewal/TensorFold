@@ -242,4 +242,90 @@ extern "C" __global__ void glm_gather(const __nv_bfloat16* __restrict__ src, __n
     if (i < n) dst[i] = src[(size_t)i * src_stride];
 }
 
+// LayerNorm with weight and bias (the indexer's k_norm): rows x width, eps.
+// grid rows, block 256 x 8.
+extern "C" __global__ void glm_layer_norm(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ w,
+                                          const __nv_bfloat16* __restrict__ b, __nv_bfloat16* __restrict__ y,
+                                          int width, int x_stride, int y_stride, float eps) {
+    const int r = blockIdx.x;
+    const int t = threadIdx.x;
+    __shared__ float red[2][8];
+    float mean_acc = 0.0f, var_acc = 0.0f;
+    const int base = t * 8;
+    for (int j = 0; j < 8; ++j) {
+        const int c = base + j;
+        if (c >= width) break;
+        const float v = __bfloat162float(x[(size_t)r * x_stride + c]);
+        mean_acc += v;
+        var_acc = fmaf(v, v, var_acc);
+    }
+    // block reduce both (each thread holds partials; a tree over shared)
+    __shared__ float means[32], vars[32];
+    {
+        const int lane = t & 31, warp = t >> 5;
+        for (int off = 16; off > 0; off >>= 1) {
+            mean_acc += __shfl_down_sync(0xffffffff, mean_acc, off);
+            var_acc += __shfl_down_sync(0xffffffff, var_acc, off);
+        }
+        if (lane == 0) {
+            means[warp] = mean_acc;
+            vars[warp] = var_acc;
+        }
+    }
+    __syncthreads();
+    if (t == 0) {
+        float m = 0, v2 = 0;
+        const int warps = (blockDim.x + 31) / 32;
+        for (int i = 0; i < warps; ++i) {
+            m += means[i];
+            v2 += vars[i];
+        }
+        red[0][0] = m / (float)width;
+        red[1][0] = rsqrtf(v2 / (float)width - (m / (float)width) * (m / (float)width) + eps);
+    }
+    __syncthreads();
+    const float mean = red[0][0], inv = red[1][0];
+    for (int j = 0; j < 8; ++j) {
+        const int c = base + j;
+        if (c >= width) break;
+        const float v = __bfloat162float(x[(size_t)r * x_stride + c]);
+        y[(size_t)r * y_stride + c] = __float2bfloat16(bf((v - mean) * inv) * __bfloat162float(w[c]) + __bfloat162float(b[c]));
+    }
+    (void)red;
+}
+
+// The pooled indexer keys: pool[blk, d] = sum_j softmax(ig + ape)[j] * ik[j] over
+// the kpool of 4; precise exp, each op rounded as the metal's glm_pool.
+// grid (128, blocks).
+extern "C" __global__ void glm_pool(const __nv_bfloat16* __restrict__ ik, const __nv_bfloat16* __restrict__ ig,
+                                    const __nv_bfloat16* __restrict__ ape, __nv_bfloat16* __restrict__ pool,
+                                    int first_blk, int n_blocks) {
+    const int d = blockIdx.x; // the 128 dims
+    const int blk = first_blk + blockIdx.y;
+    if (blockIdx.y >= n_blocks) return;
+    float logit[4], k[4];
+    for (int j = 0; j < 4; ++j) {
+        const size_t at = (size_t)(blk * 4 + j) * 128 + d;
+        logit[j] = __bfloat162float(ig[at]) + __bfloat162float(ape[j * 128 + d]);
+        k[j] = __bfloat162float(ik[at]);
+    }
+    float top = logit[0];
+    for (int j = 1; j < 4; ++j) top = fmaxf(top, logit[j]);
+    float e[4], total = 0.0f;
+    for (int j = 0; j < 4; ++j) {
+        e[j] = expf(logit[j] - top);
+        total = total + e[j];
+    }
+    float out = (e[0] / total) * k[0];
+    for (int j = 1; j < 4; ++j) out = out + (e[j] / total) * k[j];
+    pool[(size_t)blk * 128 + d] = __float2bfloat16(out);
+}
+
+// dst[i] = bf16(src[i] * s) over n elements.
+extern "C" __global__ void glm_scale(const __nv_bfloat16* __restrict__ src, __nv_bfloat16* __restrict__ dst,
+                                     int n, float s) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __float2bfloat16(__bfloat162float(src[i]) * s);
+}
+
 } // namespace tf_glm_ops

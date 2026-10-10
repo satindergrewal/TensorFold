@@ -45,6 +45,11 @@ pub fn run(gpu: Gpu, dir: []const u8, rest: []const [:0]const u8) !void {
             .{ .name = "y", .b = e.y }, .{ .name = "qkv", .b = e.qkv },
             .{ .name = "fg", .b = e.fg }, .{ .name = "mlp_act", .b = e.mlp_act },
             .{ .name = "post", .b = e.post }, .{ .name = "comb", .b = e.comb },
+            .{ .name = "mla_ql", .b = e.mla_ql }, .{ .name = "mla_att", .b = e.mla_att },
+            .{ .name = "mla_keys", .b = e.mla_keys }, .{ .name = "mla_vals", .b = e.mla_vals },
+            .{ .name = "mla_qp", .b = e.mla_qp }, .{ .name = "mla_xp", .b = e.mla_xp },
+            .{ .name = "mla_ik", .b = e.mla_ik }, .{ .name = "mla_pool", .b = e.mla_pool },
+            .{ .name = "mla_iw", .b = e.mla_iw },
         };
         for (bufs) |bb| {
             const bytes = try check.download(gpu, bb.b);

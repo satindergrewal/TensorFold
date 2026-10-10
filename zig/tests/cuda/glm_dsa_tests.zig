@@ -143,9 +143,9 @@ pub fn run(gpu: Gpu) !void {
         const qi = try a.alloc(u16, ROWS * HEADS * 128);
         defer a.free(qi);
         for (qi) |*v| v.* = bf16Bits(rand());
-        const iw = try a.alloc(f32, ROWS * HEADS);
+        const iw = try a.alloc(u16, ROWS * HEADS);
         defer a.free(iw);
-        for (iw) |*v| v.* = rand();
+        for (iw) |*v| v.* = bf16Bits(rand());
         const pool = try a.alloc(u16, blocks * 128);
         defer a.free(pool);
         for (pool) |*v| v.* = bf16Bits(rand());
@@ -185,7 +185,7 @@ pub fn run(gpu: Gpu) !void {
                 for (0..HEADS) |h| {
                     var dot: f64 = 0;
                     for (0..128) |d| dot += fromBf(qi[r * HEADS * 128 + h * 128 + d]) * fromBf(pool[b * 128 + d]);
-                    total = @mulAdd(f32, iw[r * HEADS + h], @max(@as(f32, @floatCast(dot)), 0.0), total);
+                    total = @mulAdd(f32, @as(f32, @floatCast(fromBf(iw[r * HEADS + h]))), @max(@as(f32, @floatCast(dot)), 0.0), total);
                 }
                 if (@abs(sv[r * blocks + b] - total) > 2e-2) {
                     std.debug.print("FAIL idx score r{d} b{d}: {d:.4} vs {d:.4}\n", .{ r, b, sv[r * blocks + b], total });

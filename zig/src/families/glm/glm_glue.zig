@@ -23,6 +23,9 @@ pub const Ops = struct {
     route_fn: cuda.Function,
     copy2d_fn: cuda.Function,
     gather_fn: cuda.Function,
+    layer_norm_fn: cuda.Function,
+    pool_fn: cuda.Function,
+    scale_fn: cuda.Function,
     lt: Library,
 
     pub fn load(d: *const cuda.Driver) !Ops {
@@ -41,6 +44,9 @@ pub const Ops = struct {
             .route_fn = undefined,
             .copy2d_fn = undefined,
             .gather_fn = undefined,
+            .layer_norm_fn = undefined,
+            .pool_fn = undefined,
+            .scale_fn = undefined,
             .lt = undefined,
         };
         errdefer o.unload();
@@ -54,6 +60,9 @@ pub const Ops = struct {
         o.route_fn = try mod.function("glm_route");
         o.copy2d_fn = try mod.function("glm_copy2d");
         o.gather_fn = try mod.function("glm_gather");
+        o.layer_norm_fn = try mod.function("glm_layer_norm");
+        o.pool_fn = try mod.function("glm_pool");
+        o.scale_fn = try mod.function("glm_scale");
         o.lt = try Library.open();
         return o;
     }
@@ -155,6 +164,39 @@ pub const Ops = struct {
         a.add(i(n));
         a.add(i(src_stride));
         try cuda.launch.launch(o.gather_fn, .{ .grid = .{ .x = @intCast((n + 255) / 256) }, .block = .{ .x = 256 } }, s, &a);
+    }
+
+    pub fn layerNorm(o: *const Ops, s: cuda.Stream, x: u64, w: u64, b: u64, y: u64, rows: usize, width: usize, x_stride: usize, y_stride: usize, eps: f32) !void {
+        var a: cuda.Args = .{};
+        a.add(x);
+        a.add(w);
+        a.add(b);
+        a.add(y);
+        a.add(i(width));
+        a.add(i(x_stride));
+        a.add(i(y_stride));
+        a.add(eps);
+        try cuda.launch.launch(o.layer_norm_fn, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 } }, s, &a);
+    }
+
+    pub fn pool(o: *const Ops, s: cuda.Stream, ik: u64, ig: u64, ape: u64, out: u64, first_blk: usize, n_blocks: usize) !void {
+        var a: cuda.Args = .{};
+        a.add(ik);
+        a.add(ig);
+        a.add(ape);
+        a.add(out);
+        a.add(i(first_blk));
+        a.add(i(n_blocks));
+        try cuda.launch.launch(o.pool_fn, .{ .grid = .{ .x = 128, .y = @intCast(n_blocks) }, .block = .{ .x = 1 } }, s, &a);
+    }
+
+    pub fn scaleBy(o: *const Ops, s: cuda.Stream, src: u64, dst: u64, n: usize, factor: f32) !void {
+        var a: cuda.Args = .{};
+        a.add(src);
+        a.add(dst);
+        a.add(i(n));
+        a.add(factor);
+        try cuda.launch.launch(o.scale_fn, .{ .grid = .{ .x = @intCast((n + 255) / 256) }, .block = .{ .x = 256 } }, s, &a);
     }
 
     pub fn route(o: *const Ops, s: cuda.Stream, logits: u64, bias: u64, pick: u64, wts: u64, rows: usize, experts: usize, topk: usize, scale: f32) !void {

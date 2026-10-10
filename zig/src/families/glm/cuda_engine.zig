@@ -18,7 +18,10 @@ pub const Options = struct {
     blocks_lo: usize = 0,
     blocks_hi: usize = 1 << 16,
     context: usize = 4096, // the KV caches' capacity
-    skip_mla: bool = false, // bring-up: attention passes through with a zero branch
+    skip_mla: bool = false,
+    dsa: ?@import("dsa.zig").Kernels = null,
+    index: ?@import("index.zig").Kernels = null,
+// bring-up: attention passes through with a zero branch
 };
 
 /// One GEMM shape's plan + the shared workspace.
@@ -45,6 +48,23 @@ const Gemms = struct {
         g.map.deinit();
         g.ws.free();
         g.lt.close();
+    }
+
+    /// D . W^T with independent row strides (bytes) for x, W and out.
+    fn mmStrided(g: *Gemms, s: cuda.Stream, x: u64, xs: usize, w: u64, ws_: usize, out: u64, os: usize, rows: usize, n: usize, k: usize) !void {
+        // a dedicated Linear per stride combo
+        const id = key(rows | (xs << 8), n, k, false) ^ (ws_ << 20) ^ (os << 26);
+        const gop = try g.map.getOrPut(id);
+        if (!gop.found_existing) {
+            // build with custom layouts (the shared init hardcodes ld=k)
+            var lin: cuda.cublaslt.Linear = undefined;
+            lin = try cuda.cublaslt.Linear.initStrided(&g.lt, rows, n, k, .bf16, 64 << 20, xs / 2, ws_ / 2, os / 2);
+            gop.value_ptr.* = lin;
+        }
+        gop.value_ptr.run(x, w, out, g.ws.ptr, g.ws.len, s.handle) catch |err| {
+            std.debug.print("mmS FAIL rows={d} n={d} k={d}" ++ "\n", .{ rows, n, k });
+            return err;
+        };
     }
 
     /// D[rows, n] bf16 (or fp32) = X[rows, k] . W[n, k]^T.
@@ -104,10 +124,30 @@ pub const Engine = struct {
     moe_ye: cuda.DeviceBuffer,
     moe_gu: cuda.DeviceBuffer,
     moe_act: cuda.DeviceBuffer,
+    // MLA: per-layer caches sized by context
+    mla_keys: cuda.DeviceBuffer,
+    mla_ik: cuda.DeviceBuffer,
+    mla_ig: cuda.DeviceBuffer,
+    mla_pool: cuda.DeviceBuffer,
+    mla_iw: cuda.DeviceBuffer,
+    mla_xp: cuda.DeviceBuffer,
+    mla_qr: cuda.DeviceBuffer,
+    mla_qp: cuda.DeviceBuffer,
+    mla_ql: cuda.DeviceBuffer,
+    mla_att: cuda.DeviceBuffer,
+    mla_vals: cuda.DeviceBuffer,
+    mla_scores: cuda.DeviceBuffer,
+    mla_idx: cuda.DeviceBuffer,
+    mla_scale: cuda.DeviceBuffer,
+    mla_scratch_ikraw: cuda.DeviceBuffer,
+    mla_klen: cuda.DeviceBuffer,
     mlp_tmp: cuda.DeviceBuffer, // [rows, 2*dense_inter] bf16
     mlp_act: cuda.DeviceBuffer, // [rows, dense_inter] bf16
     scratch: cuda.DeviceBuffer, // exl3/experts scratch
     skip_mla: bool = false,
+    dsa: ?@import("dsa.zig").Kernels = null,
+    index: ?@import("index.zig").Kernels = null,
+    context: usize = 4096,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, dir: []const u8, opts: Options) !*Engine {
         const e = try gpa.create(Engine);
@@ -159,10 +199,27 @@ pub const Engine = struct {
             .moe_ye = undefined,
             .moe_gu = undefined,
             .moe_act = undefined,
+            .mla_keys = undefined,
+            .mla_ik = undefined,
+            .mla_ig = undefined,
+            .mla_pool = undefined,
+            .mla_iw = undefined,
+            .mla_xp = undefined,
+            .mla_qr = undefined,
+            .mla_qp = undefined,
+            .mla_ql = undefined,
+            .mla_att = undefined,
+            .mla_vals = undefined,
+            .mla_scores = undefined,
+            .mla_idx = undefined,
+            .mla_scale = undefined,
+            .mla_scratch_ikraw = undefined,
+            .mla_klen = undefined,
             .mlp_tmp = undefined,
             .mlp_act = undefined,
             .scratch = undefined,
             .skip_mla = opts.skip_mla,
+            .context = opts.context,
         };
         e.stream = try cuda.Stream.init(d, true);
         errdefer e.stream.deinit();
@@ -170,6 +227,8 @@ pub const Engine = struct {
         e.hck = try hc.Kernels.load(d);
         e.ops = try glue.Ops.load(d);
         e.kdk = try kda.Kernels.load(d);
+        e.dsa = try @import("dsa.zig").Kernels.load(d);
+        e.index = try @import("index.zig").Kernels.load(d);
         e.g = try Gemms.init(gpa, d);
 
         const hidden = e.c.hidden;
@@ -234,6 +293,32 @@ pub const Engine = struct {
         e.moe_ye = try cuda.DeviceBuffer.alloc(d, e.rows_max * 8 * e.c.hidden * 2);
         e.moe_gu = try cuda.DeviceBuffer.alloc(d, 2 * e.c.moe_inter * 2);
         e.moe_act = try cuda.DeviceBuffer.alloc(d, e.c.moe_inter * 2);
+        {
+            const cap = opts.context;
+            const nm: usize = e.c.countKind(.mla);
+            e.mla_keys = try cuda.DeviceBuffer.alloc(d, nm * cap * e.c.kv_lora * 2);
+            e.mla_ik = try cuda.DeviceBuffer.alloc(d, nm * cap * e.c.i_dim * 2);
+            e.mla_ig = try cuda.DeviceBuffer.alloc(d, nm * cap * e.c.i_dim * 4);
+            e.mla_pool = try cuda.DeviceBuffer.alloc(d, nm * (cap / 4) * e.c.i_dim * 2);
+            e.mla_iw = try cuda.DeviceBuffer.alloc(d, e.rows_max * e.c.i_heads * 2);
+            e.mla_xp = try cuda.DeviceBuffer.alloc(d, e.rows_max * e.c.xProj() * 2);
+            e.mla_qr = try cuda.DeviceBuffer.alloc(d, e.rows_max * e.c.q_lora * 2);
+            e.mla_qp = try cuda.DeviceBuffer.alloc(d, e.rows_max * e.c.qrProj() * 2);
+            e.mla_ql = try cuda.DeviceBuffer.alloc(d, e.rows_max * e.c.mla_heads * e.c.kv_lora * 2);
+            e.mla_att = try cuda.DeviceBuffer.alloc(d, e.rows_max * e.c.mla_heads * e.c.kv_lora * 2);
+            e.mla_vals = try cuda.DeviceBuffer.alloc(d, e.rows_max * e.c.mla_heads * e.c.v_dim * 2);
+            e.mla_scores = try cuda.DeviceBuffer.alloc(d, e.rows_max * (cap / 4 + 1) * 4);
+            e.mla_idx = try cuda.DeviceBuffer.alloc(d, e.rows_max * 2051 * 4);
+            const sc = try gpa.alloc(f32, 1);
+            defer gpa.free(sc);
+            sc[0] = 1.0 / 16.0;
+            e.mla_scale = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(sc));
+            e.mla_scratch_ikraw = try cuda.DeviceBuffer.alloc(d, nm * cap * e.c.i_dim * 2);
+            const kl = try gpa.alloc(i32, 1);
+            defer gpa.free(kl);
+            kl[0] = 0;
+            e.mla_klen = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(kl));
+        }
         {
             const z = try gpa.alloc(u8, 24 * 4 * e.c.hidden * 2);
             defer gpa.free(z);
@@ -307,6 +392,85 @@ pub const Engine = struct {
     }
 
 
+
+    /// MLA attention block `mi` on normed -> branch, window at `pos`.
+    /// Tensors: q_a[1536,4096] kv_a[512,4096]; indexer wk[128,4096] gate[128,4096]
+    /// weights_proj[64,4096] wq_b[8192,1536] q_b[16384,1536]; kv_b[32768,512]:
+    /// per head [512,512] - rows 0..256 absorb (k=256 nope), rows 256..512
+    /// unabsorb (k=512 latent).
+    fn mlaLayer(e: *Engine, mi: usize, w: *const weights.Mla, rows: usize, pos: usize) !void {
+        const c = &e.c;
+        const cap = e.context;
+        const RANK: usize = c.kv_lora;
+        const NOPE: usize = c.nope;
+        const H: usize = c.mla_heads;
+        // x side projections
+        try e.g.mm(e.stream, e.normed.ptr, w.q_a, e.mla_xp.ptr, rows, c.q_lora, c.hidden, false); // q_a out [rows, 1536]
+        try e.g.mm(e.stream, e.normed.ptr, w.kv_a, e.mla_keys.ptr + (mi * cap + pos) * RANK * 2, rows, RANK, c.hidden, false); // raw latent (norm below)
+        try e.g.mm(e.stream, e.normed.ptr, w.wk, e.mla_ik_raw_ptr(mi, pos), rows, c.i_dim, c.hidden, false); // ik raw (LN below)
+        try e.g.mm(e.stream, e.normed.ptr, w.igate, e.mla_ig.ptr + (mi * cap + pos) * c.i_dim * 2, rows, c.i_dim, c.hidden, false); // gate logits bf16 (the pool reads bf16)
+        try e.g.mm(e.stream, e.normed.ptr, w.wproj, e.mla_iw.ptr, rows, c.i_heads, c.hidden, false); // indexer weights (1/64 below)
+        // the norms on the slices: keys = rms(kv_norm) of the latent; ik = LN(k_norm)
+        try e.ops.rms(e.stream, e.mla_keys.ptr + (mi * cap + pos) * RANK * 2, w.kv_norm, e.mla_keys.ptr + (mi * cap + pos) * RANK * 2, rows, RANK, RANK, RANK, c.eps);
+        try e.ops.layerNorm(e.stream, e.mla_ik_raw_ptr(mi, pos), w.k_norm_w, w.k_norm_b, e.mla_ik.ptr + (mi * cap + pos) * c.i_dim * 2, rows, c.i_dim, c.i_dim, c.i_dim, 1e-6);
+        // pool the completed blocks
+        const first_blk = pos / c.kpool;
+        const last_blk = (pos + rows) / c.kpool;
+        if (last_blk > first_blk)
+            try e.ops.pool(e.stream, e.mla_ik.ptr + mi * cap * c.i_dim * 2, e.mla_ig.ptr + mi * cap * c.i_dim * 2, w.ape, e.mla_pool.ptr + mi * (cap / 4) * c.i_dim * 2, first_blk, last_blk - first_blk);
+        // q side: norm q_a out, project nope (q_b) and the indexer queries (wq_b)
+        try e.ops.rms(e.stream, e.mla_xp.ptr, w.q_norm, e.mla_qr.ptr, rows, c.q_lora, c.q_lora, c.q_lora, c.eps);
+        try e.g.mm(e.stream, e.mla_qr.ptr, w.q_b, e.mla_qp.ptr, rows, H * NOPE, c.q_lora, false);
+        try e.g.mm(e.stream, e.mla_qr.ptr, w.wq_b, e.mla_qp.ptr + H * NOPE * 2, rows, c.i_heads * c.i_dim, c.q_lora, false);
+        // absorb: per head ql[h,512] = qp[h,256] x kv_b[h*512..+256 rows, cols 0..256]^T
+        for (0..H) |h| {
+            try e.g.mmStrided(e.stream, e.mla_qp.ptr + h * NOPE * 2, e.c.qrProj() * 2, w.kv_b + h * 512 * 512 * 2, 512 * 2, e.mla_ql.ptr + h * RANK * 2, H * RANK * 2, rows, RANK, NOPE);
+        }
+        // attend
+        const key_len = pos + rows;
+        if (pos + 1 <= c.i_topk) {
+            const idxbuf = try e.gpa.alloc(i32, rows * 2051);
+            defer e.gpa.free(idxbuf);
+            for (0..rows) |r| for (0..2051) |t| {
+                idxbuf[r * 2051 + t] = if (t < key_len) @intCast(t) else -1;
+            };
+            try e.mla_idx.upload(0, std.mem.sliceAsBytes(idxbuf));
+        } else {
+            const s_str = cap / 4 + 1;
+            // the indexer weights carry the 1/64: scale via glm_scale? fold by pre-scaling qp's iq half? the metal scales iw - do a fill-scale pass on mla_iw with a tiny kernel? simplest: scores reads iw directly - prescale here via ops.scale? no kernel; bake 1/64 INTO the index scores by scaling qp iq half is wrong (relu breaks). Use the metal's glm_scale on iw: y=x*s. We lack it - multiply iw during GEMM? mm has no alpha. DO: scale via act? no. Add small scale kernel NOW via gather? No - simplest: scale qp iq half is wrong; scale POOL? no. The clean fix: a glm_scale kernel exists in metal; add to ops later - TEMP: fold 1/64 into the ROUTE... no. For bring-up: skip the 1/64 (wrong magnitudes but exercises the path) - NO, parity matters: add glm_scale.
+            try e.scale_iw(rows);
+            try e.index.?.scores(e.stream, e.mla_qp.ptr + H * NOPE * 2, c.qrProj(), e.mla_iw.ptr, e.mla_pool.ptr + mi * (cap / 4) * c.i_dim * 2, e.mla_scores.ptr, s_str, rows, pos, c.i_heads);
+            try e.index.?.select(e.stream, e.mla_scores.ptr, s_str, e.mla_idx.ptr, 2051, rows, pos, c.i_topk / c.kpool, c.keyWidth());
+        }
+        {
+            const kl = try e.gpa.alloc(i32, 1);
+            defer e.gpa.free(kl);
+            kl[0] = @intCast(key_len);
+            try e.mla_klen.upload(0, std.mem.sliceAsBytes(kl));
+        }
+        try e.dsa.?.attention(e.stream, e.mla_ql.ptr, e.mla_keys.ptr + mi * cap * RANK * 2, e.mla_idx.ptr, e.mla_scale.ptr, e.mla_klen.ptr, e.mla_att.ptr, rows, H);
+        // unabsorb: per head v[h,256] = att[h,512] x kv_b[(h*512+256)..+256 rows, cols]^T (k=512)
+        for (0..H) |h| {
+            try e.g.mmStrided(e.stream, e.mla_att.ptr + h * RANK * 2, H * RANK * 2, w.kv_b + ((h * 512 + 256) * 512) * 2, 512 * 2, e.mla_vals.ptr + h * c.v_dim * 2, H * c.v_dim * 2, rows, c.v_dim, RANK);
+        }
+        try e.g.mm(e.stream, e.mla_vals.ptr, w.o, e.branch.ptr, rows, c.hidden, H * c.v_dim, false);
+    }
+
+    fn mla_ik_raw_ptr(e: *Engine, mi: usize, pos: usize) u64 {
+        return e.mla_scratch_ikraw.ptr + (mi * e.context + pos) * e.c.i_dim * 2;
+    }
+
+    fn mla_klen_ptr(e: *Engine, mi: usize) u64 {
+        _ = mi;
+        return e.mla_klen.ptr;
+    }
+
+    fn scale_iw(e: *Engine, rows: usize) !void {
+        // iw *= 1/64 elementwise (bf16); a tiny kernel-free path: use act? no -
+        // glm_scale added to ops: scale(x, s)
+        try e.ops.scaleBy(e.stream, e.mla_iw.ptr, e.mla_iw.ptr, rows * e.c.i_heads, 1.0 / 64.0);
+    }
+
     /// The MoE block: router, top-8 route, shared expert, the routed experts
     /// through exl3 per (row, slot) - correctness first, batching later.
     fn moeBlock(e: *Engine, w: *const weights.Moe, rows: usize) !void {
@@ -354,14 +518,19 @@ pub const Engine = struct {
         for (0..4) |s_i| try e.ops.embed(e.stream, e.ids.ptr, e.w.embed, e.x[e.xi].ptr + s_i * hidden * 2, rows, hidden);
         e.xi = 0;
         var ki: usize = 0;
+        var mi_mla: usize = 0;
+        const pos: usize = 0;
         for (e.w.layers, e.w.blocks_lo..) |*L, bi| {
             const hc_a = L.hc_attn orelse return error.UnexpectedMtp;
             try e.boundary(rows, hc_a, L.in_norm, ki > 0 or e.w.blocks_lo > 0);
             switch (L.attn) {
                 .kda => |*w| try e.kdaLayer(ki, w, rows),
                 .mla => {
-                    if (!e.skip_mla) return error.MlaUnimplemented;
-                    try e.branch.fill8(0, e.stream.handle); // zero attention out, MoE still runs
+                    if (!e.skip_mla) try e.mlaLayer(mi_mla, switch (L.attn) {
+                        .mla => |*x| x,
+                        .kda => unreachable,
+                    }, rows, pos) else try e.branch.fill8(0, e.stream.handle);
+                    mi_mla += 1;
                 },
             }
             ki += 1;
