@@ -14,13 +14,13 @@
 
 namespace tf_exl3 {
 
-// ─── Codebook constants (exl3_format.zig) ───
+// --- Codebook constants (exl3_format.zig) ---
 
 constexpr uint32_t McgMul = 0xCBAC1FED;
 constexpr uint32_t Mask = 0x8FFF8FFF;
 constexpr uint32_t Flip = 0x3B603B60;
 
-// ─── Width: per-tensor rate. halves = 2*bits (K4=8, K3=6; 7 is the half rate) ───
+// --- Width: per-tensor rate. halves = 2*bits (K4=8, K3=6; 7 is the half rate) ---
 
 struct Exl3Width {
     int halves;
@@ -35,7 +35,7 @@ struct Exl3Width {
     }
 };
 
-// ─── Circular bitstream bit read: MSB-first within little-endian pairs of int16 words ───
+// --- Circular bitstream bit read: MSB-first within little-endian pairs of int16 words ---
 
 __device__ __forceinline__ uint32_t stream_bit(const int16_t* words, uint32_t index) {
     uint32_t w32 = index >> 5;
@@ -58,7 +58,7 @@ __device__ __forceinline__ uint32_t tile_state(const Exl3Width& w, const int16_t
     return s;
 }
 
-// ─── MCG codebook: state -> fp16 pair sum (exl3_format.codebookValue) ───
+// --- MCG codebook: state -> fp16 pair sum (exl3_format.codebookValue) ---
 
 __device__ __forceinline__ float codebook_value_mcg(uint32_t state) {
     uint32_t x = state * McgMul;
@@ -67,7 +67,7 @@ __device__ __forceinline__ float codebook_value_mcg(uint32_t state) {
     return __half2float(__low2half(h2)) + __half2float(__high2half(h2));
 }
 
-// ─── Stream placement -> (row, col) in the 16x16 tile (exl3_format.tilePlacement) ───
+// --- Stream placement -> (row, col) in the 16x16 tile (exl3_format.tilePlacement) ---
 
 struct Placement { uint8_t row, col; };
 
@@ -80,7 +80,7 @@ __device__ __forceinline__ Placement tile_placement(int p) {
     };
 }
 
-// ─── The 128 Hadamard's entry: h(i,j) = (-1)^popcount(i&j) / sqrt(128) ───
+// --- The 128 Hadamard's entry: h(i,j) = (-1)^popcount(i&j) / sqrt(128) ---
 
 __device__ __forceinline__ float had_entry(int i, int j) {
     return (__popc(i & j) & 1) ? -0.08838834764831845f : 0.08838834764831845f;
@@ -95,7 +95,7 @@ using namespace tf_exl3;
 constexpr int TILE = 16;      // the trellis tile
 constexpr int ROWS_MAX = 16;  // the staged x rows per block
 
-// ─── pre: x_tilde[r, jc] = sum_i had(jc, i) x[r, base+i] suh[base+i], 128 blocks along K ───
+// --- pre: x_tilde[r, jc] = sum_i had(jc, i) x[r, base+i] suh[base+i], 128 blocks along K ---
 // Grid (k/128, m), 128 threads; the row's block stages once in shared memory.
 
 __global__ void exl3_pre_rot(
@@ -124,7 +124,7 @@ __global__ void exl3_pre_rot(
     out[(size_t)r * k + base + t] = __float2bfloat16(sum);
 }
 
-// ─── post: y .^ svh then the rotation, 128 blocks along N, in place ───
+// --- post: y .^ svh then the rotation, 128 blocks along N, in place ---
 // Grid (n/128, m), 128 threads.
 
 __global__ void exl3_post_rot(
@@ -151,7 +151,7 @@ __global__ void exl3_post_rot(
     y[(size_t)r * n + base + t] = __float2bfloat16(sum);
 }
 
-// ─── The trellis GEMM: y_pre [rows, N] = x_tilde [rows, K] W_q[K, N] ───
+// --- The trellis GEMM: y_pre [rows, N] = x_tilde [rows, K] W_q[K, N] ---
 // One block per (16-row chunk, N tile); K walked tile by tile; the tile decode is
 // exl3_format's state/placement/codebook path verbatim. x_tilde carries suh and the
 // K rotation already; svh and the N rotation belong to post.
@@ -207,7 +207,7 @@ __global__ void exl3_decode_matmul(
         y[(size_t)(row_base + my_r) * n + (size_t)tn * TILE + my_c] = __float2bfloat16(acc);
 }
 
-// ─── Scalar tile decode for the Zig host tests: decoded[p], stream position p's value ───
+// --- Scalar tile decode for the Zig host tests: decoded[p], stream position p's value ---
 
 __global__ void exl3_verify_decode(
     const int16_t* __restrict__ trellis,

@@ -45,7 +45,7 @@ pub fn run(gpu: Gpu) !void {
     var s = try cuda.Stream.init(gpu.d, true);
     defer s.deinit();
 
-    // ── the sparse attention ──
+    // -- the sparse attention --
     {
         const q = try a.alloc(u16, ROWS * HEADS * HDIM);
         defer a.free(q);
@@ -137,7 +137,7 @@ pub fn run(gpu: Gpu) !void {
         check.pass("glm dsa: worst {d:.4} over {d} rows x {d} heads", .{ worst, ROWS, HEADS });
     }
 
-    // ── the index scores + select ──
+    // -- the index scores + select --
     {
         const blocks = 80;
         const qi = try a.alloc(u16, ROWS * HEADS * 128);
@@ -182,10 +182,11 @@ pub fn run(gpu: Gpu) !void {
             // scores
             for (0..valid) |b| {
                 var total: f32 = 0;
+                const dscale: f32 = 1.0 / @sqrt(@as(f32, 128));
                 for (0..HEADS) |h| {
                     var dot: f64 = 0;
                     for (0..128) |d| dot += fromBf(qi[r * HEADS * 128 + h * 128 + d]) * fromBf(pool[b * 128 + d]);
-                    total = @mulAdd(f32, @as(f32, @floatCast(fromBf(iw[r * HEADS + h]))), @max(@as(f32, @floatCast(dot)), 0.0), total);
+                    total = @mulAdd(f32, @as(f32, @floatCast(fromBf(iw[r * HEADS + h]))), @max(@as(f32, @floatCast(dot)) * dscale, 0.0), total);
                 }
                 if (@abs(sv[r * blocks + b] - total) > 2e-2) {
                     std.debug.print("FAIL idx score r{d} b{d}: {d:.4} vs {d:.4}\n", .{ r, b, sv[r * blocks + b], total });

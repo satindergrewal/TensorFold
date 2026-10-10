@@ -1,7 +1,7 @@
 // GLM's hyper-connection boundaries: the 4-stream residual expand, the 24 mix
 // features, and the split that makes the next boundary's post/comb, the block
 // input's collapse and its RMSNorm. The spec is kernels/metal/core/hc_boundary;
-// D is the arch's hidden (4096), S its stream count (4) — constexpr like metal.
+// D is the arch's hidden (4096), S its stream count (4) - constexpr like metal.
 
 #include <cuda_bf16.h>
 #include <math.h>
@@ -18,7 +18,7 @@ constexpr int PARTS = MIX + 1; // the mixes and the square sum
 
 __device__ __forceinline__ float bf(float v) { return __bfloat162float(__float2bfloat16(v)); }
 
-// ─── expand: fold the branch into the streams by the last split's post/comb
+// --- expand: fold the branch into the streams by the last split's post/comb
 // (expand), or pass the streams through (first boundary); either way the 24 mix
 // dots and the square sum, as PART[row, slice, 25] partials.
 // Grid (SLICES, rows), 256 threads; thread t takes f = 1024*j + 4*t .. +3.
@@ -82,7 +82,7 @@ extern "C" __global__ void hc_expand_mix(
     }
 }
 
-// ─── split: the slices' sums, the mixes' norm, pre/post z's, the comb's
+// --- split: the slices' sums, the mixes' norm, pre/post z's, the comb's
 // Sinkhorn, the streams' collapse by pre and its RMSNorm.
 // Grid (rows), 1024 threads; thread t of the collapse part takes d = 4t .. +3.
 

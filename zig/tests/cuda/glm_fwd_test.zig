@@ -17,6 +17,11 @@ pub fn run(gpu: Gpu, dir: []const u8, rest: []const [:0]const u8) !void {
     var e = try glm.engine.Engine.init(a, gpu.io, gpu.d, dir, .{ .blocks_lo = 0, .blocks_hi = nm, .skip_mla = skip_mla });
     defer e.deinit();
     const rows0: usize = 4;
+    // per-block stream fingerprints (first 26 blocks)
+    const sums = try a.alloc(f64, 46);
+    defer a.free(sums);
+    @memset(sums, 0);
+    e.block_sums = sums;
     var ids_buf: [16]u32 = .{ 100, 2000, 30000, 154800, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
     var n_gen: usize = 0;
     while (n_gen < 12) : (n_gen += 1) {
@@ -42,6 +47,16 @@ pub fn run(gpu: Gpu, dir: []const u8, rest: []const [:0]const u8) !void {
             w += printed.len;
         }
         std.debug.print("  greedy[{d}]: {s}" ++ "\n", .{ rows0 + n_gen, out[0..w] });
+    }
+    {
+        var w2: usize = 0;
+        const out2 = try a.alloc(u8, 46 * 20);
+        defer a.free(out2);
+        for (0..@min(nm, 26)) |b| {
+            const pr = std.fmt.bufPrint(out2[w2..], "{d}:{d:.0} ", .{ b, sums[b] }) catch unreachable;
+            w2 += pr.len;
+        }
+        std.debug.print("  blocksums {s}" ++ "\n", .{out2[0..w2]});
     }
     const rows: usize = rows0;
     const ids = ids_buf;

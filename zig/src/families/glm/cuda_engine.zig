@@ -96,6 +96,7 @@ const Gemms = struct {
 
 pub const Engine = struct {
     gpa: std.mem.Allocator,
+    block_sums: ?[]f64 = null, // set by the test: per-block x-stream fingerprints
     d: *const cuda.Driver,
     stream: cuda.Stream,
     c: Config,
@@ -561,7 +562,19 @@ pub const Engine = struct {
                 .dense => |*w| try e.denseMlp(w, rows),
                 .moe => |*w| try e.moeBlock(w, rows),
             }
-            _ = bi;
+            if (e.block_sums) |sums| {
+                const xb = e.x[e.xi];
+                const n: usize = @min(rows * 4 * e.c.hidden, 4096);
+                const b = e.gpa.alloc(u8, n * 2) catch |err| return err;
+                defer e.gpa.free(b);
+                xb.download(0, b) catch {};
+                var acc: f64 = 0;
+                for (0..n) |i| {
+                    const h: u16 = std.mem.readInt(u16, b[i * 2 ..][0..2], .little);
+                    acc += @as(f32, @bitCast(@as(u32, h) << 16));
+                }
+                sums[bi] = acc;
+            }
         }
         if (e.stop_after_blocks) return; // the handoff: x, branch, post, comb in place
         // the final boundary folds the last branch, then the tail

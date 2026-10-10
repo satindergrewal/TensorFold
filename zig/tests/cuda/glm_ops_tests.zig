@@ -57,7 +57,7 @@ pub fn run(gpu: Gpu) !void {
     var s = try cuda.Stream.init(gpu.d, true);
     defer s.deinit();
 
-    // ── embed ──
+    // -- embed --
     {
         const table = try randBf16(a, 7 * D, 1.0);
         defer a.free(table);
@@ -84,7 +84,7 @@ pub fn run(gpu: Gpu) !void {
         check.pass("glm embed: exact", .{});
     }
 
-    // ── rms ──
+    // -- rms --
     {
         const x = try randBf16(a, ROWS * D, 1.0);
         defer a.free(x);
@@ -138,7 +138,7 @@ pub fn run(gpu: Gpu) !void {
         check.pass("glm rms: worst {d:.5}", .{worst});
     }
 
-    // ── act (the asymmetric clamp) ──
+    // -- act (the asymmetric clamp) --
     {
         const slots = 3;
         const g = try randBf16(a, ROWS * slots * D, 12.0); // past the limit
@@ -190,7 +190,7 @@ pub fn run(gpu: Gpu) !void {
         check.pass("glm act: worst {d:.5}", .{worst});
     }
 
-    // ── combine ──
+    // -- combine --
     {
         const topk = 8;
         const ye = try randBf16(a, ROWS * topk * D, 1.0);
@@ -270,7 +270,7 @@ pub fn run(gpu: Gpu) !void {
         check.pass("glm combine: worst {d:.5}", .{worst});
     }
 
-    // ── stream mean / add ──
+    // -- stream mean / add --
     {
         const x = try randBf16(a, ROWS * 4 * D, 1.0);
         defer a.free(x);
@@ -307,7 +307,7 @@ pub fn run(gpu: Gpu) !void {
         check.pass("glm mean+add: worst {d:.5}", .{worst});
     }
 
-    // ─ argmax, with a tie ──
+    // - argmax, with a tie --
     {
         const V = 3000;
         const lg = try randBf16(a, 2 * V, 1.0);
@@ -340,7 +340,7 @@ pub fn run(gpu: Gpu) !void {
         check.pass("glm argmax: exact incl tie", .{});
     }
 
-    // ── route ──
+    // -- route --
     {
         const E = 288;
         const topk = 8;
@@ -408,7 +408,7 @@ pub fn run(gpu: Gpu) !void {
         check.pass("glm route: picks exact, weights 1e-4, {d} rows", .{ROWS});
     }
 
-    // ── the head shape: m x 154880 x 4096 bf16 ──
+    // -- the head shape: m x 154880 x 4096 bf16 --
     {
         const V = 154880;
         const K2 = 4096;
@@ -439,7 +439,7 @@ pub fn run(gpu: Gpu) !void {
         }
     }
 
-    // ── cublasLt GEMM: D[5,8] = X[5,4].W^T[8,4] fp32 out ──
+    // -- cublasLt GEMM: D[5,8] = X[5,4].W^T[8,4] fp32 out --
     {
         const m = 5;
         const n = 8;

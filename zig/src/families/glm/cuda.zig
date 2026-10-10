@@ -1,4 +1,4 @@
-//! GLM-5.3-Flash on CUDA in Zig: the Metal family's engine over our runtime —
+//! GLM-5.3-Flash on CUDA in Zig: the Metal family's engine over our runtime -
 //! routed experts as EXL3 trellis weights, everything dense in bf16.
 //! The config is the Metal family's: same file, both backends.
 

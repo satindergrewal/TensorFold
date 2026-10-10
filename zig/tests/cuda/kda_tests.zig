@@ -145,14 +145,14 @@ pub fn run(gpu: Gpu) !void {
     var dy = try cuda.DeviceBuffer.alloc(gpu.d, ROWS * W * 2);
     defer dy.free();
 
-    // the conv's p view: the kernel reads p[(e-(TAPS-1))*ps + i] — the same
+    // the conv's p view: the kernel reads p[(e-(TAPS-1))*ps + i] - the same
     // buffer tail as conv_in's last ROWS rows, ps = 3W
     const p_dev = dconv_in.ptr + (TAPS - 1) * 3 * W * 2;
     try k.conv(s, p_dev, 3 * W, dconv_in.ptr, dcw.ptr, dqkv.ptr, ROWS);
     try k.step(s, dqkv.ptr, dfg.ptr, dbv.ptr, dav.ptr, ddtb.ptr, dst.ptr, donw.ptr, -5.0, 1e-6, ROWS, dsto.ptr, dy.ptr);
     try s.synchronize();
 
-    // ── the reference ──
+    // -- the reference --
     const y_ref = try a.alloc(f64, ROWS * W);
     defer a.free(y_ref);
     const st = try a.dupe(f32, st0);
@@ -182,8 +182,7 @@ pub fn run(gpu: Gpu) !void {
                     fromBf(conv_in[e * 3 * W + i]); // history then p, contiguous
                 acc += src * fromBf(cw[j * 3 * W + i]);
             }
-            const xb = bfRound(acc);
-            const sl = bfRound(xb * bfRound(sig(xb)));
+            const sl = bfRound(acc / (1.0 + @exp(-acc))); // chain_kernel silu
             switch (part) {
                 0 => q[rem] = sl,
                 1 => kk[rem] = sl,
@@ -200,7 +199,7 @@ pub fn run(gpu: Gpu) !void {
             }
             const rq: f32 = 1.0 / @sqrt(pq + 1e-6);
             const rk: f32 = 1.0 / @sqrt(pk + 1e-6);
-            const beta: f32 = @floatCast(sig(fromBf(bv[r * H + h])));
+            const beta: f32 = @floatCast(1.0 / (1.0 + @exp(-fromBf(bv[r * H + h])))); // plain sigmoid
             const gvec = try a.alloc(f32, D);
             defer a.free(gvec);
             const kvec = try a.alloc(f32, D);
@@ -210,12 +209,10 @@ pub fn run(gpu: Gpu) !void {
             for (0..D) |d| {
                 const raw: f32 = @floatCast(fromBf(fg[r * 2 * W + h * D + d]));
                 const avd: f32 = raw + dtb[h * D + d];
-                const e2: f32 = @exp(@abs(avd * @as(f32, @floatCast(avh[h]))));
-                const y2: f32 = 1.0 / (1.0 + e2);
-                const sg2: f32 = if (avd * @as(f32, @floatCast(avh[h])) < 0) y2 else 1.0 - y2;
+                const sg2: f32 = 1.0 / (1.0 + @exp(-(avd * @as(f32, @floatCast(avh[h])))));
                 gvec[d] = @exp(@as(f32, @floatCast(lb)) * sg2);
-                kvec[d] = @floatCast(bfRound(kk[h * D + d] * rk));
-                qvec[d] = @floatCast(bfRound((q[h * D + d] * rq) * qscale));
+                kvec[d] = @floatCast(kk[h * D + d] * rk); // fp32 unrounded
+                qvec[d] = @floatCast((q[h * D + d] * rq) * qscale);
             }
             for (0..D) |dv| {
                 const off = (@as(usize, h) * D + dv) * D;
@@ -281,8 +278,7 @@ pub fn run(gpu: Gpu) !void {
                 const src: f64 = fromBf(conv_in[e * 3 * W + (part * W + rem)]);
                 acc += src * fromBf(cw[j * 3 * W + (part * W + rem)]);
             }
-            const xb = bfRound(acc);
-            const sl = bfRound(xb * bfRound(sig(xb)));
+            const sl = bfRound(acc / (1.0 + @exp(-acc))); // chain_kernel silu
             const h16: u16 = std.mem.readInt(u16, qkvb[i * 2 ..][0..2], .little);
             const d2 = @abs(fromBf(h16) - sl);
             if (d2 > worst_q) {

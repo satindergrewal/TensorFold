@@ -1,7 +1,7 @@
 //! GLM-5.3-Flash's weights on the GPU: the routed projections as EXL3 trellis
 //! weights (rate from the trellis shape, never config), everything else bf16 as
 //! stored. A load takes a device and a block range [lo, hi) of `layers + 1`
-//! blocks (the MTP block trails) — the full model is 146G, past one card, so
+//! blocks (the MTP block trails) - the full model is 146G, past one card, so
 //! the box serves it split; block 0's device takes the embedding, the last the
 //! head.
 

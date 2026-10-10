@@ -1,5 +1,5 @@
 //! EXL3 trellis projections: per-tensor 3/3.5/4-bit MCG, as core/exl3_format.zig's
-//! dequantize factorizes — signs and the K rotation on x, the raw-trellis GEMM, then
+//! dequantize factorizes - signs and the K rotation on x, the raw-trellis GEMM, then
 //! the N rotation and signs on y. Geometry from the trellis shape alone; the scalar
 //! spec is the oracle and exl3.cu its warp transcription.
 
@@ -129,7 +129,7 @@ pub const Kernels = struct {
         try launch_.launch(k.mm_fn, .{ .grid = .{ .x = u(w.tilesN()), .y = u(row_chunks) }, .block = .{ .x = 256 } }, s, &a);
     }
 
-    /// One call: pre, GEMM (x_tilde in the shared scratch) and post. Single stream —
+    /// One call: pre, GEMM (x_tilde in the shared scratch) and post. Single stream -
     /// the scratch is the instance's.
     pub fn project(k: *const Kernels, s: Stream, x: u64, w: Weight, y: u64, rows: usize) !void {
         if (rows > chunk_rows or w.k > k_max) return error.WindowTooWide;
