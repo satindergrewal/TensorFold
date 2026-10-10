@@ -11,11 +11,6 @@
 namespace tf_glm_ops {
 
 __device__ __forceinline__ float bf(float v) { return __bfloat162float(__float2bfloat16(v)); }
-__device__ __forceinline__ float sig_fast(float x) {
-    const float e = __expf(fabsf(x));
-    const float y = 1.0f / (1.0f + e);
-    return x < 0 ? y : 1.0f - y;
-}
 __device__ __forceinline__ float sig_precise(float x) {
     const float e = expf(fabsf(x));
     const float y = 1.0f / (1.0f + e);
@@ -71,13 +66,13 @@ extern "C" __global__ void glm_act(const __nv_bfloat16* __restrict__ g, const __
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     const int total = rows * slots * n;
     if (i >= total) return;
+    // glue._swiglu: fp32 clamps (unrounded), silu by the division form rounded
+    // once, then the up product rounded once
     const float gv = __bfloat162float(g[i]);
     const float uv = __bfloat162float(u[i]);
-    const float gt = bf(fminf(gv, lim));
-    const float up = bf(fminf(fmaxf(uv, -lim), lim));
-    const float sg = bf(sig_fast(gt)); // torch's bf16 sigmoid: rounded before the product
-    const float sl = bf(gt * sg);
-    act[i] = __float2bfloat16(sl * up);
+    const float gt = fminf(gv, lim);
+    const float up = fminf(fmaxf(uv, -lim), lim);
+    act[i] = __float2bfloat16(bf(gt / (1.0f + expf(-gt))) * up);
 }
 
 // out[r, d] = bf16(sum_k wts[r, k] * ye[r, k, d] fused) + ys[r, d].
