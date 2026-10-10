@@ -471,7 +471,7 @@ pub const Engine = struct {
         // unabsorb: v[h, vdim] = V_h[vdim, latent] @ att[h, latent] (the v rows at
         // heads*qk_dim; x UNtransposed on the right: out = W @ x^T in col-major)
         for (0..H) |h| {
-            try e.g.mmNT(e.stream, e.mla_att.ptr + h * RANK * 2, H * RANK * 2, w.kv_b + (H * NOPE + h * c.v_dim) * RANK * 2, RANK * 2, e.mla_vals.ptr + h * c.v_dim * 2, H * c.v_dim * 2, rows, c.v_dim, RANK);
+            try e.g.mmNT(e.stream, e.mla_att.ptr + h * RANK * 2, H * RANK * 2, w.kv_b + (h * 512 + 256) * RANK * 2, RANK * 2, e.mla_vals.ptr + h * c.v_dim * 2, H * c.v_dim * 2, rows, c.v_dim, RANK);
         }
         try e.g.mm(e.stream, e.mla_vals.ptr, w.o, e.branch.ptr, rows, c.hidden, H * c.v_dim, false);
     }
