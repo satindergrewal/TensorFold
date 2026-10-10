@@ -240,7 +240,7 @@ pub fn run(gpu: Gpu) !void {
                 const ed: f32 = @exp(@abs(gd));
                 const gate: f32 = if (gd < 0) 1.0 / (1.0 + ed) else 1.0 - 1.0 / (1.0 + ed);
                 var x: f32 = @as(f32, @floatCast(y_ref[r * W + h * D + d])) * rn;
-                x = @as(f32, @floatCast(fromBf(onw[h * D + d]))) * x;
+                x = @as(f32, @floatCast(fromBf(onw[d]))) * x; // shared [D]
                 x *= gate;
                 y_ref[r * W + h * D + d] = bfRound(x);
             }

@@ -364,12 +364,12 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const Driver, dir: []const u
         if (t.dim(0) != c.vocab or t.dim(1) != c.hidden) return error.BadEmbed;
         w.embed = try L.bf16(prefix ++ "embed_tokens.weight");
     }
-    if (hi == blocks) {
-        w.final_norm = try L.bf16(prefix ++ "norm.weight");
-        const ht = try ck.get("lm_head.weight");
-        if (ht.dim(1) != c.hidden) return error.BadHead;
-        w.head = try L.bf16("lm_head.weight");
-    }
+    // the head and final norm always load (the split's last device owns them
+    // exclusively; small enough to double-load during bring-up)
+    w.final_norm = try L.bf16(prefix ++ "norm.weight");
+    const ht = try ck.get("lm_head.weight");
+    if (ht.dim(1) != c.hidden) return error.BadHead;
+    w.head = try L.bf16("lm_head.weight");
 
     const layers = try gpa.alloc(Layer, hi - lo);
     for (lo..hi) |bi| layers[bi - lo] = try L.block(bi);

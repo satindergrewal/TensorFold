@@ -408,6 +408,37 @@ pub fn run(gpu: Gpu) !void {
         check.pass("glm route: picks exact, weights 1e-4, {d} rows", .{ROWS});
     }
 
+    // ── the head shape: m x 154880 x 4096 bf16 ──
+    {
+        const V = 154880;
+        const K2 = 4096;
+        for ([_]usize{ 4, 16 }) |m2| {
+            const x2 = try randBf16(a, m2 * K2, 1.0);
+            defer a.free(x2);
+            const w2 = try randBf16(a, V * K2, 0.01);
+            defer a.free(w2);
+            var dx2 = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(x2));
+            defer dx2.free();
+            var dw2 = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(w2));
+            defer dw2.free();
+            var dd2 = try cuda.DeviceBuffer.alloc(gpu.d, m2 * V * 2);
+            defer dd2.free();
+            var ws2 = try cuda.DeviceBuffer.alloc(gpu.d, 64 << 20);
+            defer ws2.free();
+            var lin2 = cuda.cublaslt.Linear.init(&o.lt, m2, V, K2, .bf16, 64 << 20) catch |err| {
+                std.debug.print("head m={d}: INIT {t}" ++ "\n", .{ m2, err });
+                continue;
+            };
+            defer lin2.deinit();
+            lin2.run(dx2.ptr, dw2.ptr, dd2.ptr, ws2.ptr, ws2.len, s.handle) catch |err| {
+                std.debug.print("head m={d}: RUN {t}" ++ "\n", .{ m2, err });
+                continue;
+            };
+            try s.synchronize();
+            check.pass("glm cublasLt head m={d}: OK", .{m2});
+        }
+    }
+
     // ── cublasLt GEMM: D[5,8] = X[5,4].W^T[8,4] fp32 out ──
     {
         const m = 5;

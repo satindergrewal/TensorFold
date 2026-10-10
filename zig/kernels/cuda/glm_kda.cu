@@ -128,7 +128,7 @@ extern "C" __global__ void kda_step(const __nv_bfloat16* __restrict__ qkv, const
         const float pon = rsqrtf(po / (float)D + eps);
         const float gate = sig_precise(__bfloat162float(fg[(size_t)r * 2 * W + W + (size_t)h * D + t])); // g_b's, dv-indexed
         float x = syv[t] * pon;
-        x = __bfloat162float(onw[(size_t)h * D + t]) * x;
+        x = __bfloat162float(onw[t]) * x; // shared [D] across heads
         x *= gate;
         y[(size_t)r * W + (size_t)h * D + t] = __float2bfloat16(x);
         __syncthreads();

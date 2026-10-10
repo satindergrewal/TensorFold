@@ -6,6 +6,7 @@ const cuda = @import("cuda");
 pub const H = 64;
 pub const D = 128;
 pub const W = H * D;
+pub const taps = 4;
 
 pub const Kernels = struct {
     mod: cuda.Module,

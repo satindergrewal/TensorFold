@@ -10,6 +10,7 @@ pub const glue = @import("glm_glue.zig");
 pub const kda = @import("kda.zig");
 pub const dsa = @import("dsa.zig");
 pub const index = @import("index.zig");
+pub const engine = @import("cuda_engine.zig");
 
 test {
     _ = Config;
@@ -19,4 +20,5 @@ test {
     _ = kda;
     _ = dsa;
     _ = index;
+    _ = engine;
 }

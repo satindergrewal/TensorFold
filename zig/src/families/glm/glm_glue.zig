@@ -21,6 +21,8 @@ pub const Ops = struct {
     add_fn: cuda.Function,
     argmax_fn: cuda.Function,
     route_fn: cuda.Function,
+    copy2d_fn: cuda.Function,
+    gather_fn: cuda.Function,
     lt: Library,
 
     pub fn load(d: *const cuda.Driver) !Ops {
@@ -37,6 +39,8 @@ pub const Ops = struct {
             .add_fn = undefined,
             .argmax_fn = undefined,
             .route_fn = undefined,
+            .copy2d_fn = undefined,
+            .gather_fn = undefined,
             .lt = undefined,
         };
         errdefer o.unload();
@@ -48,6 +52,8 @@ pub const Ops = struct {
         o.add_fn = try mod.function("glm_add");
         o.argmax_fn = try mod.function("glm_argmax");
         o.route_fn = try mod.function("glm_route");
+        o.copy2d_fn = try mod.function("glm_copy2d");
+        o.gather_fn = try mod.function("glm_gather");
         o.lt = try Library.open();
         return o;
     }
@@ -130,6 +136,25 @@ pub const Ops = struct {
         a.add(out);
         a.add(i(vocab));
         try cuda.launch.launch(o.argmax_fn, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 1024 } }, s, &a);
+    }
+
+    pub fn copy2d(o: *const Ops, s: cuda.Stream, src: u64, dst: u64, rows: usize, cols: usize, src_stride: usize) !void {
+        var a: cuda.Args = .{};
+        a.add(src);
+        a.add(dst);
+        a.add(i(rows));
+        a.add(i(cols));
+        a.add(i(src_stride));
+        try cuda.launch.launch(o.copy2d_fn, .{ .grid = .{ .x = @intCast((cols + 255) / 256), .y = @intCast(rows) }, .block = .{ .x = 256 } }, s, &a);
+    }
+
+    pub fn gather(o: *const Ops, s: cuda.Stream, src: u64, dst: u64, n: usize, src_stride: usize) !void {
+        var a: cuda.Args = .{};
+        a.add(src);
+        a.add(dst);
+        a.add(i(n));
+        a.add(i(src_stride));
+        try cuda.launch.launch(o.gather_fn, .{ .grid = .{ .x = @intCast((n + 255) / 256) }, .block = .{ .x = 256 } }, s, &a);
     }
 
     pub fn route(o: *const Ops, s: cuda.Stream, logits: u64, bias: u64, pick: u64, wts: u64, rows: usize, experts: usize, topk: usize, scale: f32) !void {

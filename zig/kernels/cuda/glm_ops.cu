@@ -226,4 +226,20 @@ extern "C" __global__ void glm_route(const float* __restrict__ logits, const flo
     if (e < topk) wts[(size_t)r * topk + e] = (wr[e] / total) * scale;
 }
 
+// dst[r, c] = src[r * src_stride + c]; rows x cols bf16.
+extern "C" __global__ void glm_copy2d(const __nv_bfloat16* __restrict__ src, __nv_bfloat16* __restrict__ dst,
+                                      int rows, int cols, int src_stride) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= cols) return;
+    const int r = blockIdx.y;
+    dst[(size_t)r * cols + i] = src[(size_t)r * src_stride + i];
+}
+
+// dst[i] = src[i * src_stride]; n bf16 elements.
+extern "C" __global__ void glm_gather(const __nv_bfloat16* __restrict__ src, __nv_bfloat16* __restrict__ dst,
+                                      int n, int src_stride) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = src[(size_t)i * src_stride];
+}
+
 } // namespace tf_glm_ops

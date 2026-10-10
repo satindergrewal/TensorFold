@@ -20,6 +20,7 @@ const glm_hc_tests = @import("glm_hc_tests.zig");
 const glm_ops_tests = @import("glm_ops_tests.zig");
 const kda_tests = @import("kda_tests.zig");
 const dsa_tests = @import("glm_dsa_tests.zig");
+const fwd_tests = @import("glm_fwd_test.zig");
 const carveout_tests = @import("carveout_tests.zig");
 
 const usage =
@@ -50,6 +51,7 @@ const usage =
     \\  glm-ops                     the dense ops vs scalar references and cublasLt
     \\  glm-kda                     the KDA conv and delta step vs a scalar reference
     \\  glm-dsa                     the DSA sparse attention and indexer vs scalar references
+    \\  glm-fwd <dir>               the engine smoke: blocks 0..3, 4 tokens, logits checksum
     \\  carveout [MiB] [card]     GB10 display memory: round trips and bandwidth (SKIP without the card)
     \\
 ;
@@ -107,6 +109,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "glm-ops")) return glm_ops_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-kda")) return kda_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-dsa")) return dsa_tests.run(gpu);
+    if (std.mem.eql(u8, cmd, "glm-fwd")) return fwd_tests.run(gpu, try arg(rest, 0), rest);
     if (std.mem.eql(u8, cmd, "sample")) return sample_tests.draws(gpu);
     if (std.mem.eql(u8, cmd, "glue")) return glue_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "window-profile")) return window_profile.run(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2));
