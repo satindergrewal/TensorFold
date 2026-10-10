@@ -16,8 +16,35 @@ pub fn run(gpu: Gpu, dir: []const u8, rest: []const [:0]const u8) !void {
     const a = gpu.gpa;
     var e = try glm.engine.Engine.init(a, gpu.io, gpu.d, dir, .{ .blocks_lo = 0, .blocks_hi = nm, .skip_mla = skip_mla });
     defer e.deinit();
-    const rows: usize = 4;
-    const ids = [_]u32{ 100, 2000, 30000, 154879 };
+    const rows0: usize = 4;
+    var ids_buf: [16]u32 = .{ 100, 2000, 30000, 154800, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    var n_gen: usize = 0;
+    while (n_gen < 12) : (n_gen += 1) {
+        const rows_now = rows0 + n_gen;
+        if (rows_now > 16) break;
+        try e.forward(ids_buf[0..rows_now], rows_now);
+        try e.stream.synchronize();
+        const pk = try check.download(gpu, e.picks);
+        defer a.free(pk);
+        const pv = std.mem.bytesAsSlice(u32, @as([]align(1) u8, pk));
+        ids_buf[rows_now] = pv[rows_now - 1];
+    }
+    {
+        var out: []u8 = try a.alloc(u8, 160);
+        defer a.free(out);
+        var w: usize = 0;
+        for (0..rows0 + n_gen) |t| {
+            if (t == rows0) {
+                @memcpy(out[w .. w + 3], " | ");
+                w += 3;
+            }
+            const printed = std.fmt.bufPrint(out[w..], "{d} ", .{ids_buf[t]}) catch unreachable;
+            w += printed.len;
+        }
+        std.debug.print("  greedy[{d}]: {s}" ++ "\n", .{ rows0 + n_gen, out[0..w] });
+    }
+    const rows: usize = rows0;
+    const ids = ids_buf;
     // probe: embed alone before any block
     try e.ids.upload(0, std.mem.sliceAsBytes(ids[0..rows]));
     for (0..4) |s_i| try e.ops.embed(e.stream, e.ids.ptr, e.w.embed, e.x[0].ptr + s_i * e.c.hidden * 2, rows, e.c.hidden);
