@@ -288,10 +288,6 @@ pub const Engine = struct {
             }
             try e.stream.synchronize();
         }
-        const eps_v = try gpa.alloc(f32, 1);
-        defer gpa.free(eps_v);
-        eps_v[0] = e.c.hc_eps;
-        e.eps_buf = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(eps_v));
         e.moe_pick = try cuda.DeviceBuffer.alloc(d, e.rows_max * 8 * 4);
         e.moe_wts = try cuda.DeviceBuffer.alloc(d, e.rows_max * 8 * 4);
         e.moe_logits = try cuda.DeviceBuffer.alloc(d, e.rows_max * e.c.experts * 4);
@@ -319,6 +315,10 @@ pub const Engine = struct {
             defer gpa.free(sc);
             sc[0] = 1.0 / 16.0;
             e.mla_scale = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(sc));
+            const eps2 = try gpa.alloc(f32, 1);
+            defer gpa.free(eps2);
+            eps2[0] = e.c.eps;
+            e.eps_buf = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(eps2));
             e.mla_scratch_ikraw = try cuda.DeviceBuffer.alloc(d, nm * cap * e.c.i_dim * 2);
             const kl = try gpa.alloc(i32, 1);
             defer gpa.free(kl);
