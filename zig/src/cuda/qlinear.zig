@@ -6,6 +6,7 @@ const launch_ = @import("launch.zig");
 const memory = @import("memory.zig");
 const stream_ = @import("stream.zig");
 const fp8 = @import("fp8.zig");
+const exl3 = @import("exl3.zig");
 
 const Driver = driver.Driver;
 const Module = module.Module;
@@ -19,11 +20,13 @@ pub const Affine4 = struct { w: u64, s: u64, b: u64, n: usize, k: usize, npad: u
 pub const Weight = union(enum) {
     affine4: Affine4,
     fp8g: fp8.Weight,
+    exl3: exl3.Weight,
 
     pub fn outputs(w: Weight) usize {
         return switch (w) {
             .affine4 => |q| q.n,
             .fp8g => |q| q.n,
+            .exl3 => |q| q.n,
         };
     }
 
@@ -31,6 +34,7 @@ pub const Weight = union(enum) {
         return switch (w) {
             .affine4 => |q| q.k,
             .fp8g => |q| q.k,
+            .exl3 => |q| q.k,
         };
     }
 };
@@ -42,6 +46,7 @@ pub const Rows = struct { x: u64, ldx: usize = 0, sums: u64 = 0, part: u64 = 0 }
 pub const Linear = struct {
     affine4: ?*const Affine4Kernels = null,
     fp8g: ?*const fp8.Lane = null,
+    exl3: ?*const exl3.Kernels = null,
 
     /// Decode rows: out (rows, n) bf16, each row's bits the same at every row count the format takes.
     pub fn decode(l: Linear, s: Stream, w: Weight, in: Rows, out: u64, rows: usize) !void {
@@ -52,6 +57,11 @@ pub const Linear = struct {
                 return a.decode(s, in.x, in.sums, q, out, rows);
             },
             .fp8g => |q| return (l.fp8g orelse return error.FormatNotLoaded).matmul(s, in.x, if (in.ldx == 0) q.k else in.ldx, rows, q, out, in.part),
+            .exl3 => |q| {
+                const e = l.exl3 orelse return error.FormatNotLoaded;
+                if (in.ldx != 0 and in.ldx != q.k) return error.RowStride;
+                return e.project(s, in.x, q, out, rows);
+            },
         }
     }
 
@@ -64,6 +74,11 @@ pub const Linear = struct {
                 return a.prompt(s, in.x, q, out, rows);
             },
             .fp8g => |q| return (l.fp8g orelse return error.FormatNotLoaded).matmul(s, in.x, if (in.ldx == 0) q.k else in.ldx, rows, q, out, in.part),
+            .exl3 => |q| {
+                const e = l.exl3 orelse return error.FormatNotLoaded;
+                if (in.ldx != 0 and in.ldx != q.k) return error.RowStride;
+                return e.projectWide(s, in.x, q, out, rows);
+            },
         }
     }
 };

@@ -40,3 +40,5 @@ test {
     _ = @import("fp8.zig");
     _ = carveout;
 }
+
+pub const exl3 = @import("exl3.zig");
