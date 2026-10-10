@@ -18,6 +18,7 @@ pub const Options = struct {
     blocks_lo: usize = 0,
     blocks_hi: usize = 1 << 16,
     context: usize = 4096, // the KV caches' capacity
+    skip_mla: bool = false, // bring-up: attention passes through with a zero branch
 };
 
 /// One GEMM shape's plan + the shared workspace.
@@ -96,9 +97,17 @@ pub const Engine = struct {
     picks: cuda.DeviceBuffer, // u32 [rows]
     eps_buf: cuda.DeviceBuffer,
     fn_zero: cuda.DeviceBuffer,
+    moe_pick: cuda.DeviceBuffer,
+    moe_wts: cuda.DeviceBuffer,
+    moe_logits: cuda.DeviceBuffer,
+    moe_ys: cuda.DeviceBuffer,
+    moe_ye: cuda.DeviceBuffer,
+    moe_gu: cuda.DeviceBuffer,
+    moe_act: cuda.DeviceBuffer,
     mlp_tmp: cuda.DeviceBuffer, // [rows, 2*dense_inter] bf16
     mlp_act: cuda.DeviceBuffer, // [rows, dense_inter] bf16
     scratch: cuda.DeviceBuffer, // exl3/experts scratch
+    skip_mla: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, dir: []const u8, opts: Options) !*Engine {
         const e = try gpa.create(Engine);
@@ -143,9 +152,17 @@ pub const Engine = struct {
             .picks = undefined,
             .eps_buf = undefined,
             .fn_zero = undefined,
+            .moe_pick = undefined,
+            .moe_wts = undefined,
+            .moe_logits = undefined,
+            .moe_ys = undefined,
+            .moe_ye = undefined,
+            .moe_gu = undefined,
+            .moe_act = undefined,
             .mlp_tmp = undefined,
             .mlp_act = undefined,
             .scratch = undefined,
+            .skip_mla = opts.skip_mla,
         };
         e.stream = try cuda.Stream.init(d, true);
         errdefer e.stream.deinit();
@@ -210,6 +227,13 @@ pub const Engine = struct {
         defer gpa.free(eps_v);
         eps_v[0] = e.c.hc_eps;
         e.eps_buf = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(eps_v));
+        e.moe_pick = try cuda.DeviceBuffer.alloc(d, e.rows_max * 8 * 4);
+        e.moe_wts = try cuda.DeviceBuffer.alloc(d, e.rows_max * 8 * 4);
+        e.moe_logits = try cuda.DeviceBuffer.alloc(d, e.rows_max * e.c.experts * 4);
+        e.moe_ys = try cuda.DeviceBuffer.alloc(d, e.rows_max * e.c.hidden * 2);
+        e.moe_ye = try cuda.DeviceBuffer.alloc(d, e.rows_max * 8 * e.c.hidden * 2);
+        e.moe_gu = try cuda.DeviceBuffer.alloc(d, 2 * e.c.moe_inter * 2);
+        e.moe_act = try cuda.DeviceBuffer.alloc(d, e.c.moe_inter * 2);
         {
             const z = try gpa.alloc(u8, 24 * 4 * e.c.hidden * 2);
             defer gpa.free(z);
@@ -282,6 +306,46 @@ pub const Engine = struct {
         try e.g.mm(e.stream, e.mlp_act.ptr, w.down, e.branch.ptr, rows, e.c.hidden, inter, false);
     }
 
+
+    /// The MoE block: router, top-8 route, shared expert, the routed experts
+    /// through exl3 per (row, slot) - correctness first, batching later.
+    fn moeBlock(e: *Engine, w: *const weights.Moe, rows: usize) !void {
+        const hidden = e.c.hidden;
+        const inter = e.c.moe_inter;
+        // router logits fp32 then the route
+        try e.g.mm(e.stream, e.normed.ptr, w.router, e.moe_logits.ptr, rows, e.c.experts, hidden, true);
+        try e.ops.route(e.stream, e.moe_logits.ptr, w.bias, e.moe_pick.ptr, e.moe_wts.ptr, rows, e.c.experts, e.c.topk, e.c.routed_scale);
+        // the shared expert -> ys
+        try e.g.mm(e.stream, e.normed.ptr, w.shared_gate, e.mlp_tmp.ptr, rows, inter, hidden, false);
+        try e.g.mm(e.stream, e.normed.ptr, w.shared_up, e.mlp_tmp.ptr + rows * inter * 2, rows, inter, hidden, false);
+        try e.ops.act(e.stream, e.mlp_tmp.ptr, e.mlp_tmp.ptr + rows * inter * 2, e.mlp_act.ptr, rows, 1, inter, e.c.swiglu_limit);
+        try e.g.mm(e.stream, e.mlp_act.ptr, w.shared_down, e.moe_ys.ptr, rows, hidden, inter, false);
+        // the picks on host drive the per-slot expert calls
+        var pick_bytes = try cuda.HostBuffer.alloc(e.d, rows * e.c.topk * 4);
+        defer pick_bytes.free();
+        const pick_host = try e.gpa.alloc(u8, rows * e.c.topk * 4);
+        defer e.gpa.free(pick_host);
+        try e.moe_pick.downloadAsync(0, pick_host, e.stream.handle);
+        try e.stream.synchronize();
+        const picks = std.mem.bytesAsSlice(i32, @as([]align(1) u8, pick_host));
+        var r: usize = 0;
+        while (r < rows) : (r += 1) {
+            var k: usize = 0;
+            while (k < e.c.topk) : (k += 1) {
+                const ex = picks[r * e.c.topk + k];
+                if (ex < 0) continue;
+                const eu: usize = @intCast(ex);
+                const x_row = e.normed.ptr + r * hidden * 2;
+                try e.ex.project(e.stream, x_row, w.gate[eu], e.moe_gu.ptr, 1);
+                try e.ex.project(e.stream, x_row, w.up[eu], e.moe_gu.ptr + inter * 2, 1);
+                try e.ops.act(e.stream, e.moe_gu.ptr, e.moe_gu.ptr + inter * 2, e.moe_act.ptr, 1, 1, inter, e.c.swiglu_limit);
+                const ye_at = e.moe_ye.ptr + (r * e.c.topk + k) * hidden * 2;
+                try e.ex.project(e.stream, e.moe_act.ptr, w.down[eu], ye_at, 1);
+            }
+        }
+        try e.ops.combine(e.stream, e.moe_ys.ptr, e.moe_ye.ptr, e.moe_wts.ptr, e.branch.ptr, rows, e.c.topk, hidden);
+    }
+
     /// One window of `rows` tokens: ids -> picks (argmax) + logits on device.
     pub fn forward(e: *Engine, ids: []const u32, rows: usize) !void {
         const hidden = e.c.hidden;
@@ -295,13 +359,16 @@ pub const Engine = struct {
             try e.boundary(rows, hc_a, L.in_norm, ki > 0 or e.w.blocks_lo > 0);
             switch (L.attn) {
                 .kda => |*w| try e.kdaLayer(ki, w, rows),
-                .mla => return error.MlaUnimplemented,
+                .mla => {
+                    if (!e.skip_mla) return error.MlaUnimplemented;
+                    try e.branch.fill8(0, e.stream.handle); // zero attention out, MoE still runs
+                },
             }
             ki += 1;
             try e.boundary(rows, L.hc_ffn, L.post_norm, true);
             switch (L.mlp) {
                 .dense => |*w| try e.denseMlp(w, rows),
-                .moe => return error.MoeUnimplemented,
+                .moe => |*w| try e.moeBlock(w, rows),
             }
             _ = bi;
         }

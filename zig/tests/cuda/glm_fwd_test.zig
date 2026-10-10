@@ -10,8 +10,9 @@ const Gpu = check.Gpu;
 
 pub fn run(gpu: Gpu, dir: []const u8, rest: []const [:0]const u8) !void {
     const nm: usize = if (rest.len > 1) std.fmt.parseInt(usize, rest[1], 10) catch 3 else 3;
+    const skip_mla = rest.len > 2 and std.mem.eql(u8, rest[2], "skip-mla");
     const a = gpu.gpa;
-    var e = try glm.engine.Engine.init(a, gpu.io, gpu.d, dir, .{ .blocks_lo = 0, .blocks_hi = nm });
+    var e = try glm.engine.Engine.init(a, gpu.io, gpu.d, dir, .{ .blocks_lo = 0, .blocks_hi = nm, .skip_mla = skip_mla });
     defer e.deinit();
     const rows: usize = 4;
     const ids = [_]u32{ 100, 2000, 30000, 154879 };
