@@ -184,7 +184,8 @@ extern "C" __global__ void hc_split(
     __syncthreads();
     for (int i = 0; i < 4; ++i) {
         const int d = 4 * t + i;
-        normed[(size_t)r * D + d] = __float2bfloat16(__bfloat162float(norm_w[d]) * bf(xc[i] * inv_s));
+        // _hc_finish: y = w * bf(c * rinv2) - the normalized value rounds first
+        normed[(size_t)r * D + d] = __float2bfloat16(__bfloat162float(norm_w[d]) * bf(bf(xc[i] * inv_s)));
     }
 }
 
