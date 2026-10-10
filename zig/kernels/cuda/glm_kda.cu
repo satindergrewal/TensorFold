@@ -139,7 +139,7 @@ extern "C" __global__ void kda_step(const __nv_bfloat16* __restrict__ qkv, const
             __syncthreads();
             pon = red[2];
         }
-        const float gate = sig_precise(graw[t]); // the dv gate: the bf raw's sigmoid
+        const float gate = sig_precise(__bfloat162float(fg[(size_t)r * W + W + (size_t)h * D + t])); // g_b's, dv-indexed
         float x = syv[t] * pon;
         x = __bfloat162float(onw[(size_t)h * D + t]) * x;
         x *= gate;
