@@ -17,11 +17,7 @@ constexpr int W = H * D; // 8192
 constexpr int TAPS = 4;
 
 __device__ __forceinline__ float bf(float v) { return __bfloat162float(__float2bfloat16(v)); }
-__device__ __forceinline__ float sig_precise(float x) {
-    const float e = expf(fabsf(x));
-    const float y = 1.0f / (1.0f + e);
-    return x < 0 ? y : 1.0f - y;
-}
+__device__ __forceinline__ float sig_precise(float x) { return 1.0f / (1.0f + expf(-x)); } // the python engine's exact form
 
 __device__ __forceinline__ float block_sum(float v, float* red) {
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
@@ -56,8 +52,7 @@ extern "C" __global__ void kda_conv(const __nv_bfloat16* __restrict__ p, int ps,
                                       : __bfloat162float(p[(size_t)(e - (TAPS - 1)) * ps + i]);
         acc = fmaf(xv, __bfloat162float(cw[(size_t)j * 3 * W + i]), acc);
     }
-    const float xb = bf(acc);
-    qkv[(size_t)r * 3 * W + i] = __float2bfloat16(xb * bf(sig_precise(xb))); // silu: the sigmoid rounded, then the bf16 product
+    qkv[(size_t)r * 3 * W + i] = __float2bfloat16_rn(acc / (1.0f + expf(-acc))); // silu exactly as chain_kernel
 }
 
 // The recurrent step over the whole window; grid H, block D (a state row each).
@@ -85,7 +80,7 @@ extern "C" __global__ void kda_step(const __nv_bfloat16* __restrict__ qkv, const
         const float vk = __bfloat162float(qkv[qb + W + t]);
         const float vv = __bfloat162float(qkv[qb + 2 * W + t]);
         const float sa = __bfloat162float(fg[(size_t)r * 2 * W + (size_t)h * D + t]);
-        graw[t] = bf(sa); // the gate raw, bf as stored; dk-indexed in the state, dv in the out
+        graw[t] = sa; // the f_b out (already bf16), dk-indexed in the state, dv in the out
         const float beta = sig_precise(__bfloat162float(bv[(size_t)r * H + h]));
 
         // the L2 norms over the raw values; then everyone's normalized vector
@@ -103,8 +98,8 @@ extern "C" __global__ void kda_step(const __nv_bfloat16* __restrict__ qkv, const
         }
         __syncthreads();
         const float rq = red[0], rk = red[1];
-        qvec[t] = bf((vq * rq) * qscale); // the dk-shared q, k
-        kvec[t] = bf(vk * rk);
+        qvec[t] = (vq * rq) * qscale; // fp32: the python engine keeps the normalized vectors unrounded
+        kvec[t] = vk * rk;
         __syncthreads();
 
         // this dv's state row: the dk gate, the key dot, the delta, the out
@@ -125,7 +120,7 @@ extern "C" __global__ void kda_step(const __nv_bfloat16* __restrict__ qkv, const
         // every thread sums the whole array: identical, no reduce needed
         float po = 0.0f;
         for (int i = 0; i < D; ++i) po = fmaf(syv[i], syv[i], po);
-        const float pon = rsqrtf(po / (float)D + eps);
+        const float pon = 1.0f / sqrtf(po / (float)D + eps);
         const float gate = sig_precise(__bfloat162float(fg[(size_t)r * 2 * W + W + (size_t)h * D + t])); // g_b's, dv-indexed
         float x = syv[t] * pon;
         x = __bfloat162float(onw[t]) * x; // shared [D] across heads
