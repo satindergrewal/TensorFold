@@ -69,6 +69,18 @@ const Gemms = struct {
         };
     }
 
+    /// D[rows, n] = X[rows, k] . W[k, n] (W UNtransposed: row-major x @ W).
+    fn mmNT(g: *Gemms, s: cuda.Stream, x: u64, xs: usize, w: u64, ws_: usize, out: u64, os: usize, rows: usize, n: usize, k: usize) !void {
+        const id = key(rows | (xs << 8), n, k, false) ^ (ws_ << 20) ^ (os << 26) ^ 0x5A5A;
+        const gop = try g.map.getOrPut(id);
+        if (!gop.found_existing)
+            gop.value_ptr.* = try cuda.cublaslt.Linear.initNT(&g.lt, rows, n, k, .bf16, 64 << 20, xs / 2, ws_ / 2, os / 2);
+        gop.value_ptr.run(x, w, out, g.ws.ptr, g.ws.len, s.handle) catch |err| {
+            std.debug.print("mmNT FAIL rows={d} n={d} k={d}" ++ "\n", .{ rows, n, k });
+            return err;
+        };
+    }
+
     /// D[rows, n] bf16 (or fp32) = X[rows, k] . W[n, k]^T.
     fn mm(g: *Gemms, s: cuda.Stream, x: u64, w: u64, out: u64, rows: usize, n: usize, k: usize, f32_out: bool) !void {
         const id = key(rows, n, k, f32_out);
@@ -428,9 +440,10 @@ pub const Engine = struct {
         try e.ops.rms(e.stream, e.mla_xp.ptr, w.q_norm, e.mla_qr.ptr, rows, c.q_lora, c.q_lora, c.q_lora, c.eps);
         try e.g.mm(e.stream, e.mla_qr.ptr, w.q_b, e.mla_qp.ptr, rows, H * NOPE, c.q_lora, false);
         try e.g.mm(e.stream, e.mla_qr.ptr, w.wq_b, e.mla_qp.ptr + H * NOPE * 2, rows, c.i_heads * c.i_dim, c.q_lora, false);
-        // absorb: per head ql[h,512] = qp[h,256] x kv_b[h*512..+256 rows, cols 0..256]^T
+        // absorb: ql[h, latent] = q_nope[h, qk] @ K_h[qk, latent] (kv_b's k rows,
+        // heads*qk_dim of them, 512-wide; the W is UNtransposed)
         for (0..H) |h| {
-            try e.g.mmStrided(e.stream, e.mla_qp.ptr + h * NOPE * 2, e.c.qrProj() * 2, w.kv_b + h * 512 * 512 * 2, 512 * 2, e.mla_ql.ptr + h * RANK * 2, H * RANK * 2, rows, RANK, NOPE);
+            try e.g.mmNT(e.stream, e.mla_qp.ptr + h * NOPE * 2, e.c.qrProj() * 2, w.kv_b + h * NOPE * RANK * 2, RANK * 2, e.mla_ql.ptr + h * RANK * 2, H * RANK * 2, rows, RANK, NOPE);
         }
         // attend
         const key_len = pos + rows;
@@ -455,9 +468,10 @@ pub const Engine = struct {
             try e.mla_klen.upload(0, std.mem.sliceAsBytes(kl));
         }
         try e.dsa.?.attention(e.stream, e.mla_ql.ptr, e.mla_keys.ptr + mi * cap * RANK * 2, e.mla_idx.ptr, e.mla_scale.ptr, e.mla_klen.ptr, e.mla_att.ptr, rows, H);
-        // unabsorb: per head v[h,256] = att[h,512] x kv_b[(h*512+256)..+256 rows, cols]^T (k=512)
+        // unabsorb: v[h, vdim] = V_h[vdim, latent] @ att[h, latent] (the v rows at
+        // heads*qk_dim; x UNtransposed on the right: out = W @ x^T in col-major)
         for (0..H) |h| {
-            try e.g.mmStrided(e.stream, e.mla_att.ptr + h * RANK * 2, H * RANK * 2, w.kv_b + ((h * 512 + 256) * 512) * 2, 512 * 2, e.mla_vals.ptr + h * c.v_dim * 2, H * c.v_dim * 2, rows, c.v_dim, RANK);
+            try e.g.mmNT(e.stream, e.mla_att.ptr + h * RANK * 2, H * RANK * 2, w.kv_b + (H * NOPE + h * c.v_dim) * RANK * 2, RANK * 2, e.mla_vals.ptr + h * c.v_dim * 2, H * c.v_dim * 2, rows, c.v_dim, RANK);
         }
         try e.g.mm(e.stream, e.mla_vals.ptr, w.o, e.branch.ptr, rows, c.hidden, H * c.v_dim, false);
     }

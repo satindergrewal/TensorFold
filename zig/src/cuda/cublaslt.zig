@@ -170,6 +170,39 @@ pub const Linear = struct {
         return self;
     }
 
+
+    /// Like initStrided but with op(W) = N: D[n, m] = W[n, k] X[k, m] (the stored
+    /// W read untransposed; row-major x @ W expressed in cuBLAS column-major).
+    pub fn initNT(lt: *const Library, m: u64, n: u64, k: u64, out: DataType, workspace_limit: usize, xld: u64, wld: u64, dld: u64) Error!Linear {
+        var self: Linear = undefined;
+        self.lt = lt;
+        try lt.check(lt.api.cublasLtCreate(&self.handle), "cublasLtCreate");
+        errdefer _ = lt.api.cublasLtDestroy(self.handle);
+        try lt.check(lt.api.cublasLtMatmulDescCreate(&self.desc, compute_32f, .f32), "cublasLtMatmulDescCreate");
+        errdefer _ = lt.api.cublasLtMatmulDescDestroy(self.desc);
+        const ta: c_int = 0;
+        const tb: c_int = @backingInt(Op.n);
+        try lt.check(lt.api.cublasLtMatmulDescSetAttribute(self.desc, desc_transa, &ta, @sizeOf(c_int)), "set transa");
+        try lt.check(lt.api.cublasLtMatmulDescSetAttribute(self.desc, desc_transb, &tb, @sizeOf(c_int)), "set transb");
+        try lt.check(lt.api.cublasLtMatrixLayoutCreate(&self.a, .bf16, n, k, @intCast(wld)), "layout W");
+        errdefer _ = lt.api.cublasLtMatrixLayoutDestroy(self.a);
+        try lt.check(lt.api.cublasLtMatrixLayoutCreate(&self.b, .bf16, k, m, @intCast(xld)), "layout X");
+        errdefer _ = lt.api.cublasLtMatrixLayoutDestroy(self.b);
+        try lt.check(lt.api.cublasLtMatrixLayoutCreate(&self.c, out, n, m, @intCast(dld)), "layout D");
+        errdefer _ = lt.api.cublasLtMatrixLayoutDestroy(self.c);
+        try lt.check(lt.api.cublasLtMatmulPreferenceCreate(&self.pref), "cublasLtMatmulPreferenceCreate");
+        errdefer _ = lt.api.cublasLtMatmulPreferenceDestroy(self.pref);
+        const limit: u64 = workspace_limit;
+        try lt.check(lt.api.cublasLtMatmulPreferenceSetAttribute(self.pref, pref_max_workspace_bytes, &limit, @sizeOf(u64)), "set workspace");
+        var found: [1]Heuristic = undefined;
+        var count: c_int = 0;
+        try lt.check(lt.api.cublasLtMatmulAlgoGetHeuristic(self.handle, self.desc, self.a, self.b, self.c, self.c, self.pref, 1, &found, &count), "cublasLtMatmulAlgoGetHeuristic");
+        if (count < 1 or found[0].state != 0) return error.NoAlgorithm;
+        self.algo = found[0].algo;
+        self.workspace_need = found[0].workspace_size;
+        return self;
+    }
+
     pub fn deinit(self: *Linear) void {
         const api = self.lt.api;
         _ = api.cublasLtMatmulPreferenceDestroy(self.pref);
