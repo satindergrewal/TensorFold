@@ -488,7 +488,7 @@ pub const Engine = struct {
     fn scale_iw(e: *Engine, rows: usize) !void {
         // iw *= 1/64 elementwise (bf16); a tiny kernel-free path: use act? no -
         // glm_scale added to ops: scale(x, s)
-        try e.ops.scaleBy(e.stream, e.mla_iw.ptr, e.mla_iw.ptr, rows * e.c.i_heads, 1.0 / 64.0);
+        try e.ops.scaleBy(e.stream, e.mla_iw.ptr, e.mla_iw.ptr, rows * e.c.i_heads, 1.0 / @sqrt(@as(f32, @floatFromInt(e.c.i_heads)))); // sparse.py wscale
     }
 
     /// The MoE block: router, top-8 route, shared expert, the routed experts

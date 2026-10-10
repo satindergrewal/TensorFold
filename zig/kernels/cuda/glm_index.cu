@@ -28,6 +28,8 @@ extern "C" __global__ void index_scores(const __nv_bfloat16* __restrict__ q_i, /
     if (row >= rows) return;
     const int blocks = (p0 + row + 1) / KPOOL;
     if (blk >= blocks) return;
+    // sparse._scores: sc = sum_h w_h * relu(dot * DIM^-0.5), w = W * heads^-0.5
+    const float d_scale = rsqrtf((float)DIM);
     const __nv_bfloat16* qr = q_i + (size_t)row * q_stride;
     const __nv_bfloat16* pr = pool + (size_t)blk * DIM;
     float total = 0.0f;
@@ -35,7 +37,7 @@ extern "C" __global__ void index_scores(const __nv_bfloat16* __restrict__ q_i, /
         const __nv_bfloat16* qh = qr + (size_t)h * DIM;
         float dot = 0.0f;
         for (int d = 0; d < DIM; ++d) dot = fmaf(__bfloat162float(qh[d]), __bfloat162float(pr[d]), dot);
-        total = fmaf(__bfloat162float(iw[(size_t)row * heads + h]), fmaxf(dot, 0.0f), total);
+        total = fmaf(__bfloat162float(iw[(size_t)row * heads + h]), fmaxf(dot * d_scale, 0.0f), total);
     }
     scores[(size_t)row * s_stride + blk] = total;
 }
