@@ -18,7 +18,9 @@ pub const Options = struct {
     blocks_lo: usize = 0,
     blocks_hi: usize = 1 << 16,
     context: usize = 4096, // the KV caches' capacity
-    skip_mla: bool = false,
+    skip_mla: bool = false, // bring-up: attention passes through with a zero branch
+    cont: bool = false, // the streams/branch/post/comb staged; skip embed
+    stop_after_blocks: bool = false, // leave the walk mid-model for the handoff
     dsa: ?@import("dsa.zig").Kernels = null,
     index: ?@import("index.zig").Kernels = null,
 // bring-up: attention passes through with a zero branch
@@ -144,10 +146,12 @@ pub const Engine = struct {
     mlp_tmp: cuda.DeviceBuffer, // [rows, 2*dense_inter] bf16
     mlp_act: cuda.DeviceBuffer, // [rows, dense_inter] bf16
     scratch: cuda.DeviceBuffer, // exl3/experts scratch
-    skip_mla: bool = false,
     dsa: ?@import("dsa.zig").Kernels = null,
     index: ?@import("index.zig").Kernels = null,
     context: usize = 4096,
+    skip_mla: bool = false,
+    cont: bool = false,
+    stop_after_blocks: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, dir: []const u8, opts: Options) !*Engine {
         const e = try gpa.create(Engine);
@@ -219,6 +223,8 @@ pub const Engine = struct {
             .mlp_act = undefined,
             .scratch = undefined,
             .skip_mla = opts.skip_mla,
+            .cont = opts.cont,
+            .stop_after_blocks = opts.stop_after_blocks,
             .context = opts.context,
         };
         e.stream = try cuda.Stream.init(d, true);
@@ -513,10 +519,12 @@ pub const Engine = struct {
     /// One window of `rows` tokens: ids -> picks (argmax) + logits on device.
     pub fn forward(e: *Engine, ids: []const u32, rows: usize) !void {
         const hidden = e.c.hidden;
-        // embed into the four streams
-        try e.ids.upload(0, std.mem.sliceAsBytes(ids)[0 .. rows * 4]);
-        for (0..4) |s_i| try e.ops.embed(e.stream, e.ids.ptr, e.w.embed, e.x[e.xi].ptr + s_i * hidden * 2, rows, hidden);
-        e.xi = 0;
+        if (!e.cont) {
+            // embed into the four streams
+            try e.ids.upload(0, std.mem.sliceAsBytes(ids)[0 .. rows * 4]);
+            for (0..4) |s_i| try e.ops.embed(e.stream, e.ids.ptr, e.w.embed, e.x[e.xi].ptr + s_i * hidden * 2, rows, hidden);
+            e.xi = 0;
+        }
         var ki: usize = 0;
         var mi_mla: usize = 0;
         const pos: usize = 0;
@@ -541,6 +549,7 @@ pub const Engine = struct {
             }
             _ = bi;
         }
+        if (e.stop_after_blocks) return; // the handoff: x, branch, post, comb in place
         // the final boundary folds the last branch, then the tail
         try e.boundary(rows, null, 0, true);
         try e.ops.streamMean(e.stream, e.x[e.xi].ptr, e.y.ptr, rows, hidden);

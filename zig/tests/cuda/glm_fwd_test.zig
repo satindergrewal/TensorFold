@@ -10,6 +10,8 @@ const Gpu = check.Gpu;
 
 pub fn run(gpu: Gpu, dir: []const u8, rest: []const [:0]const u8) !void {
     const nm: usize = if (rest.len > 1) std.fmt.parseInt(usize, rest[1], 10) catch 3 else 3;
+    const split = rest.len > 2 and std.mem.eql(u8, rest[2], "split");
+    if (split) return runSplit(gpu, dir, nm);
     const skip_mla = rest.len > 2 and std.mem.eql(u8, rest[2], "skip-mla");
     const a = gpu.gpa;
     var e = try glm.engine.Engine.init(a, gpu.io, gpu.d, dir, .{ .blocks_lo = 0, .blocks_hi = nm, .skip_mla = skip_mla });
@@ -97,4 +99,54 @@ pub fn run(gpu: Gpu, dir: []const u8, rest: []const [:0]const u8) !void {
         std.debug.print("  streams first NaN at {s} (len {d})" ++ "\n", .{ if (nan_at) |v| std.fmt.allocPrint(a, "{d}", .{v}) catch "oom" else "none", rows * 4 * e.c.hidden });
     }
     check.pass("glm fwd smoke: logits sum {d:.1}, max {d:.2} at {d}; picks {d},{d},{d},{d}", .{ sum, mx, mx_at, pv[0], pv[1], pv[2], pv[3] });
+}
+
+fn runSplit(gpu: Gpu, dir: []const u8, split_at: usize) !void {
+    const a = gpu.gpa;
+    // engine A on this context (device 0)
+    var ea = try glm.engine.Engine.init(a, gpu.io, gpu.d, dir, .{ .blocks_lo = 0, .blocks_hi = split_at, .stop_after_blocks = true });
+    const rows: usize = 4;
+    const ids = [_]u32{ 100, 2000, 30000, 154879 };
+    try ea.forward(&ids, rows);
+    try ea.stream.synchronize();
+    // the handoff state through the host: x (both planes), branch, post, comb
+    var ctx1 = try cuda.Context.init(gpu.d, 1);
+    defer ctx1.deinit();
+    var eb = try glm.engine.Engine.init(a, gpu.io, gpu.d, dir, .{ .blocks_lo = split_at, .blocks_hi = 45, .cont = true });
+    defer eb.deinit();
+    // stage: download under A's context, upload under B's
+    const parts = [_]struct { src: cuda.DeviceBuffer, dst: *cuda.DeviceBuffer, name: []const u8 }{
+        .{ .src = ea.x[0], .dst = &eb.x[0], .name = "x0" },
+        .{ .src = ea.x[1], .dst = &eb.x[1], .name = "x1" },
+        .{ .src = ea.branch, .dst = &eb.branch, .name = "branch" },
+        .{ .src = ea.post, .dst = &eb.post, .name = "post" },
+        .{ .src = ea.comb, .dst = &eb.comb, .name = "comb" },
+    };
+    for (parts) |pt| {
+        const bytes = try check.download(gpu, pt.src);
+        defer a.free(bytes);
+        try pt.dst.upload(0, bytes);
+    }
+    eb.xi = ea.xi;
+    try eb.forward(&ids, rows);
+    try eb.stream.synchronize();
+    const lg = try check.download(gpu, eb.logits);
+    defer a.free(lg);
+    var sum: f64 = 0;
+    var mx: f32 = -1e30;
+    var mx_at: usize = 0;
+    for (0..rows * eb.c.vocab) |i| {
+        const h: u16 = std.mem.readInt(u16, lg[i * 2 ..][0..2], .little);
+        const v = @as(f32, @bitCast(@as(u32, h) << 16));
+        sum += v;
+        if (v > mx) {
+            mx = v;
+            mx_at = i % eb.c.vocab;
+        }
+    }
+    const pk = try check.download(gpu, eb.picks);
+    defer a.free(pk);
+    const pv = std.mem.bytesAsSlice(u32, @as([]align(1) u8, pk));
+    check.pass("glm fwd SPLIT 0..{d}..46: sum {d:.1} max {d:.2} at {d}; picks {d},{d},{d},{d}", .{ split_at, sum, mx, mx_at, pv[0], pv[1], pv[2], pv[3] });
+    _ = ea.deinit();
 }
