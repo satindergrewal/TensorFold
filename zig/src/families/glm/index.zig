@@ -23,7 +23,7 @@ pub const Kernels = struct {
         k.mod.unload();
     }
 
-    pub fn scores(k: *const Kernels, s: cuda.Stream, q_i: u64, q_stride: usize, iw: u64, pool: u64, out: u64, s_stride: usize, rows: usize, p0: usize) !void {
+    pub fn scores(k: *const Kernels, s: cuda.Stream, q_i: u64, q_stride: usize, iw: u64, pool: u64, out: u64, s_stride: usize, rows: usize, p0: usize, heads: usize) !void {
         var a: cuda.Args = .{};
         a.add(q_i);
         a.add(@as(i32, @intCast(q_stride)));
@@ -33,6 +33,7 @@ pub const Kernels = struct {
         a.add(@as(i32, @intCast(s_stride)));
         a.add(@as(i32, @intCast(rows)));
         a.add(@as(i32, @intCast(p0)));
+        a.add(@as(i32, @intCast(heads)));
         const blocks = (p0 + rows + 3) / 4; // the last row's, an upper bound
         try cuda.launch.launch(k.scores_fn, .{ .grid = .{ .x = @intCast((blocks + 255) / 256), .y = @intCast(rows) }, .block = .{ .x = 256 } }, s, &a);
     }

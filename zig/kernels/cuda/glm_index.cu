@@ -12,7 +12,6 @@
 
 namespace tf_glm_index {
 
-constexpr int HEADS = 64;
 constexpr int DIM = 128;
 constexpr int KPOOL = 4;
 
@@ -23,7 +22,7 @@ extern "C" __global__ void index_scores(const __nv_bfloat16* __restrict__ q_i, /
                                         const float* __restrict__ iw, // [rows, HEADS]
                                         const __nv_bfloat16* __restrict__ pool, // [pool_rows, DIM]
                                         float* __restrict__ scores, // [rows, s_stride]
-                                        int s_stride, int rows, int p0) {
+                                        int s_stride, int rows, int p0, int heads) {
     const int row = blockIdx.y;
     const int blk = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= rows) return;
@@ -32,11 +31,11 @@ extern "C" __global__ void index_scores(const __nv_bfloat16* __restrict__ q_i, /
     const __nv_bfloat16* qr = q_i + (size_t)row * q_stride;
     const __nv_bfloat16* pr = pool + (size_t)blk * DIM;
     float total = 0.0f;
-    for (int h = 0; h < HEADS; ++h) {
+    for (int h = 0; h < heads; ++h) {
         const __nv_bfloat16* qh = qr + (size_t)h * DIM;
         float dot = 0.0f;
         for (int d = 0; d < DIM; ++d) dot = fmaf(__bfloat162float(qh[d]), __bfloat162float(pr[d]), dot);
-        total = fmaf(iw[(size_t)row * HEADS + h], fmaxf(dot, 0.0f), total);
+        total = fmaf(iw[(size_t)row * heads + h], fmaxf(dot, 0.0f), total);
     }
     scores[(size_t)row * s_stride + blk] = total;
 }
