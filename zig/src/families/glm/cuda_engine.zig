@@ -643,12 +643,16 @@ pub const Engine = struct {
             try e.ops.pool(e.stream, e.mla_ik.ptr + mi * cap * c.i_dim * 2, e.mla_ig.ptr + mi * cap * c.i_dim * 2, w.ape, e.mla_pool.ptr + mi * (cap / 4) * c.i_dim * 2, first_blk, last_blk - first_blk);
         // q side: norm q_a out, project nope (q_b) and the indexer queries (wq_b)
         try e.ops.rms(e.stream, e.mla_xp.ptr, w.q_norm, e.mla_qr.ptr, rows, c.q_lora, c.q_lora, c.q_lora, c.eps);
-        try e.g.mm(e.stream, e.mla_qr.ptr, w.q_b, e.mla_qp.ptr, rows, H * NOPE, c.q_lora, false);
-        try e.g.mm(e.stream, e.mla_qr.ptr, w.wq_b, e.mla_qp.ptr + H * NOPE * 2, rows, c.i_heads * c.i_dim, c.q_lora, false);
+        // both q_b and the indexer queries write the interleaved [rows, qrProj] layout
+        // the absorb and the index scores read (ldc = qrProj, wq_b at column H*NOPE)
+        const qst = c.q_lora * 2;
+        const qpst = c.qrProj() * 2;
+        try e.g.mmStrided(e.stream, e.mla_qr.ptr, qst, w.q_b, qst, e.mla_qp.ptr, qpst, rows, H * NOPE, c.q_lora);
+        try e.g.mmStrided(e.stream, e.mla_qr.ptr, qst, w.wq_b, qst, e.mla_qp.ptr + H * NOPE * 2, qpst, rows, c.i_heads * c.i_dim, c.q_lora);
         // absorb: ql[h, latent] = q_nope[h, qk] @ K_h[qk, latent] (kv_b's k rows,
         // heads*qk_dim of them, 512-wide; the W is UNtransposed)
         for (0..H) |h| {
-            try e.g.mmNT(e.stream, e.mla_qp.ptr + h * NOPE * 2, e.c.qrProj() * 2, w.kv_b + h * NOPE * RANK * 2, RANK * 2, e.mla_ql.ptr + h * RANK * 2, H * RANK * 2, rows, RANK, NOPE);
+            try e.g.mmNT(e.stream, e.mla_qp.ptr + h * NOPE * 2, e.c.qrProj() * 2, w.kv_b + h * RANK * RANK * 2, RANK * 2, e.mla_ql.ptr + h * RANK * 2, H * RANK * 2, rows, RANK, NOPE);
         }
         // attend
         const key_len = pos + rows;
@@ -656,7 +660,7 @@ pub const Engine = struct {
             const idxbuf = try e.gpa.alloc(i32, rows * 2051);
             defer e.gpa.free(idxbuf);
             for (0..rows) |r| for (0..2051) |t| {
-                idxbuf[r * 2051 + t] = if (t < key_len) @intCast(t) else -1;
+                idxbuf[r * 2051 + t] = if (t < key_len and t <= pos + r) @intCast(t) else -1;
             };
             try e.mla_idx.upload(0, std.mem.sliceAsBytes(idxbuf));
         } else {
@@ -676,9 +680,20 @@ pub const Engine = struct {
         // unabsorb: v[h, vdim] = V_h[vdim, latent] @ att[h, latent] (the v rows at
         // heads*qk_dim; x UNtransposed on the right: out = W @ x^T in col-major)
         for (0..H) |h| {
-            try e.g.mmNT(e.stream, e.mla_att.ptr + h * RANK * 2, H * RANK * 2, w.kv_b + (h * 512 + 256) * RANK * 2, RANK * 2, e.mla_vals.ptr + h * c.v_dim * 2, H * c.v_dim * 2, rows, c.v_dim, RANK);
+            // V is stored [v_dim, latent]: the transposed-W form (like mm, with strides)
+            try e.g.mmStrided(e.stream, e.mla_att.ptr + h * RANK * 2, H * RANK * 2, w.kv_b + (h * 512 + 256) * RANK * 2, RANK * 2, e.mla_vals.ptr + h * c.v_dim * 2, H * c.v_dim * 2, rows, c.v_dim, RANK);
         }
         try e.g.mm(e.stream, e.mla_vals.ptr, w.o, e.branch.ptr, rows, c.hidden, H * c.v_dim, false);
+        if (rows == 4 and mi == 0) {
+            try e.stream.synchronize();
+            try e.dumpBin("mla_xp.bin", e.mla_xp.ptr, rows * c.q_lora * 2);
+            try e.dumpBin("mla_qr.bin", e.mla_qr.ptr, rows * c.q_lora * 2);
+            try e.dumpBin("mla_keys.bin", e.mla_keys.ptr + (mi * cap + pos) * RANK * 2, rows * RANK * 2);
+            try e.dumpBin("mla_qp.bin", e.mla_qp.ptr, rows * c.qrProj() * 2);
+            try e.dumpBin("mla_ql.bin", e.mla_ql.ptr, rows * H * RANK * 2);
+            try e.dumpBin("mla_att.bin", e.mla_att.ptr, rows * H * RANK * 2);
+            try e.dumpBin("mla_vals.bin", e.mla_vals.ptr, rows * H * c.v_dim * 2);
+        }
     }
 
     fn mla_ik_raw_ptr(e: *Engine, mi: usize, pos: usize) u64 {
