@@ -98,6 +98,7 @@ pub const Engine = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     block_sums: ?[]f64 = null, // set by the test: per-block x-stream fingerprints
+    cur_bi: usize = 0,
     d: *const cuda.Driver,
     stream: cuda.Stream,
     c: Config,
@@ -748,6 +749,16 @@ pub const Engine = struct {
             }
         }
         try e.ops.combine(e.stream, e.moe_ys.ptr, e.moe_ye.ptr, e.moe_wts.ptr, e.branch.ptr, rows, e.c.topk, hidden);
+        if (rows == 4 and e.cur_bi == 3) {
+            try e.stream.synchronize();
+            {
+                try e.dumpBin("moe_logits.bin", e.moe_logits.ptr, rows * e.c.experts * 4);
+                try e.dumpBin("moe_pick.bin", e.moe_pick.ptr, rows * e.c.topk * 4);
+                try e.dumpBin("moe_wts.bin", e.moe_wts.ptr, rows * e.c.topk * 4);
+                try e.dumpBin("moe_ys.bin", e.moe_ys.ptr, rows * hidden * 2);
+                try e.dumpBin("moe_ye.bin", e.moe_ye.ptr, rows * e.c.topk * hidden * 2);
+            }
+        }
     }
 
     /// One window of `rows` tokens: ids -> picks (argmax) + logits on device.
@@ -764,6 +775,7 @@ pub const Engine = struct {
         var mi_mla: usize = 0;
         const pos: usize = 0;
         for (e.w.layers, e.w.blocks_lo..) |*L, bi| {
+            e.cur_bi = @intCast(bi);
             const hc_a = L.hc_attn orelse return error.UnexpectedMtp;
             try e.boundary(rows, hc_a, L.in_norm, ki > 0 or e.w.blocks_lo > 0);
             if (rows == 4 and bi <= 5) try e.dumpPb(bi, "na", e.normed.ptr, rows);

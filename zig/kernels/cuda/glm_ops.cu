@@ -83,7 +83,7 @@ extern "C" __global__ void glm_combine(const __nv_bfloat16* __restrict__ ys, con
     if (i >= d) return;
     const __nv_bfloat16* y = ye + (size_t)r * topk * d + i;
     float acc = wts[r * topk] * __bfloat162float(y[0]);
-    for (int k = 1; k < topk; ++k) acc = fmaf(acc, wts[r * topk + k], __bfloat162float(y[(size_t)k * d]));
+    for (int k = 1; k < topk; ++k) acc = fmaf(wts[r * topk + k], __bfloat162float(y[(size_t)k * d]), acc);
     out[(size_t)r * d + i] = __float2bfloat16(bf(acc) + __bfloat162float(ys[(size_t)r * d + i]));
 }
 
