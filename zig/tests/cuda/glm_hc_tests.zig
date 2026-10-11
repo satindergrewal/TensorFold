@@ -76,16 +76,18 @@ fn reference(
     for (0..F) |f| {
         const s = f / D;
         const d = f - s * D;
-        var v: f64 = fromBf16(xold[f]);
+        // glue's hc_pre computes partials on the streams ENTERING the boundary:
+        // the gates decide how to mix the incoming branch, so the features and
+        // the sum of squares always see the pre-fold value
+        const v: f64 = fromBf16(xold[f]);
         if (expand) {
             var mm: f64 = @as(f64, comb[0 * S + s]) * fromBf16(xold[0 * D + d]);
             mm += @as(f64, comb[1 * S + s]) * fromBf16(xold[1 * D + d]);
             mm += @as(f64, comb[2 * S + s]) * fromBf16(xold[2 * D + d]);
             mm += @as(f64, comb[3 * S + s]) * fromBf16(xold[3 * D + d]);
-            v = @floatCast(@as(f32, @floatCast(@as(f64, post[s]) * fromBf16(branch[d]) + mm)));
-            v = roundBf(v); // the stream write's rounding
-        }
-        x_new[f] = @floatCast(v);
+            const folded: f64 = @floatCast(@as(f32, @floatCast(@as(f64, post[s]) * fromBf16(branch[d]) + mm)));
+            x_new[f] = @floatCast(roundBf(folded));
+        } else x_new[f] = @floatCast(v);
         ss += v * v;
         for (0..MIX) |m| mix[m] += @as(f64, fromBf16(fn_w[m * F + f])) * v;
     }

@@ -46,14 +46,16 @@ extern "C" __global__ void hc_expand_mix(
     for (int tn = 0; tn < 4; ++tn) {
         const int f = 1024 * j + 4 * t + tn;
         const int s = f / D, d = f - s * D;
+        // glue.hc_pre computes its partials on the streams ENTERING the boundary
+        // (pre-fold): the gates decide how to mix the incoming branch, so v stays
+        // the old value for the features and the sum of squares
         float v = __bfloat162float(xold[rb + f]);
         if (expand) {
             float mm = c[0 * S + s] * __bfloat162float(xold[rb + 0 * D + d]);
             mm = fmaf(c[1 * S + s], __bfloat162float(xold[rb + 1 * D + d]), mm);
             mm = fmaf(c[2 * S + s], __bfloat162float(xold[rb + 2 * D + d]), mm);
             mm = fmaf(c[3 * S + s], __bfloat162float(xold[rb + 3 * D + d]), mm);
-            v = bf(post[(size_t)r * S + s] * __bfloat162float(branch[(size_t)r * D + d]) + mm);
-            xnew[rb + f] = __float2bfloat16(v);
+            xnew[rb + f] = __float2bfloat16(bf(post[(size_t)r * S + s] * __bfloat162float(branch[(size_t)r * D + d]) + mm));
         }
         ss = fmaf(v, v, ss);
         for (int m = 0; m < MIX; ++m)

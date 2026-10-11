@@ -99,6 +99,8 @@ pub const Engine = struct {
     io: std.Io,
     block_sums: ?[]f64 = null, // set by the test: per-block x-stream fingerprints
     cur_bi: usize = 0,
+    attn_sums: ?[]f64 = null,
+    fwd_count: usize = 0, // set by the test: stream means at their L-points
     d: *const cuda.Driver,
     stream: cuda.Stream,
     c: Config,
@@ -176,7 +178,7 @@ pub const Engine = struct {
             w.deinit();
             gpa.destroy(w);
         }
-        const rows_max: usize = 16;
+        const rows_max: usize = 24;
         e.* = .{
             .gpa = gpa,
             .io = io,
@@ -447,11 +449,26 @@ pub const Engine = struct {
             return;
         }
         const layer_h = h.?;
-        try e.hck.expandMix(e.stream, x_old, e.branch.ptr, e.post.ptr, e.comb.ptr, layer_h.fnp, x_new, e.part.ptr, rows, pending);
         _ = hidden;
-        // without the expand x_new was not written: the collapse reads the old
-        try e.hck.split(e.stream, if (pending) x_new else x_old, e.part.ptr, layer_h.scale, layer_h.base, norm_w, e.eps_buf.ptr, e.normed.ptr, e.post.ptr, e.comb.ptr, rows);
-        if (pending) e.xi = 1 - e.xi;
+        // glue's order: the partials and post/comb of THIS boundary (from the x
+        // entering it, with this boundary's fn) come first; the fold then mixes
+        // the branch with those fresh gates. The old order folded with the
+        // previous boundary's post/comb - one boundary stale.
+        try e.hck.expandMix(e.stream, x_old, e.branch.ptr, e.post.ptr, e.comb.ptr, layer_h.fnp, x_new, e.part.ptr, rows, false);
+        try e.hck.split(e.stream, x_old, e.part.ptr, layer_h.scale, layer_h.base, norm_w, e.eps_buf.ptr, e.normed.ptr, e.post.ptr, e.comb.ptr, rows);
+        if (pending) {
+            if (rows == 4 and e.cur_bi == 4) {
+                try e.stream.synchronize();
+                try e.dumpBin("tl4_postpre.bin", e.post.ptr, 16 * 4);
+                try e.dumpBin("tl4_branch.bin", e.branch.ptr, rows * e.c.hidden * 2);
+            }
+            try e.hck.expandMix(e.stream, x_old, e.branch.ptr, e.post.ptr, e.comb.ptr, layer_h.fnp, x_new, e.part.ptr, rows, true);
+            if (rows == 4 and e.cur_bi == 4) {
+                try e.stream.synchronize();
+                try e.dumpBin("tl4_postpost.bin", e.post.ptr, 16 * 4);
+            }
+            e.xi = 1 - e.xi;
+        }
     }
 
     /// KDA attention block `li` (its dense kind index) on normed -> branch.
@@ -558,7 +575,7 @@ pub const Engine = struct {
         }
         // the step, state ping-pong
         const st_in = if (e.kda_st_cur == 0) e.kda_st0.ptr else e.kda_st1.ptr;
-        if (li <= 4 and rows == 4) {
+        if (li <= 4 and e.fwd_count == 1) {
             try e.stream.synchronize();
             const hb = try e.gpa.alloc(u8, 256);
             defer e.gpa.free(hb);
@@ -573,7 +590,7 @@ pub const Engine = struct {
         }
         const st_out = if (e.kda_st_cur == 0) e.kda_st1.ptr else e.kda_st0.ptr;
         try e.kdk.step(e.stream, e.qkv.ptr, e.fg.ptr, e.bv.ptr, w.a, w.dt_bias, st_in + li * st_bytes, w.o_norm, c.lower_bound, c.hc_eps, rows, st_out + li * st_bytes, e.y.ptr);
-        if (li <= 4 and rows == 4) {
+        if (li <= 4 and e.fwd_count == 1) {
             try e.stream.synchronize();
             const c0 = try e.nzHead(e.kda_st0.ptr);
             const c1 = try e.nzHead(e.kda_st1.ptr);
@@ -583,7 +600,7 @@ pub const Engine = struct {
         e.kda_st_cur = 1 - e.kda_st_cur; // TODO: per-layer, not global, once windows chain
         // o_proj -> branch
         try e.g.mm(e.stream, e.y.ptr, w.o, e.branch.ptr, rows, c.hidden, Wq, false);
-        if (li <= 4 and rows == 4) {
+        if (li <= 4 and e.fwd_count == 1) {
             try e.stream.synchronize();
             std.debug.print("  ptrs st_in {x} st_out {x} st0 {x} st1 {x} sb {d}\n", .{ st_in, st_out, e.kda_st0.ptr, e.kda_st1.ptr, st_bytes });
             const z0 = try e.nzFull(e.kda_st0.ptr, e.kda_st0.len);
@@ -601,7 +618,7 @@ pub const Engine = struct {
             try e.dumpBin("sd_stin.bin", st_in + li * st_bytes, H * D * D * 4);
             std.debug.print("  step io dumped rows={d}", .{rows});
         }
-        if (li <= 4 and rows == 4) {
+        if (li <= 4 and e.fwd_count == 1) {
             try e.stream.synchronize();
             const hb = try e.gpa.alignedAlloc(u8, .@"2", D * 2);
             defer e.gpa.free(hb);
@@ -695,7 +712,7 @@ pub const Engine = struct {
             try e.g.mmStrided(e.stream, e.mla_att.ptr + h * RANK * 2, H * RANK * 2, w.kv_b + (h * 512 + 256) * RANK * 2, RANK * 2, e.mla_vals.ptr + h * c.v_dim * 2, H * c.v_dim * 2, rows, c.v_dim, RANK);
         }
         try e.g.mm(e.stream, e.mla_vals.ptr, w.o, e.branch.ptr, rows, c.hidden, H * c.v_dim, false);
-        if (rows == 4 and mi <= 1) {
+        if (e.fwd_count == 1 and mi <= 1) {
             try e.stream.synchronize();
             try e.dumpBin("mla_xp.bin", e.mla_xp.ptr, rows * c.q_lora * 2);
             try e.dumpBin("mla_qr.bin", e.mla_qr.ptr, rows * c.q_lora * 2);
@@ -759,7 +776,7 @@ pub const Engine = struct {
             }
         }
         try e.ops.combine(e.stream, e.moe_ys.ptr, e.moe_ye.ptr, e.moe_wts.ptr, e.branch.ptr, rows, e.c.topk, hidden);
-        if (rows == 4 and (e.cur_bi == 3 or e.cur_bi == 7)) {
+        if (e.fwd_count == 1 and (e.cur_bi == 3 or e.cur_bi == 7)) {
             try e.stream.synchronize();
             {
                 try e.dumpBin("moe_logits.bin", e.moe_logits.ptr, rows * e.c.experts * 4);
@@ -773,7 +790,7 @@ pub const Engine = struct {
 
     /// One window of `rows` tokens: ids -> picks (argmax) + logits on device.
     pub fn forward(e: *Engine, ids: []const u32, rows: usize) !void {
-        std.debug.print("  fwd entry rows={d}" ++ "\n", .{rows});
+        e.fwd_count += 1;
         const hidden = e.c.hidden;
         if (!e.cont) {
             // embed into the four streams
@@ -787,8 +804,41 @@ pub const Engine = struct {
         for (e.w.layers, e.w.blocks_lo..) |*L, bi| {
             e.cur_bi = @intCast(bi);
             const hc_a = L.hc_attn orelse return error.UnexpectedMtp;
+            if (e.fwd_count == 1 and bi == 4) {
+                try e.stream.synchronize();
+                try e.dumpBin("at4_xpre.bin", e.x[e.xi].ptr, rows * 4 * e.c.hidden * 2);
+                try e.dumpBin("at4_branch.bin", e.branch.ptr, rows * e.c.hidden * 2);
+                try e.dumpBin("at4_afn.bin", hc_a.fnp, 24 * 4 * e.c.hidden * 2);
+            }
             try e.boundary(rows, hc_a, L.in_norm, ki > 0 or e.w.blocks_lo > 0);
-            if (rows == 4 and bi <= 22) try e.dumpPb(bi, "na", e.normed.ptr, rows);
+            if (e.fwd_count == 1 and bi == 4) {
+                try e.stream.synchronize();
+                try e.dumpBin("at4_post.bin", e.post.ptr, 16 * 4);
+                try e.dumpBin("at4_comb.bin", e.comb.ptr, 16 * 4 * 4);
+                try e.dumpBin("at4_xpost.bin", e.x[e.xi].ptr, rows * 4 * e.c.hidden * 2);
+                try e.dumpBin("at4_abase.bin", hc_a.base, 24 * 4);
+                try e.dumpBin("at4_ascale.bin", hc_a.scale, 3 * 4);
+            }
+            if (e.attn_sums) |asums| {
+                if (e.fwd_count == 1 and bi >= 1) {
+                try e.stream.synchronize();
+                const hd = e.c.hidden;
+                const xb = try e.gpa.alloc(u8, 4 * hd * 2);
+                defer e.gpa.free(xb);
+                try e.x[e.xi].download(0, xb);
+                var acc: f64 = 0;
+                for (0..hd) |d| {
+                    var m: f32 = 0;
+                    for (0..4) |st| {
+                        const h: u16 = std.mem.readInt(u16, xb[(st * hd + d) * 2 ..][0..2], .little);
+                        m += @as(f32, @bitCast(@as(u32, h) << 16));
+                    }
+                    acc += m / 4.0;
+                }
+                asums[bi - 1] = acc;
+                }
+            }
+            if (e.fwd_count == 1 and bi <= 22) try e.dumpPb(bi, "na", e.normed.ptr, rows);
             if (bi == 0) {
                 try e.b0Print("normed", e.normed);
                 const nb = try e.gpa.alloc(u8, e.c.hidden * 2);
@@ -812,26 +862,33 @@ pub const Engine = struct {
                     mi_mla += 1;
                 },
             }
-            if (rows == 4 and bi <= 22) try e.dumpPb(bi, "ba", e.branch.ptr, rows);
-            if (rows == 4 and bi <= 5) {
+            if (e.fwd_count == 1 and bi <= 22) try e.dumpPb(bi, "ba", e.branch.ptr, rows);
+            if (e.fwd_count == 1 and bi <= 5) {
                 try e.stream.synchronize();
-                try e.dumpBin("pb0_xpre.bin", e.x[if (e.xi < 2) e.xi else 0].ptr, rows * 4 * e.c.hidden * 2);
-                try e.dumpBin("pb0_fnp.bin", (L.hc_ffn orelse unreachable).fnp, 24 * 4 * e.c.hidden * 2);
-                try e.dumpBin("pb0_fbase.bin", (L.hc_ffn orelse unreachable).base, 24 * 4);
-                try e.dumpBin("pb0_fscale.bin", (L.hc_ffn orelse unreachable).scale, 3 * 4);
+                var n1: [24]u8 = undefined;
+                try e.dumpBin(std.fmt.bufPrint(&n1, "pb{d}_xpre.bin", .{bi}) catch unreachable, e.x[if (e.xi < 2) e.xi else 0].ptr, rows * 4 * e.c.hidden * 2);
+                var n2: [24]u8 = undefined;
+                try e.dumpBin(std.fmt.bufPrint(&n2, "pb{d}_fnp.bin", .{bi}) catch unreachable, (L.hc_ffn orelse unreachable).fnp, 24 * 4 * e.c.hidden * 2);
+                try e.dumpBin("hc_fbase.bin", (L.hc_ffn orelse unreachable).base, 24 * 4);
+                try e.dumpBin("hc_fscale.bin", (L.hc_ffn orelse unreachable).scale, 3 * 4);
             }
             try e.boundary(rows, L.hc_ffn, L.post_norm, true);
-            if (rows == 4 and bi <= 22) try e.dumpPb(bi, "nf", e.normed.ptr, rows);
-            if (rows == 4 and bi <= 5) {
-                try e.dumpBin("pb0_post.bin", e.post.ptr, rows * 4 * 4);
-                try e.dumpBin("pb0_comb.bin", e.comb.ptr, rows * 16 * 4);
-                try e.dumpBin("pb0_xpost.bin", e.x[if (e.xi < 2) e.xi else 0].ptr, rows * 4 * e.c.hidden * 2);
+            if (e.fwd_count == 1 and bi <= 22) try e.dumpPb(bi, "nf", e.normed.ptr, rows);
+            if (e.fwd_count == 1 and bi <= 5) {
+                var n3: [24]u8 = undefined;
+                try e.dumpBin(std.fmt.bufPrint(&n3, "pb{d}_post.bin", .{bi}) catch unreachable, e.post.ptr, rows * 4 * 4);
+                var n4: [24]u8 = undefined;
+                try e.dumpBin(std.fmt.bufPrint(&n4, "pb{d}_comb.bin", .{bi}) catch unreachable, e.comb.ptr, rows * 16 * 4);
+                var n5: [24]u8 = undefined;
+                try e.dumpBin(std.fmt.bufPrint(&n5, "pb{d}_xpost.bin", .{bi}) catch unreachable, e.x[if (e.xi < 2) e.xi else 0].ptr, rows * 4 * e.c.hidden * 2);
+                var n7: [24]u8 = undefined;
+                try e.dumpBin(std.fmt.bufPrint(&n7, "pb{d}_part.bin", .{bi}) catch unreachable, e.part.ptr, rows * hc.partBytes(1));
             }
             switch (L.mlp) {
                 .dense => |*w| try e.denseMlp(w, rows),
                 .moe => |*w| try e.moeBlock(w, rows),
             }
-            if (rows == 4 and bi <= 22) try e.dumpPb(bi, "bf", e.branch.ptr, rows);
+            if (e.fwd_count == 1 and bi <= 22) try e.dumpPb(bi, "bf", e.branch.ptr, rows);
             if (e.block_sums) |sums| {
                 // their tap metric: row 0's mean of the 4 streams, summed over D
                 const hd = e.c.hidden;

@@ -16,12 +16,16 @@ pub fn run(gpu: Gpu, dir: []const u8, rest: []const [:0]const u8) !void {
     const a = gpu.gpa;
     var e = try glm.engine.Engine.init(a, gpu.io, gpu.d, dir, .{ .blocks_lo = 0, .blocks_hi = nm, .skip_mla = skip_mla });
     defer e.deinit();
-    const rows0: usize = 4;
+
     // per-block stream fingerprints (first 26 blocks)
     const sums = try a.alloc(f64, 46);
     defer a.free(sums);
     @memset(sums, 0);
     e.block_sums = sums;
+    const asumsv = try a.alloc(f64, 46);
+    defer a.free(asumsv);
+    @memset(asumsv, 0);
+    e.attn_sums = asumsv;
     if (rest.len > 2 and std.mem.eql(u8, rest[2], "oneshot")) {
         // one 16-row window, full picks: the token-1 parity probe
         var ids16: [16]u32 = .{ 785, 6722, 315, 9621, 374, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
@@ -66,11 +70,25 @@ pub fn run(gpu: Gpu, dir: []const u8, rest: []const [:0]const u8) !void {
         };
         std.debug.print("  st0 FULL nonzero {d}/{d}\n", .{ nzf, ff.len });
     }
-    var ids_buf: [16]u32 = .{ 785, 6722, 315, 9621, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    var ids_buf: [24]u32 = .{ 785, 6722, 315, 9621, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    var rows0: usize = 4;
+    {
+        var cdir0 = std.Io.Dir.cwd();
+        if (cdir0.openFile(gpu.io, "pf.ids", .{})) |fh0| {
+            var f0 = fh0;
+            defer f0.close(gpu.io);
+            var buf0: [96]u8 = undefined;
+            if (f0.readPositional(gpu.io, &[1][]u8{buf0[0..]}, 0)) |n0| {
+                const cnt0 = @min(n0 / 4, 24);
+                for (0..cnt0) |i| ids_buf[i] = std.mem.readInt(u32, buf0[i * 4 ..][0..4], .little);
+                rows0 = cnt0;
+            } else |_| {}
+        } else |_| {}
+    }
     var n_gen: usize = 0;
-    while (n_gen < 12) : (n_gen += 1) {
+    while (n_gen < 5) : (n_gen += 1) {
         const rows_now = rows0 + n_gen;
-        if (rows_now > 16) break;
+        if (rows_now > 23) break;
         try e.forward(ids_buf[0..rows_now], rows_now);
         try e.stream.synchronize();
         const pk = try check.download(gpu, e.picks);
@@ -85,6 +103,17 @@ pub fn run(gpu: Gpu, dir: []const u8, rest: []const [:0]const u8) !void {
             for (0..@min(nm, 26)) |b| {
                 const pr = std.fmt.bufPrint(out2[w2..], "{d}:{d:.4} ", .{ b, sums[b] }) catch unreachable;
                 w2 += pr.len;
+            }
+            {
+                var out3: []u8 = try a.alloc(u8, nm * 20 + 8);
+                defer a.free(out3);
+                var w3: usize = 0;
+                for (1..@min(nm, 26)) |b| {
+                    const pr = std.fmt.bufPrint(out3[w3..], "{d}:{d:.4} ", .{ b, asumsv[b - 1] }) catch unreachable;
+                    w3 += pr.len;
+                }
+                std.debug.print("  firstpass attnsums {s}\n", .{out3[0..w3]});
+
             }
             std.debug.print("  firstpass blocksums {s}\n", .{out2[0..w2]});
         }
@@ -206,8 +235,21 @@ fn runSplit(gpu: Gpu, dir: []const u8, split_at: usize, nm: usize) !void {
     const a = gpu.gpa;
     // engine A on this context (device 0)
     var ea = try glm.engine.Engine.init(a, gpu.io, gpu.d, dir, .{ .blocks_lo = 0, .blocks_hi = split_at, .stop_after_blocks = true });
-    const rows: usize = 5;
-    const ids = [5]u32{ 785, 6722, 315, 9621, 374 };
+    const rows: usize = 19;
+    var ids: [24]u32 = .{ 151644, 872, 198, 4063, 374, 2207, 315, 9621, 30, 151645, 198, 151644, 77091, 198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    // prompt file override: pf.ids in the cwd (u32 LE, count = rows from argv not supported; first 16)
+    {
+        var cdir = std.Io.Dir.cwd();
+        if (cdir.openFile(gpu.io, "pf.ids", .{})) |fh| {
+            var f = fh;
+            defer f.close(gpu.io);
+            var buf: [64]u8 = undefined;
+            if (f.readPositional(gpu.io, &[1][]u8{buf[0..]}, 0)) |n| {
+                const cnt = @min(n / 4, 24);
+                for (0..cnt) |i| ids[i] = std.mem.readInt(u32, buf[i * 4 ..][0..4], .little);
+            } else |_| {}
+        } else |_| {}
+    }
     try ea.forward(&ids, rows);
     try ea.stream.synchronize();
     // the handoff state through the host: x (both planes), branch, post, comb
