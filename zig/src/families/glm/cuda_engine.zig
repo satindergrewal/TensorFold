@@ -578,6 +578,25 @@ pub const Engine = struct {
                     acc += m / 4.0;
                 }
                 sums[bi] = acc;
+                if (bi == 0) {
+                    var br: f64 = 0;
+                    const bb = e.gpa.alloc(u8, e.c.hidden * 2) catch |err| return err;
+                    defer e.gpa.free(bb);
+                    e.branch.download(0, bb) catch {};
+                    for (0..e.c.hidden) |d| {
+                        const h: u16 = std.mem.readInt(u16, bb[d * 2 ..][0..2], .little);
+                        br += @as(f32, @bitCast(@as(u32, h) << 16));
+                    }
+                    var yr: f64 = 0;
+                    const yb = e.gpa.alloc(u8, e.c.hidden * 2) catch |err| return err;
+                    defer e.gpa.free(yb);
+                    e.y.download(0, yb) catch {};
+                    for (0..e.c.hidden) |d| {
+                        const h: u16 = std.mem.readInt(u16, yb[d * 2 ..][0..2], .little);
+                        yr += @as(f32, @bitCast(@as(u32, h) << 16));
+                    }
+                    std.debug.print("  b0 branch sum {d:.2} attn-y sum {d:.2}\n", .{br, yr});
+                }
             }
         }
         if (e.stop_after_blocks) return; // the handoff: x, branch, post, comb in place
