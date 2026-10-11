@@ -334,9 +334,10 @@ pub const Engine = struct {
             defer gpa.free(sc);
             sc[0] = 1.0 / 16.0;
             e.mla_scale = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(sc));
-            const eps2 = try gpa.alloc(f32, 1);
+            const eps2 = try gpa.alloc(f32, 2);
             defer gpa.free(eps2);
             eps2[0] = e.c.eps;
+            eps2[1] = e.c.hc_eps;
             e.eps_buf = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(eps2));
             e.mla_scratch_ikraw = try cuda.DeviceBuffer.alloc(d, nm * cap * e.c.i_dim * 2);
             const kl = try gpa.alloc(i32, 1);
@@ -405,6 +406,13 @@ pub const Engine = struct {
             c += 1;
         };
         return c;
+    }
+
+    /// Per-KDA-layer probe dump: sd{li}_{tag}.bin.
+    fn dumpPb2(e: *Engine, li: usize, tag: []const u8, ptr: u64, n: usize) !void {
+        var name: [24]u8 = undefined;
+        const nm = std.fmt.bufPrint(&name, "sd{d}_{s}.bin", .{ li, tag }) catch return;
+        try e.dumpBin(nm, ptr, n);
     }
 
     /// Per-block probe dump: pb{bi}_{tag}.bin, rows*hidden bf16 at a raw pointer.
@@ -550,7 +558,7 @@ pub const Engine = struct {
         }
         // the step, state ping-pong
         const st_in = if (e.kda_st_cur == 0) e.kda_st0.ptr else e.kda_st1.ptr;
-        if (li == 0 and rows == 4) {
+        if (li <= 4 and rows == 4) {
             try e.stream.synchronize();
             const hb = try e.gpa.alloc(u8, 256);
             defer e.gpa.free(hb);
@@ -565,7 +573,7 @@ pub const Engine = struct {
         }
         const st_out = if (e.kda_st_cur == 0) e.kda_st1.ptr else e.kda_st0.ptr;
         try e.kdk.step(e.stream, e.qkv.ptr, e.fg.ptr, e.bv.ptr, w.a, w.dt_bias, st_in + li * st_bytes, w.o_norm, c.lower_bound, c.hc_eps, rows, st_out + li * st_bytes, e.y.ptr);
-        if (li == 0 and rows == 4) {
+        if (li <= 4 and rows == 4) {
             try e.stream.synchronize();
             const c0 = try e.nzHead(e.kda_st0.ptr);
             const c1 = try e.nzHead(e.kda_st1.ptr);
@@ -575,25 +583,25 @@ pub const Engine = struct {
         e.kda_st_cur = 1 - e.kda_st_cur; // TODO: per-layer, not global, once windows chain
         // o_proj -> branch
         try e.g.mm(e.stream, e.y.ptr, w.o, e.branch.ptr, rows, c.hidden, Wq, false);
-        if (li == 0 and rows == 4) {
+        if (li <= 4 and rows == 4) {
             try e.stream.synchronize();
             std.debug.print("  ptrs st_in {x} st_out {x} st0 {x} st1 {x} sb {d}\n", .{ st_in, st_out, e.kda_st0.ptr, e.kda_st1.ptr, st_bytes });
             const z0 = try e.nzFull(e.kda_st0.ptr, e.kda_st0.len);
             const z1 = try e.nzFull(e.kda_st1.ptr, e.kda_st1.len);
             std.debug.print("  census st0 {d}/{d} st1 {d}/{d}\n", .{ z0, e.kda_st0.len / 4, z1, e.kda_st1.len / 4 });
 
-            try e.dumpBin("sd_qkv.bin", e.qkv.ptr, rows * 3 * Wq * 2);
-            try e.dumpBin("sd_fg.bin", e.fg.ptr, rows * 2 * Wq * 2);
-            try e.dumpBin("sd_bv.bin", e.bv.ptr, rows * H * 2);
-            try e.dumpBin("sd_a.bin", w.a, H * 4);
-            try e.dumpBin("sd_dtb.bin", w.dt_bias, H * D * 4);
-            try e.dumpBin("sd_onw.bin", w.o_norm, D * 2);
-            try e.dumpBin("sd_y.bin", e.y.ptr, rows * Wq * 2);
+            try e.dumpPb2(li, "qkv", e.qkv.ptr, rows * 3 * Wq * 2);
+            try e.dumpPb2(li, "fg", e.fg.ptr, rows * 2 * Wq * 2);
+            try e.dumpPb2(li, "bv", e.bv.ptr, rows * H * 2);
+            try e.dumpPb2(li, "a", w.a, H * 4);
+            try e.dumpPb2(li, "dtb", w.dt_bias, H * D * 4);
+            try e.dumpPb2(li, "onw", w.o_norm, D * 2);
+            try e.dumpPb2(li, "y", e.y.ptr, rows * Wq * 2);
             try e.dumpBin("sd_stout.bin", st_out + li * st_bytes, H * D * D * 4);
             try e.dumpBin("sd_stin.bin", st_in + li * st_bytes, H * D * D * 4);
             std.debug.print("  step io dumped rows={d}", .{rows});
         }
-        if (li == 0 and rows == 4) {
+        if (li <= 4 and rows == 4) {
             try e.stream.synchronize();
             const hb = try e.gpa.alignedAlloc(u8, .@"2", D * 2);
             defer e.gpa.free(hb);
@@ -687,7 +695,7 @@ pub const Engine = struct {
             try e.g.mmStrided(e.stream, e.mla_att.ptr + h * RANK * 2, H * RANK * 2, w.kv_b + (h * 512 + 256) * RANK * 2, RANK * 2, e.mla_vals.ptr + h * c.v_dim * 2, H * c.v_dim * 2, rows, c.v_dim, RANK);
         }
         try e.g.mm(e.stream, e.mla_vals.ptr, w.o, e.branch.ptr, rows, c.hidden, H * c.v_dim, false);
-        if (rows == 4 and mi == 0) {
+        if (rows == 4 and mi <= 1) {
             try e.stream.synchronize();
             try e.dumpBin("mla_xp.bin", e.mla_xp.ptr, rows * c.q_lora * 2);
             try e.dumpBin("mla_qr.bin", e.mla_qr.ptr, rows * c.q_lora * 2);
@@ -751,7 +759,7 @@ pub const Engine = struct {
             }
         }
         try e.ops.combine(e.stream, e.moe_ys.ptr, e.moe_ye.ptr, e.moe_wts.ptr, e.branch.ptr, rows, e.c.topk, hidden);
-        if (rows == 4 and e.cur_bi == 3) {
+        if (rows == 4 and (e.cur_bi == 3 or e.cur_bi == 7)) {
             try e.stream.synchronize();
             {
                 try e.dumpBin("moe_logits.bin", e.moe_logits.ptr, rows * e.c.experts * 4);
@@ -780,7 +788,7 @@ pub const Engine = struct {
             e.cur_bi = @intCast(bi);
             const hc_a = L.hc_attn orelse return error.UnexpectedMtp;
             try e.boundary(rows, hc_a, L.in_norm, ki > 0 or e.w.blocks_lo > 0);
-            if (rows == 4 and bi <= 5) try e.dumpPb(bi, "na", e.normed.ptr, rows);
+            if (rows == 4 and bi <= 22) try e.dumpPb(bi, "na", e.normed.ptr, rows);
             if (bi == 0) {
                 try e.b0Print("normed", e.normed);
                 const nb = try e.gpa.alloc(u8, e.c.hidden * 2);
@@ -793,6 +801,7 @@ pub const Engine = struct {
             switch (L.attn) {
                 .kda => |*w| {
                     try e.kdaLayer(ki, w, rows);
+                    ki += 1;
                     if (bi == 0) try e.b0Print("attn", e.y);
                 },
                 .mla => {
@@ -803,15 +812,26 @@ pub const Engine = struct {
                     mi_mla += 1;
                 },
             }
-            if (rows == 4 and bi <= 5) try e.dumpPb(bi, "ba", e.branch.ptr, rows);
-            ki += 1;
+            if (rows == 4 and bi <= 22) try e.dumpPb(bi, "ba", e.branch.ptr, rows);
+            if (rows == 4 and bi <= 5) {
+                try e.stream.synchronize();
+                try e.dumpBin("pb0_xpre.bin", e.x[if (e.xi < 2) e.xi else 0].ptr, rows * 4 * e.c.hidden * 2);
+                try e.dumpBin("pb0_fnp.bin", (L.hc_ffn orelse unreachable).fnp, 24 * 4 * e.c.hidden * 2);
+                try e.dumpBin("pb0_fbase.bin", (L.hc_ffn orelse unreachable).base, 24 * 4);
+                try e.dumpBin("pb0_fscale.bin", (L.hc_ffn orelse unreachable).scale, 3 * 4);
+            }
             try e.boundary(rows, L.hc_ffn, L.post_norm, true);
-            if (rows == 4 and bi <= 5) try e.dumpPb(bi, "nf", e.normed.ptr, rows);
+            if (rows == 4 and bi <= 22) try e.dumpPb(bi, "nf", e.normed.ptr, rows);
+            if (rows == 4 and bi <= 5) {
+                try e.dumpBin("pb0_post.bin", e.post.ptr, rows * 4 * 4);
+                try e.dumpBin("pb0_comb.bin", e.comb.ptr, rows * 16 * 4);
+                try e.dumpBin("pb0_xpost.bin", e.x[if (e.xi < 2) e.xi else 0].ptr, rows * 4 * e.c.hidden * 2);
+            }
             switch (L.mlp) {
                 .dense => |*w| try e.denseMlp(w, rows),
                 .moe => |*w| try e.moeBlock(w, rows),
             }
-            if (rows == 4 and bi <= 5) try e.dumpPb(bi, "bf", e.branch.ptr, rows);
+            if (rows == 4 and bi <= 22) try e.dumpPb(bi, "bf", e.branch.ptr, rows);
             if (e.block_sums) |sums| {
                 // their tap metric: row 0's mean of the 4 streams, summed over D
                 const hd = e.c.hidden;
@@ -856,6 +876,11 @@ pub const Engine = struct {
         try e.boundary(rows, null, 0, true);
         try e.ops.streamMean(e.stream, e.x[e.xi].ptr, e.y.ptr, rows, hidden);
         try e.ops.rms(e.stream, e.y.ptr, e.w.final_norm, e.normed.ptr, rows, hidden, hidden, hidden, e.c.eps);
+        if (rows == 4) {
+            try e.stream.synchronize();
+            try e.dumpBin("tail_x.bin", e.x[e.xi].ptr, rows * 4 * hidden * 2);
+            try e.dumpBin("tail_normed.bin", e.normed.ptr, rows * hidden * 2);
+        }
         try e.g.mm(e.stream, e.normed.ptr, e.w.head, e.logits.ptr, e.rows_max, e.c.vocab, hidden, false);
         try e.ops.argmax(e.stream, e.logits.ptr, e.picks.ptr, rows, e.c.vocab);
     }

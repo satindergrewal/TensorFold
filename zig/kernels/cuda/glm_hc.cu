@@ -117,7 +117,7 @@ extern "C" __global__ void hc_split(
 
     if (t < S) {
         const float z = mix[t] * scale[0] + base[t];
-        pre_s[t] = 1.0f / (1.0f + __expf(-z)) + eps[0];
+        pre_s[t] = 1.0f / (1.0f + __expf(-z)) + eps[1];
         const float zp = mix[S + t] * scale[1] + base[S + t];
         post_out[(size_t)r * S + t] = 2.0f / (1.0f + __expf(-zp));
     }
@@ -132,6 +132,8 @@ extern "C" __global__ void hc_split(
             row[i] = -INFINITY;
             for (int jj = 0; jj < S; ++jj) row[i] = fmaxf(row[i], mm[i][jj]);
         }
+        // glue._hc_finish's bits: a plain init, one column pass, then ITERS-1
+        // row/column pairs, hc_eps on every denominator and after the init
         float rr[4][4];
         for (int i = 0; i < S; ++i) {
             float e[4], sum = 0.0f;
@@ -139,18 +141,23 @@ extern "C" __global__ void hc_split(
                 e[jj] = __expf(mm[i][jj] - row[i]);
                 sum += e[jj];
             }
-            for (int jj = 0; jj < S; ++jj) rr[i][jj] = e[jj] / (sum + eps[0]) + eps[0];
+            for (int jj = 0; jj < S; ++jj) rr[i][jj] = e[jj] / sum + eps[1];
         }
-        for (int it = 0; it < 20; ++it) {
+        for (int jj = 0; jj < S; ++jj) {
+            float sum = 0.0f;
+            for (int i = 0; i < S; ++i) sum += rr[i][jj];
+            for (int i = 0; i < S; ++i) rr[i][jj] /= sum + eps[1];
+        }
+        for (int it = 0; it < 19; ++it) {
             for (int i = 0; i < S; ++i) {
                 float sum = 0.0f;
                 for (int jj = 0; jj < S; ++jj) sum += rr[i][jj];
-                for (int jj = 0; jj < S; ++jj) rr[i][jj] /= sum + eps[0];
+                for (int jj = 0; jj < S; ++jj) rr[i][jj] /= sum + eps[1];
             }
             for (int jj = 0; jj < S; ++jj) {
                 float sum = 0.0f;
                 for (int i = 0; i < S; ++i) sum += rr[i][jj];
-                for (int i = 0; i < S; ++i) rr[i][jj] /= sum + eps[0];
+                for (int i = 0; i < S; ++i) rr[i][jj] /= sum + eps[1];
             }
         }
         for (int i = 0; i < S; ++i)

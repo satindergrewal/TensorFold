@@ -11,7 +11,7 @@ const Gpu = check.Gpu;
 pub fn run(gpu: Gpu, dir: []const u8, rest: []const [:0]const u8) !void {
     const nm: usize = if (rest.len > 1) std.fmt.parseInt(usize, rest[1], 10) catch 3 else 3;
     const split = rest.len > 2 and std.mem.eql(u8, rest[2], "split");
-    if (split) return runSplit(gpu, dir, nm);
+    if (split) return runSplit(gpu, dir, nm / 2, nm);
     const skip_mla = rest.len > 2 and std.mem.eql(u8, rest[2], "skip-mla");
     const a = gpu.gpa;
     var e = try glm.engine.Engine.init(a, gpu.io, gpu.d, dir, .{ .blocks_lo = 0, .blocks_hi = nm, .skip_mla = skip_mla });
@@ -24,8 +24,8 @@ pub fn run(gpu: Gpu, dir: []const u8, rest: []const [:0]const u8) !void {
     e.block_sums = sums;
     if (rest.len > 2 and std.mem.eql(u8, rest[2], "oneshot")) {
         // one 16-row window, full picks: the token-1 parity probe
-        var ids16: [16]u32 = .{ 100, 2000, 30000, 154800, 5, 77, 999, 4242, 151665, 2, 31340, 27501, 100, 2000, 30000, 154800 };
-        try e.forward(&ids16, 16);
+        var ids16: [16]u32 = .{ 785, 6722, 315, 9621, 374, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+        try e.forward(&ids16, 5);
         try e.stream.synchronize();
         const pk = try check.download(gpu, e.picks);
         defer a.free(pk);
@@ -33,7 +33,7 @@ pub fn run(gpu: Gpu, dir: []const u8, rest: []const [:0]const u8) !void {
         var out: []u8 = try a.alloc(u8, 160);
         defer a.free(out);
         var w: usize = 0;
-        for (pv[0..16]) |t| {
+        for (pv[0..5]) |t| {
             const printed = std.fmt.bufPrint(out[w..], "{d} ", .{t}) catch unreachable;
             w += printed.len;
         }
@@ -66,7 +66,7 @@ pub fn run(gpu: Gpu, dir: []const u8, rest: []const [:0]const u8) !void {
         };
         std.debug.print("  st0 FULL nonzero {d}/{d}\n", .{ nzf, ff.len });
     }
-    var ids_buf: [16]u32 = .{ 100, 2000, 30000, 154800, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    var ids_buf: [16]u32 = .{ 785, 6722, 315, 9621, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
     var n_gen: usize = 0;
     while (n_gen < 12) : (n_gen += 1) {
         const rows_now = rows0 + n_gen;
@@ -202,12 +202,12 @@ pub fn run(gpu: Gpu, dir: []const u8, rest: []const [:0]const u8) !void {
     check.pass("glm fwd smoke: logits sum {d:.1}, max {d:.2} at {d}; picks {d},{d},{d},{d}", .{ sum, mx, mx_at, pv[0], pv[1], pv[2], pv[3] });
 }
 
-fn runSplit(gpu: Gpu, dir: []const u8, split_at: usize) !void {
+fn runSplit(gpu: Gpu, dir: []const u8, split_at: usize, nm: usize) !void {
     const a = gpu.gpa;
     // engine A on this context (device 0)
     var ea = try glm.engine.Engine.init(a, gpu.io, gpu.d, dir, .{ .blocks_lo = 0, .blocks_hi = split_at, .stop_after_blocks = true });
-    const rows: usize = 16;
-    const ids = [16]u32{ 100, 2000, 30000, 154800, 5, 77, 999, 4242, 151665, 2, 31340, 27501, 100, 2000, 30000, 154800 };
+    const rows: usize = 5;
+    const ids = [5]u32{ 785, 6722, 315, 9621, 374 };
     try ea.forward(&ids, rows);
     try ea.stream.synchronize();
     // the handoff state through the host: x (both planes), branch, post, comb
@@ -222,7 +222,7 @@ fn runSplit(gpu: Gpu, dir: []const u8, split_at: usize) !void {
     const xi_hand = ea.xi;
     var ctx1 = try cuda.Context.init(gpu.d, 1);
     defer ctx1.deinit();
-    var eb = try glm.engine.Engine.init(a, gpu.io, gpu.d, dir, .{ .blocks_lo = split_at, .blocks_hi = 45, .cont = true });
+    var eb = try glm.engine.Engine.init(a, gpu.io, gpu.d, dir, .{ .blocks_lo = split_at, .blocks_hi = @max(nm, split_at + 1), .cont = true });
     defer eb.deinit();
     try eb.x[0].upload(0, ho.x0);
     try eb.x[1].upload(0, ho.x1);
