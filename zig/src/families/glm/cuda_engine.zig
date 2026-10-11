@@ -563,15 +563,19 @@ pub const Engine = struct {
                 .moe => |*w| try e.moeBlock(w, rows),
             }
             if (e.block_sums) |sums| {
-                const xb = e.x[e.xi];
-                const n: usize = @min(rows * 4 * e.c.hidden, 4096);
-                const b = e.gpa.alloc(u8, n * 2) catch |err| return err;
+                // their tap metric: row 0's mean of the 4 streams, summed over D
+                const hd = e.c.hidden;
+                const b = e.gpa.alloc(u8, 4 * hd * 2) catch |err| return err;
                 defer e.gpa.free(b);
-                xb.download(0, b) catch {};
+                e.x[e.xi].download(0, b) catch {};
                 var acc: f64 = 0;
-                for (0..n) |i| {
-                    const h: u16 = std.mem.readInt(u16, b[i * 2 ..][0..2], .little);
-                    acc += @as(f32, @bitCast(@as(u32, h) << 16));
+                for (0..hd) |d| {
+                    var m: f32 = 0;
+                    for (0..4) |st| {
+                        const h: u16 = std.mem.readInt(u16, b[(st * hidden + d) * 2 ..][0..2], .little);
+                        m += @as(f32, @bitCast(@as(u32, h) << 16));
+                    }
+                    acc += m / 4.0;
                 }
                 sums[bi] = acc;
             }
