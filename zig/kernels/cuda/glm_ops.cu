@@ -87,6 +87,26 @@ extern "C" __global__ void glm_combine(const __nv_bfloat16* __restrict__ ys, con
     out[(size_t)r * d + i] = __float2bfloat16(bf(acc) + __bfloat162float(ys[(size_t)r * d + i]));
 }
 
+extern "C" __global__ void glm_embed_f32(const int* __restrict__ ids, const __nv_bfloat16* __restrict__ e,
+                                         float* __restrict__ out, int rows, int d) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = rows * d;
+    if (i >= total) return;
+    const int r = i / d, c = i - r * d;
+    out[i] = __bfloat162float(__ldg(e + (size_t)__ldg(ids + r) * d + c));
+}
+
+// y[r, d] = bf16(sum of the 4 f32 streams in order, * 0.25).
+extern "C" __global__ void glm_stream_mean_f32(const float* __restrict__ x, __nv_bfloat16* __restrict__ y, int d) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int r = blockIdx.y;
+    if (i >= d) return;
+    const float* row = x + (size_t)r * 4 * d + i;
+    float v = row[0];
+    for (int s = 1; s < 4; ++s) v += row[(size_t)s * d];
+    y[(size_t)r * d + i] = __float2bfloat16(v * 0.25f);
+}
+
 // y[r, d] = bf16(sum of the 4 streams in order, * 0.25).
 extern "C" __global__ void glm_stream_mean(const __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ y, int d) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;

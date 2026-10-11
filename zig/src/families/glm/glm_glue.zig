@@ -14,6 +14,8 @@ fn i(x: usize) c_int {
 pub const Ops = struct {
     mod: cuda.Module,
     embed_fn: cuda.Function,
+    embed_f32_fn: cuda.Function,
+    mean_f32_fn: cuda.Function,
     rms_fn: cuda.Function,
     act_fn: cuda.Function,
     combine_fn: cuda.Function,
@@ -35,6 +37,8 @@ pub const Ops = struct {
         var o: Ops = .{
             .mod = mod,
             .embed_fn = undefined,
+            .embed_f32_fn = undefined,
+            .mean_f32_fn = undefined,
             .rms_fn = undefined,
             .act_fn = undefined,
             .combine_fn = undefined,
@@ -51,6 +55,8 @@ pub const Ops = struct {
         };
         errdefer o.unload();
         o.embed_fn = try mod.function("glm_embed");
+        o.embed_f32_fn = try mod.function("glm_embed_f32");
+        o.mean_f32_fn = try mod.function("glm_stream_mean_f32");
         o.rms_fn = try mod.function("glm_rms");
         o.act_fn = try mod.function("glm_act");
         o.combine_fn = try mod.function("glm_combine");
@@ -120,6 +126,25 @@ pub const Ops = struct {
         a.add(i(topk));
         a.add(i(d));
         try cuda.launch.launch(o.combine_fn, .{ .grid = .{ .x = @intCast((d + 255) / 256), .y = @intCast(rows) }, .block = .{ .x = 256 } }, s, &a);
+    }
+
+    pub fn embedF32(o: *const Ops, s: cuda.Stream, ids: u64, e: u64, out: u64, rows: usize, d: usize) !void {
+        var a: cuda.Args = .{};
+        a.add(ids);
+        a.add(e);
+        a.add(out);
+        a.add(i(rows));
+        a.add(i(d));
+        const total = rows * d;
+        try cuda.launch.launch(o.embed_f32_fn, .{ .grid = .{ .x = @intCast((total + 255) / 256) }, .block = .{ .x = 256 } }, s, &a);
+    }
+
+    pub fn streamMeanF32(o: *const Ops, s: cuda.Stream, x: u64, y: u64, rows: usize, d: usize) !void {
+        var a: cuda.Args = .{};
+        a.add(x);
+        a.add(y);
+        a.add(i(d));
+        try cuda.launch.launch(o.mean_f32_fn, .{ .grid = .{ .x = @intCast((d + 255) / 256), .y = @intCast(rows) }, .block = .{ .x = 256 } }, s, &a);
     }
 
     pub fn streamMean(o: *const Ops, s: cuda.Stream, x: u64, y: u64, rows: usize, d: usize) !void {

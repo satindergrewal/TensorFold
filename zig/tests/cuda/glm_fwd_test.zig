@@ -311,6 +311,36 @@ fn runSplit(gpu: Gpu, dir: []const u8, split_at: usize, nm: usize) !void {
         check.pass("glm fwd SPLIT 0..{d}..46: sum {d:.1} max {d:.2} at {d}", .{ split_at, sum, mx, mx_at });
         std.debug.print("  split16 picks: {s}\n", .{out[0..w]});
     }
+    // top-5 of the LAST row's logits: the knife-edge probe
+    {
+        const vocab = eb.c.vocab;
+        const last = try a.alloc(u32, vocab);
+        defer a.free(last);
+        var best5: [5]f32 = .{ -1e30, -1e30, -1e30, -1e30, -1e30 };
+        var at5: [5]usize = .{ 0, 0, 0, 0, 0 };
+        for (0..vocab) |v| {
+            const h: u16 = std.mem.readInt(u16, lg[((rows - 1) * vocab + v) * 2 ..][0..2], .little);
+            const val = @as(f32, @bitCast(@as(u32, h) << 16));
+            var slot: usize = 5;
+            var j: usize = 0;
+            while (j < 5) : (j += 1) {
+                if (val > best5[j]) {
+                    slot = j;
+                    break;
+                }
+            }
+            if (slot < 5) {
+                var k: usize = 4;
+                while (k > slot) : (k -= 1) {
+                    best5[k] = best5[k - 1];
+                    at5[k] = at5[k - 1];
+                }
+                best5[slot] = val;
+                at5[slot] = v;
+            }
+        }
+        std.debug.print("  top5: {d}@{d:.2} {d}@{d:.2} {d}@{d:.2} {d}@{d:.2} {d}@{d:.2}\n", .{ at5[0], best5[0], at5[1], best5[1], at5[2], best5[2], at5[3], best5[3], at5[4], best5[4] });
+    }
     {
         // deterministic-fingerprint: active rows' first 4 logits + row sums
         var ir: usize = 0;

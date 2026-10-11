@@ -12,15 +12,19 @@ pub const Kernels = struct {
     mod: cuda.Module,
     expand_fn: Function,
     split_fn: Function,
+    expand_f32_fn: Function,
+    split_f32_fn: Function,
 
     pub fn load(d: *const cuda.Driver) !Kernels {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
         var mod = try cuda.Module.load(d, cuda.kernels.glm_hc);
         errdefer mod.unload();
-        var k: Kernels = .{ .mod = mod, .expand_fn = undefined, .split_fn = undefined };
+        var k: Kernels = .{ .mod = mod, .expand_fn = undefined, .split_fn = undefined, .expand_f32_fn = undefined, .split_f32_fn = undefined };
         errdefer k.deinit();
         k.expand_fn = try mod.function(expand_sym);
         k.split_fn = try mod.function(split_sym);
+        k.expand_f32_fn = try mod.function("hc_expand_mix_f32");
+        k.split_f32_fn = try mod.function("hc_split_f32");
         return k;
     }
 
@@ -85,6 +89,60 @@ pub const Kernels = struct {
         a.add(@as(i32, @intCast(rows)));
         try launch_.launch(k.split_fn, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 1024 } }, s, &a);
     }
+    pub fn expandMixF32(
+        k: *const Kernels,
+        s: cuda.Stream,
+        x_old: u64,
+        branch: u64,
+        post: u64,
+        comb: u64,
+        fn_packed: u64,
+        x_new: u64,
+        part: u64,
+        rows: usize,
+        expand: bool,
+    ) !void {
+        var a: launch_.Args = .{};
+        a.add(x_old);
+        a.add(branch);
+        a.add(post);
+        a.add(comb);
+        a.add(fn_packed);
+        a.add(x_new);
+        a.add(part);
+        a.add(@as(i32, @intCast(rows)));
+        a.add(@as(i32, @intFromBool(expand)));
+        try launch_.launch(k.expand_f32_fn, .{ .grid = .{ .x = slices, .y = @intCast(rows) }, .block = .{ .x = 256 } }, s, &a);
+    }
+
+    pub fn splitF32(
+        k: *const Kernels,
+        s: cuda.Stream,
+        x: u64,
+        part: u64,
+        scale: u64,
+        base: u64,
+        norm_w: u64,
+        eps: u64,
+        normed: u64,
+        post_out: u64,
+        comb_out: u64,
+        rows: usize,
+    ) !void {
+        var a: launch_.Args = .{};
+        a.add(x);
+        a.add(part);
+        a.add(scale);
+        a.add(base);
+        a.add(norm_w);
+        a.add(eps);
+        a.add(normed);
+        a.add(post_out);
+        a.add(comb_out);
+        a.add(@as(i32, @intCast(rows)));
+        try launch_.launch(k.split_f32_fn, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 } }, s, &a);
+    }
+
 };
 
 pub const slices = 16; // F / 1024

@@ -261,8 +261,8 @@ pub const Engine = struct {
         const W: usize = e.c.kdaWidth();
         const rows = rows_max;
         e.ids = try cuda.DeviceBuffer.alloc(d, rows * 4);
-        e.x[0] = try cuda.DeviceBuffer.alloc(d, rows * 4 * hidden * 2);
-        e.x[1] = try cuda.DeviceBuffer.alloc(d, rows * 4 * hidden * 2);
+        e.x[0] = try cuda.DeviceBuffer.alloc(d, rows * 4 * hidden * 4); // fp32 streams
+        e.x[1] = try cuda.DeviceBuffer.alloc(d, rows * 4 * hidden * 4);
         e.branch = try cuda.DeviceBuffer.alloc(d, rows * hidden * 2);
         e.normed = try cuda.DeviceBuffer.alloc(d, rows * hidden * 2);
         e.part = try cuda.DeviceBuffer.alloc(d, rows * hc.partBytes(1));
@@ -444,7 +444,7 @@ pub const Engine = struct {
         if (h == null) {
             // the final boundary: the expand alone, the streams become the
             // mean's source
-            try e.hck.expandMix(e.stream, x_old, e.branch.ptr, e.post.ptr, e.comb.ptr, e.fn_zero.ptr, x_new, e.part.ptr, rows, true);
+            try e.hck.expandMixF32(e.stream, x_old, e.branch.ptr, e.post.ptr, e.comb.ptr, e.fn_zero.ptr, x_new, e.part.ptr, rows, true);
             e.xi = 1 - e.xi;
             return;
         }
@@ -454,15 +454,15 @@ pub const Engine = struct {
         // entering it, with this boundary's fn) come first; the fold then mixes
         // the branch with those fresh gates. The old order folded with the
         // previous boundary's post/comb - one boundary stale.
-        try e.hck.expandMix(e.stream, x_old, e.branch.ptr, e.post.ptr, e.comb.ptr, layer_h.fnp, x_new, e.part.ptr, rows, false);
-        try e.hck.split(e.stream, x_old, e.part.ptr, layer_h.scale, layer_h.base, norm_w, e.eps_buf.ptr, e.normed.ptr, e.post.ptr, e.comb.ptr, rows);
+        try e.hck.expandMixF32(e.stream, x_old, e.branch.ptr, e.post.ptr, e.comb.ptr, layer_h.fnp, x_new, e.part.ptr, rows, false);
+        try e.hck.splitF32(e.stream, x_old, e.part.ptr, layer_h.scale, layer_h.base, norm_w, e.eps_buf.ptr, e.normed.ptr, e.post.ptr, e.comb.ptr, rows);
         if (pending) {
             if (rows == 4 and e.cur_bi == 4) {
                 try e.stream.synchronize();
                 try e.dumpBin("tl4_postpre.bin", e.post.ptr, 16 * 4);
                 try e.dumpBin("tl4_branch.bin", e.branch.ptr, rows * e.c.hidden * 2);
             }
-            try e.hck.expandMix(e.stream, x_old, e.branch.ptr, e.post.ptr, e.comb.ptr, layer_h.fnp, x_new, e.part.ptr, rows, true);
+            try e.hck.expandMixF32(e.stream, x_old, e.branch.ptr, e.post.ptr, e.comb.ptr, layer_h.fnp, x_new, e.part.ptr, rows, true);
             if (rows == 4 and e.cur_bi == 4) {
                 try e.stream.synchronize();
                 try e.dumpBin("tl4_postpost.bin", e.post.ptr, 16 * 4);
@@ -795,7 +795,7 @@ pub const Engine = struct {
         if (!e.cont) {
             // embed into the four streams
             try e.ids.upload(0, std.mem.sliceAsBytes(ids)[0 .. rows * 4]);
-            for (0..4) |s_i| try e.ops.embed(e.stream, e.ids.ptr, e.w.embed, e.x[e.xi].ptr + s_i * hidden * 2, rows, hidden);
+            for (0..4) |s_i| try e.ops.embedF32(e.stream, e.ids.ptr, e.w.embed, e.x[e.xi].ptr + s_i * hidden * 4, rows, hidden);
             e.xi = 0;
         }
         var ki: usize = 0;
@@ -823,16 +823,14 @@ pub const Engine = struct {
                 if (e.fwd_count == 1 and bi >= 1) {
                 try e.stream.synchronize();
                 const hd = e.c.hidden;
-                const xb = try e.gpa.alloc(u8, 4 * hd * 2);
+                const xb = try e.gpa.alloc(u8, 4 * hd * 4);
                 defer e.gpa.free(xb);
                 try e.x[e.xi].download(0, xb);
                 var acc: f64 = 0;
+                const fv = std.mem.bytesAsSlice(f32, @as([]align(1) u8, xb));
                 for (0..hd) |d| {
-                    var m: f32 = 0;
-                    for (0..4) |st| {
-                        const h: u16 = std.mem.readInt(u16, xb[(st * hd + d) * 2 ..][0..2], .little);
-                        m += @as(f32, @bitCast(@as(u32, h) << 16));
-                    }
+                    var m: f64 = 0;
+                    for (0..4) |st| m += fv[st * hd + d];
                     acc += m / 4.0;
                 }
                 asums[bi - 1] = acc;
@@ -892,17 +890,15 @@ pub const Engine = struct {
             if (e.block_sums) |sums| {
                 // their tap metric: row 0's mean of the 4 streams, summed over D
                 const hd = e.c.hidden;
-                const b = e.gpa.alloc(u8, 4 * hd * 2) catch |err| return err;
+                const b = e.gpa.alloc(u8, 4 * hd * 4) catch |err| return err;
                 defer e.gpa.free(b);
                 e.stream.synchronize() catch {};
                 e.x[e.xi].download(0, b) catch {};
                 var acc: f64 = 0;
+                const fv = std.mem.bytesAsSlice(f32, @as([]align(1) u8, b));
                 for (0..hd) |d| {
-                    var m: f32 = 0;
-                    for (0..4) |st| {
-                        const h: u16 = std.mem.readInt(u16, b[(st * hidden + d) * 2 ..][0..2], .little);
-                        m += @as(f32, @bitCast(@as(u32, h) << 16));
-                    }
+                    var m: f64 = 0;
+                    for (0..4) |st| m += fv[st * hd + d];
                     acc += m / 4.0;
                 }
                 sums[bi] = acc;
@@ -931,7 +927,7 @@ pub const Engine = struct {
         if (e.stop_after_blocks) return; // the handoff: x, branch, post, comb in place
         // the final boundary folds the last branch, then the tail
         try e.boundary(rows, null, 0, true);
-        try e.ops.streamMean(e.stream, e.x[e.xi].ptr, e.y.ptr, rows, hidden);
+        try e.ops.streamMeanF32(e.stream, e.x[e.xi].ptr, e.y.ptr, rows, hidden);
         try e.ops.rms(e.stream, e.y.ptr, e.w.final_norm, e.normed.ptr, rows, hidden, hidden, hidden, e.c.eps);
         if (rows == 4) {
             try e.stream.synchronize();
