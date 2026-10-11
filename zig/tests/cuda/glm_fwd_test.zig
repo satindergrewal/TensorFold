@@ -235,7 +235,7 @@ fn runSplit(gpu: Gpu, dir: []const u8, split_at: usize, nm: usize) !void {
     const a = gpu.gpa;
     // engine A on this context (device 0)
     var ea = try glm.engine.Engine.init(a, gpu.io, gpu.d, dir, .{ .blocks_lo = 0, .blocks_hi = split_at, .stop_after_blocks = true });
-    const rows: usize = 19;
+    var rows: usize = 19;
     var ids: [24]u32 = .{ 151644, 872, 198, 4063, 374, 2207, 315, 9621, 30, 151645, 198, 151644, 77091, 198, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
     // prompt file override: pf.ids in the cwd (u32 LE, count = rows from argv not supported; first 16)
     {
@@ -247,6 +247,7 @@ fn runSplit(gpu: Gpu, dir: []const u8, split_at: usize, nm: usize) !void {
             if (f.readPositional(gpu.io, &[1][]u8{buf[0..]}, 0)) |n| {
                 const cnt = @min(n / 4, 24);
                 for (0..cnt) |i| ids[i] = std.mem.readInt(u32, buf[i * 4 ..][0..4], .little);
+                rows = cnt;
             } else |_| {}
         } else |_| {}
     }
@@ -279,6 +280,7 @@ fn runSplit(gpu: Gpu, dir: []const u8, split_at: usize, nm: usize) !void {
         a.free(ho.comb);
     }
     eb.xi = xi_hand;
+    eb.fwd_count = 0;
     try eb.forward(&ids, rows);
     try eb.stream.synchronize();
     const lg = try check.download(gpu, eb.logits);

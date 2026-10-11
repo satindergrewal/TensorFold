@@ -776,7 +776,7 @@ pub const Engine = struct {
             }
         }
         try e.ops.combine(e.stream, e.moe_ys.ptr, e.moe_ye.ptr, e.moe_wts.ptr, e.branch.ptr, rows, e.c.topk, hidden);
-        if (e.fwd_count == 1 and (e.cur_bi == 3 or e.cur_bi == 7)) {
+        if (e.fwd_count == 1 and (e.cur_bi == 3 or e.cur_bi == 11)) {
             try e.stream.synchronize();
             {
                 try e.dumpBin("moe_logits.bin", e.moe_logits.ptr, rows * e.c.experts * 4);
@@ -838,7 +838,7 @@ pub const Engine = struct {
                 asums[bi - 1] = acc;
                 }
             }
-            if (e.fwd_count == 1 and bi <= 22) try e.dumpPb(bi, "na", e.normed.ptr, rows);
+            if (e.fwd_count == 1 and bi <= 45) try e.dumpPb(bi, "na", e.normed.ptr, rows);
             if (bi == 0) {
                 try e.b0Print("normed", e.normed);
                 const nb = try e.gpa.alloc(u8, e.c.hidden * 2);
@@ -862,8 +862,8 @@ pub const Engine = struct {
                     mi_mla += 1;
                 },
             }
-            if (e.fwd_count == 1 and bi <= 22) try e.dumpPb(bi, "ba", e.branch.ptr, rows);
-            if (e.fwd_count == 1 and bi <= 5) {
+            if (e.fwd_count == 1 and bi <= 45) try e.dumpPb(bi, "ba", e.branch.ptr, rows);
+            if (e.fwd_count == 1 and bi <= 45) {
                 try e.stream.synchronize();
                 var n1: [24]u8 = undefined;
                 try e.dumpBin(std.fmt.bufPrint(&n1, "pb{d}_xpre.bin", .{bi}) catch unreachable, e.x[if (e.xi < 2) e.xi else 0].ptr, rows * 4 * e.c.hidden * 2);
@@ -873,8 +873,8 @@ pub const Engine = struct {
                 try e.dumpBin("hc_fscale.bin", (L.hc_ffn orelse unreachable).scale, 3 * 4);
             }
             try e.boundary(rows, L.hc_ffn, L.post_norm, true);
-            if (e.fwd_count == 1 and bi <= 22) try e.dumpPb(bi, "nf", e.normed.ptr, rows);
-            if (e.fwd_count == 1 and bi <= 5) {
+            if (e.fwd_count == 1 and bi <= 45) try e.dumpPb(bi, "nf", e.normed.ptr, rows);
+            if (e.fwd_count == 1 and bi <= 45) {
                 var n3: [24]u8 = undefined;
                 try e.dumpBin(std.fmt.bufPrint(&n3, "pb{d}_post.bin", .{bi}) catch unreachable, e.post.ptr, rows * 4 * 4);
                 var n4: [24]u8 = undefined;
@@ -888,7 +888,7 @@ pub const Engine = struct {
                 .dense => |*w| try e.denseMlp(w, rows),
                 .moe => |*w| try e.moeBlock(w, rows),
             }
-            if (e.fwd_count == 1 and bi <= 22) try e.dumpPb(bi, "bf", e.branch.ptr, rows);
+            if (e.fwd_count == 1 and bi <= 45) try e.dumpPb(bi, "bf", e.branch.ptr, rows);
             if (e.block_sums) |sums| {
                 // their tap metric: row 0's mean of the 4 streams, summed over D
                 const hd = e.c.hidden;
