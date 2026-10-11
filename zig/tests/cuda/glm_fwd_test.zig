@@ -22,6 +22,26 @@ pub fn run(gpu: Gpu, dir: []const u8, rest: []const [:0]const u8) !void {
     defer a.free(sums);
     @memset(sums, 0);
     e.block_sums = sums;
+    if (rest.len > 2 and std.mem.eql(u8, rest[2], "oneshot")) {
+        // one 16-row window, full picks: the token-1 parity probe
+        var ids16: [16]u32 = .{ 100, 2000, 30000, 154800, 5, 77, 999, 4242, 151665, 2, 31340, 27501, 100, 2000, 30000, 154800 };
+        try e.forward(&ids16, 16);
+        try e.stream.synchronize();
+        const pk = try check.download(gpu, e.picks);
+        defer a.free(pk);
+        const pv = std.mem.bytesAsSlice(u32, @as([]align(1) u8, pk));
+        var out: []u8 = try a.alloc(u8, 160);
+        defer a.free(out);
+        var w: usize = 0;
+        for (pv[0..16]) |t| {
+            const printed = std.fmt.bufPrint(out[w..], "{d} ", .{t}) catch unreachable;
+            w += printed.len;
+        }
+        std.debug.print("  oneshot picks: {s}\n", .{out[0..w]});
+
+        return;
+    }
+
     {
         // state zero check: the first 64 floats of kda_st0 right after init
         try e.stream.synchronize();
@@ -57,6 +77,17 @@ pub fn run(gpu: Gpu, dir: []const u8, rest: []const [:0]const u8) !void {
         defer a.free(pk);
         const pv = std.mem.bytesAsSlice(u32, @as([]align(1) u8, pk));
         ids_buf[rows_now] = pv[rows_now - 1];
+        if (n_gen == 0) {
+            // first forward, fresh state: the parity fingerprint vs their taps
+            var out2: []u8 = try a.alloc(u8, nm * 20 + 8);
+            defer a.free(out2);
+            var w2: usize = 0;
+            for (0..@min(nm, 26)) |b| {
+                const pr = std.fmt.bufPrint(out2[w2..], "{d}:{d:.4} ", .{ b, sums[b] }) catch unreachable;
+                w2 += pr.len;
+            }
+            std.debug.print("  firstpass blocksums {s}\n", .{out2[0..w2]});
+        }
     }
     {
         var out: []u8 = try a.alloc(u8, 160);
@@ -175,8 +206,8 @@ fn runSplit(gpu: Gpu, dir: []const u8, split_at: usize) !void {
     const a = gpu.gpa;
     // engine A on this context (device 0)
     var ea = try glm.engine.Engine.init(a, gpu.io, gpu.d, dir, .{ .blocks_lo = 0, .blocks_hi = split_at, .stop_after_blocks = true });
-    const rows: usize = 4;
-    const ids = [_]u32{ 100, 2000, 30000, 154879 };
+    const rows: usize = 16;
+    const ids = [16]u32{ 100, 2000, 30000, 154800, 5, 77, 999, 4242, 151665, 2, 31340, 27501, 100, 2000, 30000, 154800 };
     try ea.forward(&ids, rows);
     try ea.stream.synchronize();
     // the handoff state through the host: x (both planes), branch, post, comb
@@ -225,7 +256,17 @@ fn runSplit(gpu: Gpu, dir: []const u8, split_at: usize) !void {
     const pk = try check.download(gpu, eb.picks);
     defer a.free(pk);
     const pv = std.mem.bytesAsSlice(u32, @as([]align(1) u8, pk));
-    check.pass("glm fwd SPLIT 0..{d}..46: sum {d:.1} max {d:.2} at {d}; picks {d},{d},{d},{d}", .{ split_at, sum, mx, mx_at, pv[0], pv[1], pv[2], pv[3] });
+    {
+        var out: []u8 = try a.alloc(u8, 200);
+        defer a.free(out);
+        var w: usize = 0;
+        for (pv[0..rows]) |t| {
+            const printed = std.fmt.bufPrint(out[w..], "{d} ", .{t}) catch unreachable;
+            w += printed.len;
+        }
+        check.pass("glm fwd SPLIT 0..{d}..46: sum {d:.1} max {d:.2} at {d}", .{ split_at, sum, mx, mx_at });
+        std.debug.print("  split16 picks: {s}\n", .{out[0..w]});
+    }
     {
         // deterministic-fingerprint: active rows' first 4 logits + row sums
         var ir: usize = 0;

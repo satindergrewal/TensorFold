@@ -281,6 +281,8 @@ pub const Engine = struct {
         e.mlp_act = try cuda.DeviceBuffer.alloc(d, rows * e.c.dense_inter * 2);
         e.scratch = try cuda.DeviceBuffer.alloc(d, 256 << 20);
         // the recurrent state and conv history start zeroed
+        try e.post.fill32(0, null);
+        try e.comb.fill32(0, null);
         try e.kda_st0.fill32(0, null);
         try e.kda_st1.fill32(0, null);
         try e.kda_cs.fill8(0, null);
