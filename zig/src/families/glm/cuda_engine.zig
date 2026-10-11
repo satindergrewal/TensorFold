@@ -287,7 +287,7 @@ pub const Engine = struct {
         // [W, 1, TAPS] uploads (element (c, j) at c*TAPS + j)
         {
             const Wq: usize = e.c.kdaWidth();
-            e.kda_cw = try cuda.DeviceBuffer.alloc(d, 4 * 3 * Wq * 2);
+            e.kda_cw = try cuda.DeviceBuffer.alloc(d, n_kda * 4 * 3 * Wq * 2);
             var ki: usize = 0;
             for (e.w.layers) |*L| {
                 const wk = switch (L.attn) {
@@ -296,8 +296,9 @@ pub const Engine = struct {
                 };
                 const srcs = [3]u64{ wk.q_conv, wk.k_conv, wk.v_conv };
                 const taps_g: usize = 4;
+                const cw_at = e.kda_cw.ptr + ki * 4 * 3 * Wq * 2;
                 for (0..taps_g) |j| for (0..3) |part| {
-                    try e.ops.gather(e.stream, srcs[part] + j * 2, e.kda_cw.ptr + (j * 3 + part) * Wq * 2, Wq, 4);
+                    try e.ops.gather(e.stream, srcs[part] + j * 2, cw_at + (j * 3 + part) * Wq * 2, Wq, 4);
                 };
                 ki += 1;
             }
@@ -369,14 +370,25 @@ pub const Engine = struct {
     }
 
     /// Dump n bytes at a raw device pointer to a file in the cwd (probes only; raw posix write).
-    fn dumpBin(e: *Engine, name: [:0]const u8, ptr: u64, n: usize) !void {
+    fn dumpBin(e: *Engine, name: []const u8, ptr: u64, n: usize) !void {
+        try e.stream.synchronize();
         const hb = try e.gpa.alloc(u8, n);
         defer e.gpa.free(hb);
         try (cuda.DeviceBuffer{ .d = e.d, .ptr = ptr, .len = n, .borrowed = true }).download(0, hb);
-        const fd = std.posix.openatZ(std.posix.AT.FDCWD, name, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o664) catch return;
-        const f = std.Io.File{ .handle = fd, .flags = .{ .nonblocking = false } };
-        defer std.Io.File.close(f, e.io);
-        f.writeStreamingAll(e.io, hb) catch {};
+        var z: [64:0]u8 = undefined;
+        if (name.len >= z.len) return;
+        @memcpy(z[0..name.len], name);
+        z[name.len] = 0;
+        const fd = std.posix.openatZ(std.posix.AT.FDCWD, z[0..name.len :0].ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o664) catch return;
+        defer _ = std.os.linux.close(fd);
+        var off: usize = 0;
+        while (off < hb.len) {
+            const wn = std.os.linux.write(fd, hb.ptr + off, hb.len - off);
+            const wr: isize = @bitCast(wn);
+            if (std.os.linux.errno(wr) == .INTR) continue;
+            if (wr <= 0) return;
+            off += @as(usize, @intCast(wr));
+        }
     }
 
     /// Count nonzero f32 in a whole device range (probes only).
@@ -390,6 +402,13 @@ pub const Engine = struct {
             c += 1;
         };
         return c;
+    }
+
+    /// Per-block probe dump: pb{bi}_{tag}.bin, rows*hidden bf16 at a raw pointer.
+    fn dumpPb(e: *Engine, bi: usize, tag: []const u8, ptr: u64, rows: usize) !void {
+        var name: [24]u8 = undefined;
+        const n = std.fmt.bufPrint(&name, "pb{d}_{s}.bin", .{ bi, tag }) catch return;
+        try e.dumpBin(n, ptr, rows * e.c.hidden * 2);
     }
 
     /// Count nonzero f32 in the first 128 bytes at a raw device pointer (probes only).
@@ -503,7 +522,7 @@ pub const Engine = struct {
         }
         // conv: history per layer, weights the engine built at load (kda_cw)
         const cs_at = e.kda_cs.ptr + li * 3 * Wq * 2;
-        try e.kdk.conv(e.stream, e.proj.ptr, ps, cs_at, e.kda_cw.ptr, e.qkv.ptr, rows);
+        try e.kdk.conv(e.stream, e.proj.ptr, ps, cs_at, e.kda_cw.ptr + li * 4 * 3 * Wq * 2, e.qkv.ptr, rows);
         if (li == 0) {
             try e.stream.synchronize();
             const qb2 = try e.gpa.alloc(u8, 3 * Wq * 2);
@@ -579,6 +598,7 @@ pub const Engine = struct {
             var acc: f64 = 0;
             const fv = std.mem.bytesAsSlice(u16, hb);
             for (fv) |h16| acc += @as(f32, @bitCast(@as(u32, h16) << 16));
+            try e.dumpBin("sd_y2.bin", e.y.ptr, rows * Wq * 2);
             std.debug.print("  y r0 h0 sum {d:.5}\n", .{acc});
 
         }
@@ -731,6 +751,7 @@ pub const Engine = struct {
         for (e.w.layers, e.w.blocks_lo..) |*L, bi| {
             const hc_a = L.hc_attn orelse return error.UnexpectedMtp;
             try e.boundary(rows, hc_a, L.in_norm, ki > 0 or e.w.blocks_lo > 0);
+            if (rows == 4 and bi <= 5) try e.dumpPb(bi, "na", e.normed.ptr, rows);
             if (bi == 0) {
                 try e.b0Print("normed", e.normed);
                 const nb = try e.gpa.alloc(u8, e.c.hidden * 2);
@@ -753,12 +774,15 @@ pub const Engine = struct {
                     mi_mla += 1;
                 },
             }
+            if (rows == 4 and bi <= 5) try e.dumpPb(bi, "ba", e.branch.ptr, rows);
             ki += 1;
             try e.boundary(rows, L.hc_ffn, L.post_norm, true);
+            if (rows == 4 and bi <= 5) try e.dumpPb(bi, "nf", e.normed.ptr, rows);
             switch (L.mlp) {
                 .dense => |*w| try e.denseMlp(w, rows),
                 .moe => |*w| try e.moeBlock(w, rows),
             }
+            if (rows == 4 and bi <= 5) try e.dumpPb(bi, "bf", e.branch.ptr, rows);
             if (e.block_sums) |sums| {
                 // their tap metric: row 0's mean of the 4 streams, summed over D
                 const hd = e.c.hidden;

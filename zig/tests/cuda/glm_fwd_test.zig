@@ -103,6 +103,10 @@ pub fn run(gpu: Gpu, dir: []const u8, rest: []const [:0]const u8) !void {
         }
         std.debug.print("  embed stage: {d} NaNs, first {s}" ++ "\n", .{ nans, if (first) |v| std.fmt.allocPrint(a, "{d}", .{v}) catch "?" else "-" });
     }
+    try e.kda_st0.fill32(0, e.stream.handle);
+    try e.kda_st1.fill32(0, e.stream.handle);
+    try e.kda_cs.fill8(0, e.stream.handle);
+    e.kda_st_cur = 0;
     try e.forward(&ids, rows);
     try e.stream.synchronize();
     // per-buffer NaN census after the walk
