@@ -96,6 +96,7 @@ const Gemms = struct {
 
 pub const Engine = struct {
     gpa: std.mem.Allocator,
+    io: std.Io,
     block_sums: ?[]f64 = null, // set by the test: per-block x-stream fingerprints
     d: *const cuda.Driver,
     stream: cuda.Stream,
@@ -177,6 +178,7 @@ pub const Engine = struct {
         const rows_max: usize = 16;
         e.* = .{
             .gpa = gpa,
+            .io = io,
             .d = d,
             .stream = undefined,
             .c = w.config,
@@ -263,7 +265,7 @@ pub const Engine = struct {
         e.part = try cuda.DeviceBuffer.alloc(d, rows * hc.partBytes(1));
         e.post = try cuda.DeviceBuffer.alloc(d, rows * 4 * 4);
         e.comb = try cuda.DeviceBuffer.alloc(d, rows * 16 * 4);
-        e.y = try cuda.DeviceBuffer.alloc(d, rows * hidden * 2);
+        e.y = try cuda.DeviceBuffer.alloc(d, rows * @max(hidden, W) * 2); // the KDA step writes [rows, Wq]
         e.proj = try cuda.DeviceBuffer.alloc(d, rows * e.c.kdaProj() * 2);
         e.qkv = try cuda.DeviceBuffer.alloc(d, rows * 3 * W * 2);
         e.fg = try cuda.DeviceBuffer.alloc(d, rows * 2 * W * 2);
@@ -350,6 +352,59 @@ pub const Engine = struct {
 
     /// One hc boundary: expand (pending) or first-mix, then the split; the
     /// post/comb pair persists across boundaries in the engine.
+
+    /// A block-0 fingerprint of one buffer's row 0 (the lane-side prints' counterpart).
+    fn b0Print(e: *Engine, what: []const u8, buf: cuda.DeviceBuffer) !void {
+        try e.stream.synchronize();
+        const b = try e.gpa.alloc(u8, e.c.hidden * 2);
+        defer e.gpa.free(b);
+        try buf.download(0, b[0..@min(b.len, buf.len)]);
+        var acc: f64 = 0;
+        const n = @min(e.c.hidden, buf.len / 2);
+        for (0..n) |d| {
+            const h: u16 = std.mem.readInt(u16, b[d * 2 ..][0..2], .little);
+            acc += @as(f32, @bitCast(@as(u32, h) << 16));
+        }
+        std.debug.print("  [b0] {s} {d:.4}\n", .{ what, acc });
+    }
+
+    /// Dump n bytes at a raw device pointer to a file in the cwd (probes only; raw posix write).
+    fn dumpBin(e: *Engine, name: [:0]const u8, ptr: u64, n: usize) !void {
+        const hb = try e.gpa.alloc(u8, n);
+        defer e.gpa.free(hb);
+        try (cuda.DeviceBuffer{ .d = e.d, .ptr = ptr, .len = n, .borrowed = true }).download(0, hb);
+        const fd = std.posix.openatZ(std.posix.AT.FDCWD, name, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o664) catch return;
+        const f = std.Io.File{ .handle = fd, .flags = .{ .nonblocking = false } };
+        defer std.Io.File.close(f, e.io);
+        f.writeStreamingAll(e.io, hb) catch {};
+    }
+
+    /// Count nonzero f32 in a whole device range (probes only).
+    fn nzFull(e: *Engine, ptr: u64, n: usize) !usize {
+        const hb = try e.gpa.alloc(u8, n);
+        defer e.gpa.free(hb);
+        try (cuda.DeviceBuffer{ .d = e.d, .ptr = ptr, .len = n, .borrowed = true }).download(0, hb);
+        const fv = std.mem.bytesAsSlice(f32, @as([]align(1) u8, hb));
+        var c: usize = 0;
+        for (fv) |v| if (v != 0) {
+            c += 1;
+        };
+        return c;
+    }
+
+    /// Count nonzero f32 in the first 128 bytes at a raw device pointer (probes only).
+    fn nzHead(e: *Engine, ptr: u64) !usize {
+        const hb = try e.gpa.alloc(u8, 128);
+        defer e.gpa.free(hb);
+        try (cuda.DeviceBuffer{ .d = e.d, .ptr = ptr, .len = 128, .borrowed = true }).download(0, hb);
+        const fv = std.mem.bytesAsSlice(f32, @as([]align(1) u8, hb));
+        var c: usize = 0;
+        for (fv) |v| if (v != 0) {
+            c += 1;
+        };
+        return c;
+    }
+
     fn boundary(e: *Engine, rows: usize, h: ?weights.Hc, norm_w: u64, pending: bool) !void {
         const hidden = e.c.hidden;
         const x_old = e.x[e.xi].ptr;
@@ -377,28 +432,157 @@ pub const Engine = struct {
         const ps = c.kdaProj();
         const H: usize = c.kda_heads;
         const st_bytes: usize = H * D * D * 4;
-        // the stacked projections
-        try e.g.mm(e.stream, e.normed.ptr, w.q, e.proj.ptr, rows, Wq, c.hidden, false);
-        try e.g.mm(e.stream, e.normed.ptr, w.k, e.proj.ptr + Wq * 2, rows, Wq, c.hidden, false);
-        try e.g.mm(e.stream, e.normed.ptr, w.v, e.proj.ptr + 2 * Wq * 2, rows, Wq, c.hidden, false);
-        try e.g.mm(e.stream, e.normed.ptr, w.f_a, e.proj.ptr + 3 * Wq * 2, rows, D, c.hidden, false);
-        try e.g.mm(e.stream, e.normed.ptr, w.g_a, e.proj.ptr + (3 * Wq + D) * 2, rows, D, c.hidden, false);
-        try e.g.mm(e.stream, e.normed.ptr, w.b, e.proj.ptr + (3 * Wq + 2 * D) * 2, rows, H, c.hidden, false);
-        // f_b / g_b on the f_a/g_a slices
-        try e.g.mm(e.stream, e.proj.ptr + 3 * Wq * 2, w.f_b, e.fg.ptr, rows, Wq, D, false);
-        try e.g.mm(e.stream, e.proj.ptr + (3 * Wq + D) * 2, w.g_b, e.fg.ptr + rows * Wq * 2, rows, Wq, D, false);
+        // the stacked projections: rows land in the ps-strided fused buffer the conv reads
+        const xst = c.hidden * 2;
+        const wst = c.hidden * 2;
+        const ost = ps * 2;
+        try e.g.mmStrided(e.stream, e.normed.ptr, xst, w.q, wst, e.proj.ptr, ost, rows, Wq, c.hidden);
+        try e.g.mmStrided(e.stream, e.normed.ptr, xst, w.k, wst, e.proj.ptr + Wq * 2, ost, rows, Wq, c.hidden);
+        try e.g.mmStrided(e.stream, e.normed.ptr, xst, w.v, wst, e.proj.ptr + 2 * Wq * 2, ost, rows, Wq, c.hidden);
+        try e.g.mmStrided(e.stream, e.normed.ptr, xst, w.f_a, wst, e.proj.ptr + 3 * Wq * 2, ost, rows, D, c.hidden);
+        try e.g.mmStrided(e.stream, e.normed.ptr, xst, w.g_a, wst, e.proj.ptr + (3 * Wq + D) * 2, ost, rows, D, c.hidden);
+        try e.g.mmStrided(e.stream, e.normed.ptr, xst, w.b, wst, e.proj.ptr + (3 * Wq + 2 * D) * 2, ost, rows, H, c.hidden);
+        // f_b / g_b on the f_a/g_a slices; the step kernel reads fg interleaved [rows, 2Wq]
+        try e.g.mmStrided(e.stream, e.proj.ptr + 3 * Wq * 2, ost, w.f_b, D * 2, e.fg.ptr, 2 * Wq * 2, rows, Wq, D);
+        try e.g.mmStrided(e.stream, e.proj.ptr + (3 * Wq + D) * 2, ost, w.g_b, D * 2, e.fg.ptr + Wq * 2, 2 * Wq * 2, rows, Wq, D);
+        if (li == 0) {
+            try e.stream.synchronize();
+            const fb2 = try e.gpa.alloc(u8, 2 * Wq * 2);
+            defer e.gpa.free(fb2);
+            try e.fg.download(0, fb2);
+            var fb_s: f64 = 0;
+            var gb_s: f64 = 0;
+            for (0..Wq) |d| {
+                const h: u16 = std.mem.readInt(u16, fb2[d * 2 ..][0..2], .little);
+                fb_s += @as(f32, @bitCast(@as(u32, h) << 16));
+            }
+            for (0..Wq) |d| {
+                const h: u16 = std.mem.readInt(u16, fb2[(Wq + d) * 2 ..][0..2], .little);
+                gb_s += @as(f32, @bitCast(@as(u32, h) << 16));
+            }
+            std.debug.print("  [kda0] fb {d:.2} gb {d:.2}\n", .{ fb_s, gb_s });
+        }
         // b packed from the proj slice
         try e.ops.copy2d(e.stream, e.proj.ptr + (3 * Wq + 2 * D) * 2, e.bv.ptr, rows, H, ps);
+        if (li == 0) {
+            try e.stream.synchronize();
+            const bb2 = try e.gpa.alloc(u8, ps * 2);
+            defer e.gpa.free(bb2);
+            try e.proj.download(0, bb2);
+            var q_s: f64 = 0;
+            var k_s: f64 = 0;
+            var v_s: f64 = 0;
+            var fa_s: f64 = 0;
+            var ga_s: f64 = 0;
+            var b_s: f64 = 0;
+            for (0..Wq) |d| {
+                const h: u16 = std.mem.readInt(u16, bb2[d * 2 ..][0..2], .little);
+                q_s += @as(f32, @bitCast(@as(u32, h) << 16));
+            }
+            for (0..Wq) |d| {
+                const h: u16 = std.mem.readInt(u16, bb2[(Wq + d) * 2 ..][0..2], .little);
+                k_s += @as(f32, @bitCast(@as(u32, h) << 16));
+            }
+            for (0..Wq) |d| {
+                const h: u16 = std.mem.readInt(u16, bb2[(2 * Wq + d) * 2 ..][0..2], .little);
+                v_s += @as(f32, @bitCast(@as(u32, h) << 16));
+            }
+            for (0..D) |d| {
+                const h: u16 = std.mem.readInt(u16, bb2[(3 * Wq + d) * 2 ..][0..2], .little);
+                fa_s += @as(f32, @bitCast(@as(u32, h) << 16));
+            }
+            for (0..D) |d| {
+                const h: u16 = std.mem.readInt(u16, bb2[(3 * Wq + D + d) * 2 ..][0..2], .little);
+                ga_s += @as(f32, @bitCast(@as(u32, h) << 16));
+            }
+            for (0..H) |d| {
+                const h: u16 = std.mem.readInt(u16, bb2[(3 * Wq + 2 * D + d) * 2 ..][0..2], .little);
+                b_s += @as(f32, @bitCast(@as(u32, h) << 16));
+            }
+            std.debug.print("  [kda0] q {d:.2} k {d:.2} v {d:.2} fa {d:.2} ga {d:.2} b {d:.2}\n", .{ q_s, k_s, v_s, fa_s, ga_s, b_s });
+        }
         // conv: history per layer, weights the engine built at load (kda_cw)
         const cs_at = e.kda_cs.ptr + li * 3 * Wq * 2;
         try e.kdk.conv(e.stream, e.proj.ptr, ps, cs_at, e.kda_cw.ptr, e.qkv.ptr, rows);
+        if (li == 0) {
+            try e.stream.synchronize();
+            const qb2 = try e.gpa.alloc(u8, 3 * Wq * 2);
+            defer e.gpa.free(qb2);
+            try e.qkv.download(0, qb2);
+            var qq: f64 = 0;
+            var kk: f64 = 0;
+            var vv: f64 = 0;
+            for (0..Wq) |d| {
+                const h: u16 = std.mem.readInt(u16, qb2[d * 2 ..][0..2], .little);
+                qq += @as(f32, @bitCast(@as(u32, h) << 16));
+            }
+            for (0..Wq) |d| {
+                const h: u16 = std.mem.readInt(u16, qb2[(Wq + d) * 2 ..][0..2], .little);
+                kk += @as(f32, @bitCast(@as(u32, h) << 16));
+            }
+            for (0..Wq) |d| {
+                const h: u16 = std.mem.readInt(u16, qb2[(2 * Wq + d) * 2 ..][0..2], .little);
+                vv += @as(f32, @bitCast(@as(u32, h) << 16));
+            }
+            std.debug.print("  [kda0] convq {d:.2} convk {d:.2} convv {d:.2}\n", .{ qq, kk, vv });
+        }
         // the step, state ping-pong
         const st_in = if (e.kda_st_cur == 0) e.kda_st0.ptr else e.kda_st1.ptr;
+        if (li == 0 and rows == 4) {
+            try e.stream.synchronize();
+            const hb = try e.gpa.alloc(u8, 256);
+            defer e.gpa.free(hb);
+            try (cuda.DeviceBuffer{ .d = e.d, .ptr = st_in, .len = 256, .borrowed = true }).download(0, hb);
+            const fv = std.mem.bytesAsSlice(f32, @as([]align(1) u8, hb));
+            var nz: usize = 0;
+            for (fv) |v| if (v != 0) {
+                nz += 1;
+            };
+            std.debug.print("  pre-step st_in nonzero {d}/64 first {d:.4}\n", .{ nz, fv[0] });
+
+        }
         const st_out = if (e.kda_st_cur == 0) e.kda_st1.ptr else e.kda_st0.ptr;
         try e.kdk.step(e.stream, e.qkv.ptr, e.fg.ptr, e.bv.ptr, w.a, w.dt_bias, st_in + li * st_bytes, w.o_norm, c.lower_bound, c.hc_eps, rows, st_out + li * st_bytes, e.y.ptr);
+        if (li == 0 and rows == 4) {
+            try e.stream.synchronize();
+            const c0 = try e.nzHead(e.kda_st0.ptr);
+            const c1 = try e.nzHead(e.kda_st1.ptr);
+            std.debug.print("  post-step st0 nz {d}/32 st1 nz {d}/32\n", .{ c0, c1 });
+
+        }
         e.kda_st_cur = 1 - e.kda_st_cur; // TODO: per-layer, not global, once windows chain
         // o_proj -> branch
         try e.g.mm(e.stream, e.y.ptr, w.o, e.branch.ptr, rows, c.hidden, Wq, false);
+        if (li == 0 and rows == 4) {
+            try e.stream.synchronize();
+            std.debug.print("  ptrs st_in {x} st_out {x} st0 {x} st1 {x} sb {d}\n", .{ st_in, st_out, e.kda_st0.ptr, e.kda_st1.ptr, st_bytes });
+            const z0 = try e.nzFull(e.kda_st0.ptr, e.kda_st0.len);
+            const z1 = try e.nzFull(e.kda_st1.ptr, e.kda_st1.len);
+            std.debug.print("  census st0 {d}/{d} st1 {d}/{d}\n", .{ z0, e.kda_st0.len / 4, z1, e.kda_st1.len / 4 });
+
+            try e.dumpBin("sd_qkv.bin", e.qkv.ptr, rows * 3 * Wq * 2);
+            try e.dumpBin("sd_fg.bin", e.fg.ptr, rows * 2 * Wq * 2);
+            try e.dumpBin("sd_bv.bin", e.bv.ptr, rows * H * 2);
+            try e.dumpBin("sd_a.bin", w.a, H * 4);
+            try e.dumpBin("sd_dtb.bin", w.dt_bias, H * D * 4);
+            try e.dumpBin("sd_onw.bin", w.o_norm, D * 2);
+            try e.dumpBin("sd_y.bin", e.y.ptr, rows * Wq * 2);
+            try e.dumpBin("sd_stout.bin", st_out + li * st_bytes, H * D * D * 4);
+            try e.dumpBin("sd_stin.bin", st_in + li * st_bytes, H * D * D * 4);
+            std.debug.print("  step io dumped rows={d}", .{rows});
+        }
+        if (li == 0 and rows == 4) {
+            try e.stream.synchronize();
+            const hb = try e.gpa.alignedAlloc(u8, .@"2", D * 2);
+            defer e.gpa.free(hb);
+            try (cuda.DeviceBuffer{ .d = e.d, .ptr = e.y.ptr, .len = D * 2, .borrowed = true }).download(0, hb);
+            var acc: f64 = 0;
+            const fv = std.mem.bytesAsSlice(u16, hb);
+            for (fv) |h16| acc += @as(f32, @bitCast(@as(u32, h16) << 16));
+            std.debug.print("  y r0 h0 sum {d:.5}\n", .{acc});
+
+        }
+        if (li == 0) try e.b0Print("attn-post-o", e.branch);
     }
 
     /// The dense MLP on normed -> branch.
@@ -533,6 +717,7 @@ pub const Engine = struct {
 
     /// One window of `rows` tokens: ids -> picks (argmax) + logits on device.
     pub fn forward(e: *Engine, ids: []const u32, rows: usize) !void {
+        std.debug.print("  fwd entry rows={d}" ++ "\n", .{rows});
         const hidden = e.c.hidden;
         if (!e.cont) {
             // embed into the four streams
@@ -546,8 +731,20 @@ pub const Engine = struct {
         for (e.w.layers, e.w.blocks_lo..) |*L, bi| {
             const hc_a = L.hc_attn orelse return error.UnexpectedMtp;
             try e.boundary(rows, hc_a, L.in_norm, ki > 0 or e.w.blocks_lo > 0);
+            if (bi == 0) {
+                try e.b0Print("normed", e.normed);
+                const nb = try e.gpa.alloc(u8, e.c.hidden * 2);
+                defer e.gpa.free(nb);
+                e.normed.download(0, nb) catch {};
+                var dir = std.Io.Dir.cwd();
+                dir.writeFile(e.io, .{ .sub_path = "normed0.bin", .data = nb }) catch {};
+                std.debug.print("  normed row0 dumped 8192B\n", .{});
+            }
             switch (L.attn) {
-                .kda => |*w| try e.kdaLayer(ki, w, rows),
+                .kda => |*w| {
+                    try e.kdaLayer(ki, w, rows);
+                    if (bi == 0) try e.b0Print("attn", e.y);
+                },
                 .mla => {
                     if (!e.skip_mla) try e.mlaLayer(mi_mla, switch (L.attn) {
                         .mla => |*x| x,
@@ -567,6 +764,7 @@ pub const Engine = struct {
                 const hd = e.c.hidden;
                 const b = e.gpa.alloc(u8, 4 * hd * 2) catch |err| return err;
                 defer e.gpa.free(b);
+                e.stream.synchronize() catch {};
                 e.x[e.xi].download(0, b) catch {};
                 var acc: f64 = 0;
                 for (0..hd) |d| {
@@ -579,6 +777,7 @@ pub const Engine = struct {
                 }
                 sums[bi] = acc;
                 if (bi == 0) {
+                    e.stream.synchronize() catch {};
                     var br: f64 = 0;
                     const bb = e.gpa.alloc(u8, e.c.hidden * 2) catch |err| return err;
                     defer e.gpa.free(bb);

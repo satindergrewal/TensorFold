@@ -22,6 +22,30 @@ pub fn run(gpu: Gpu, dir: []const u8, rest: []const [:0]const u8) !void {
     defer a.free(sums);
     @memset(sums, 0);
     e.block_sums = sums;
+    {
+        // state zero check: the first 64 floats of kda_st0 right after init
+        try e.stream.synchronize();
+        const hb = try a.alloc(u8, 256);
+        defer a.free(hb);
+        try (cuda.DeviceBuffer{ .d = gpu.d, .ptr = e.kda_st0.ptr, .len = 256, .borrowed = true }).download(0, hb);
+        const fv = std.mem.bytesAsSlice(f32, @as([]align(1) u8, hb));
+        var nz: usize = 0;
+        for (fv) |v| if (v != 0) {
+            nz += 1;
+        };
+        std.debug.print("  st0 head nonzero {d}/64 first {d:.4}\n", .{ nz, fv[0] });
+
+        // full-buffer census: every float of kda_st0
+        const full = try a.alloc(u8, e.kda_st0.len);
+        defer a.free(full);
+        try e.kda_st0.download(0, full);
+        var nzf: usize = 0;
+        const ff = std.mem.bytesAsSlice(f32, @as([]align(1) u8, full));
+        for (ff) |x| if (x != 0) {
+            nzf += 1;
+        };
+        std.debug.print("  st0 FULL nonzero {d}/{d}\n", .{ nzf, ff.len });
+    }
     var ids_buf: [16]u32 = .{ 100, 2000, 30000, 154800, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
     var n_gen: usize = 0;
     while (n_gen < 12) : (n_gen += 1) {
@@ -53,7 +77,7 @@ pub fn run(gpu: Gpu, dir: []const u8, rest: []const [:0]const u8) !void {
         const out2 = try a.alloc(u8, 46 * 20);
         defer a.free(out2);
         for (0..@min(nm, 26)) |b| {
-            const pr = std.fmt.bufPrint(out2[w2..], "{d}:{d:.0} ", .{ b, sums[b] }) catch unreachable;
+            const pr = std.fmt.bufPrint(out2[w2..], "{d}:{d:.4} ", .{ b, sums[b] }) catch unreachable;
             w2 += pr.len;
         }
         std.debug.print("  blocksums {s}" ++ "\n", .{out2[0..w2]});
