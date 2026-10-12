@@ -675,7 +675,9 @@ fn runSplit(gpu: Gpu, dir: []const u8, split_at: usize, nm: usize) !void {
             const cco = try check.download(gpu, ea.comb);
             const cme = try check.download(gpu, ea.mtp_emb);
             var one_a: [1]u32 = .{ta};
+            ea.dump_on = true;
             try ea.forward(one_a[0..1], 1, rows);
+            ea.dump_on = false;
             try ea.stream.synchronize();
             const dx0 = try check.download(gpu, ea.x[0]);
             const dx1 = try check.download(gpu, ea.x[1]);

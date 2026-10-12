@@ -782,10 +782,12 @@ pub const Engine = struct {
                 try e.ops.copy2d(e.stream, e.proj.ptr + (rows - 3) * ps, cs_at2, 3, 3 * Wq, ps);
             } else {
                 const keep = 3 - rows;
-                // the kept slice is cs[rows..3) (the LAST keep rows); the old code
-                // read from keep*3W - for rows=1 it took cs[2] + an out-of-bounds
-                // row of the NEXT layer's cs, corrupting every decode window
-                try e.ops.copy2d(e.stream, cs_at2 + rows * 3 * Wq * 2, cs_at2, keep, 3 * Wq, 3 * Wq);
+                // the kept slice is cs[rows..3) (the LAST keep rows). dst overlaps
+                // src (a downward shift) and copy2d blocks run CONCURRENTLY - an
+                // in-place copy races (block y+1 clobbers block y's source row).
+                // Stage through scratch: two disjoint copies are always safe.
+                try e.ops.copy2d(e.stream, cs_at2 + rows * 3 * Wq * 2, e.scratch.ptr, keep, 3 * Wq, 3 * Wq);
+                try e.ops.copy2d(e.stream, e.scratch.ptr, cs_at2, keep, 3 * Wq, 3 * Wq);
                 try e.ops.copy2d(e.stream, e.proj.ptr, cs_at2 + keep * 3 * Wq * 2, rows, 3 * Wq, ps);
             }
             if (e.dump_on and li == 0) {
@@ -808,7 +810,7 @@ pub const Engine = struct {
             const ep = @as([]const u8, if (e.cont) "b" else "a");
             const W3 = @as(usize, c.kdaWidth());
             inline for (.{ "kqkvT", "kfgT", "kbvT", "kyT", "kprojT", "kcsT" }, .{ 3 * W3, 2 * W3, c.kda_heads, W3, @as(usize, c.kdaProj()), 3 * W3 }) |tag, wid| {
-                const n = rows * wid * 2;
+                const n = if (comptime std.mem.eql(u8, tag, "kcsT")) 3 * wid * 2 else if (comptime std.mem.eql(u8, tag, "kprojT")) 2 * wid * 2 else rows * wid * 2;
                 const buf = try e.gpa.alloc(u8, n);
                 defer e.gpa.free(buf);
                 const src = if (comptime std.mem.eql(u8, tag, "kqkvT")) e.qkv.ptr else if (comptime std.mem.eql(u8, tag, "kfgT")) e.fg.ptr else if (comptime std.mem.eql(u8, tag, "kbvT")) e.bv.ptr else if (comptime std.mem.eql(u8, tag, "kprojT")) e.proj.ptr else if (comptime std.mem.eql(u8, tag, "kcsT")) (e.kda_cs.ptr + li * 3 * W3 * 2) else e.y.ptr;
