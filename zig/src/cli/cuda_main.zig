@@ -3,6 +3,8 @@
 const std = @import("std");
 const cuda = @import("cuda");
 const nemotron = @import("nemotron");
+const glm = @import("glm");
+const posix = std.posix;
 const core = @import("core");
 const lanes = @import("lanes");
 const checks = @import("cuda_checks.zig");
@@ -40,6 +42,7 @@ const usage =
 pub fn main(init: std.process.Init) !u8 {
     const gpa = init.gpa;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
+    if (args.len >= 3 and std.mem.eql(u8, args[1], "glm-serve")) return glmServe(gpa, init, args[2..]);
     if (args.len < 3) {
         std.debug.print("{s}", .{usage});
         return 2;
@@ -192,6 +195,161 @@ pub fn main(init: std.process.Init) !u8 {
     }
     std.debug.print("{s}", .{usage});
     return 2;
+}
+
+/// glm-serve MODEL [--port N] [--context N]: the GLM CUDA engine behind a
+/// minimal JSON-over-HTTP surface (token ids in, ids out; greedy). One request
+/// at a time on the engine's stream - the serving slice of Phase 3.
+fn glmServe(gpa: std.mem.Allocator, init: std.process.Init, rest: []const [:0]const u8) !u8 {
+    if (rest.len < 1) {
+        std.debug.print("usage: tensorfold glm-serve MODEL [--port N] [--context N]", .{});
+        return 2;
+    }
+    var port: u16 = 8890;
+    var context: usize = 4096;
+    var i: usize = 1;
+    while (i < rest.len) : (i += 1) {
+        if (std.mem.eql(u8, rest[i], "--port") and i + 1 < rest.len) {
+            port = try std.fmt.parseInt(u16, rest[i + 1], 10);
+            i += 1;
+        } else if (std.mem.eql(u8, rest[i], "--context") and i + 1 < rest.len) {
+            context = try std.fmt.parseInt(usize, rest[i + 1], 10);
+            i += 1;
+        }
+    }
+    var driver = try cuda.Driver.open();
+    defer driver.close();
+    var ctx = try cuda.Context.init(&driver, 0);
+    defer ctx.deinit();
+    var eng = try glm.engine.Engine.init(gpa, init.io, &driver, rest[0], .{ .context = context });
+    defer eng.deinit();
+    // the server listener (their listener.zig pattern, raw posix here)
+    const rc = posix.system.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    if (posix.errno(rc) != .SUCCESS) {
+        std.debug.print("socket failed", .{});
+        return 1;
+    }
+    const fd: posix.socket_t = @intCast(rc);
+    const one: c_int = 1;
+    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&one)) catch {};
+    var addr: posix.sockaddr.in = .{ .family = posix.AF.INET, .port = std.mem.nativeToBig(u16, port), .addr = 0 };
+    if (posix.errno(posix.system.bind(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr)))) != .SUCCESS) {
+        std.debug.print("bind failed on port {d}", .{port});
+        return 1;
+    }
+    if (posix.errno(posix.system.listen(fd, 128)) != .SUCCESS) {
+        std.debug.print("listen failed", .{});
+        return 1;
+    }
+    std.debug.print("glm-serve: {s} on 0.0.0.0:{d} (POST /generate with a JSON body)", .{ rest[0], port });
+    while (true) {
+        const rc2 = posix.system.accept(fd, null, null);
+        if (posix.errno(rc2) != .SUCCESS) continue;
+        const conn_fd: posix.socket_t = @intCast(rc2);
+        defer _ = posix.system.close(conn_fd);
+        serveFd(gpa, eng, conn_fd) catch |err| {
+            std.debug.print("request: {}", .{err});
+        };
+    }
+    return 0;
+}
+
+fn serveFd(gpa: std.mem.Allocator, eng: *glm.engine.Engine, fd: posix.socket_t) !void {
+    var buf: [1 << 16]u8 = undefined;
+    var n: usize = 0;
+    while (n < buf.len) {
+        const got: isize = @bitCast(posix.system.read(fd, buf[n..].ptr, buf.len - n));
+        if (got <= 0) break;
+        n += @intCast(got);
+        if (std.mem.indexOfScalar(u8, buf[0..n], '}') != null) break;
+    }
+    _ = gpa;
+    const body = blk: {
+        const idx = std.mem.indexOf(u8, buf[0..n], "\r\n\r\n") orelse break :blk buf[0..n];
+        break :blk buf[idx + 4 .. n];
+    };
+    var ids_buf: [8192]u32 = @splat(0);
+    var n_ids: usize = 0;
+    var max_tokens: usize = 64;
+    if (std.mem.indexOf(u8, body, "\"prompt\"")) |p0| {
+        var j = p0;
+        while (j < body.len and body[j] != '[') j += 1;
+        if (j < body.len) {
+            j += 1;
+            var val: u32 = 0;
+            var in_num = false;
+            while (j < body.len and body[j] != ']') : (j += 1) {
+                const ch = body[j];
+                if (ch >= '0' and ch <= '9') {
+                    val = val * 10 + (ch - '0');
+                    in_num = true;
+                } else if (in_num) {
+                    if (n_ids < ids_buf.len) {
+                        ids_buf[n_ids] = val;
+                        n_ids += 1;
+                    }
+                    val = 0;
+                    in_num = false;
+                }
+            }
+            if (in_num and n_ids < ids_buf.len) {
+                ids_buf[n_ids] = val;
+                n_ids += 1;
+            }
+        }
+    }
+    if (std.mem.indexOf(u8, body, "\"max_tokens\"")) |m0| {
+        var j = m0;
+        while (j < body.len and body[j] != ':') j += 1;
+        if (j < body.len) {
+            j += 1;
+            var v: usize = 0;
+            var any = false;
+            while (j < body.len and body[j] >= '0' and body[j] <= '9') : (j += 1) {
+                v = v * 10 + (body[j] - '0');
+                any = true;
+            }
+            if (any) max_tokens = v;
+        }
+    }
+    if (n_ids == 0) {
+        _ = posix.system.write(fd, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n", 45);
+        return;
+    }
+    @memset(eng.kda_st_cur, 0);
+    try eng.kda_st0.fill32(0, null);
+    try eng.kda_st1.fill32(0, null);
+    try eng.kda_cs.fill8(0, null);
+    var pos: usize = 0;
+    try eng.forward(ids_buf[0..n_ids], n_ids, pos);
+    pos += n_ids;
+    var out_ids: [512]u32 = @splat(0);
+    var n_out: usize = 0;
+    var one: [1]u32 = .{0};
+    var pick: [8192]u8 = undefined;
+    const pv = std.mem.bytesAsSlice(u32, @as([]align(1) u8, &pick));
+    while (n_out < max_tokens and n_out < out_ids.len and pos < eng.context - 1) {
+        try eng.stream.synchronize();
+        try eng.picks.download(0, pick[0 .. @min(pick.len, 4 * @max(n_ids, 1))]);
+        const tok = if (n_out == 0) pv[n_ids - 1] else pv[0];
+        out_ids[n_out] = tok;
+        n_out += 1;
+        one[0] = tok;
+        try eng.forward(one[0..1], 1, pos);
+        pos += 1;
+    }
+    var jbuf: [8192]u8 = undefined;
+    var w: usize = 0;
+    w += (std.fmt.bufPrint(jbuf[w..], "{{\"tokens\":[", .{}) catch unreachable).len;
+    for (out_ids[0..n_out], 0..) |t, ti| {
+        const sep: []const u8 = if (ti > 0) "," else "";
+        w += (std.fmt.bufPrint(jbuf[w..], "{s}{d}", .{ sep, t }) catch unreachable).len;
+    }
+    w += (std.fmt.bufPrint(jbuf[w..], "],\"count\":{d}}}", .{ n_out }) catch unreachable).len;
+    var hdr: [128]u8 = undefined;
+    const h = try std.fmt.bufPrint(&hdr, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{w});
+    _ = posix.system.write(fd, h.ptr, h.len);
+    _ = posix.system.write(fd, &jbuf, w);
 }
 
 const Options = struct {
