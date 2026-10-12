@@ -19,12 +19,12 @@ __device__ __forceinline__ float sig_precise(float x) {
 
 // out[r, d] = E[ids[r], d]; grid over rows*D / 256.
 extern "C" __global__ void glm_embed(const int* __restrict__ ids, const __nv_bfloat16* __restrict__ e,
-                                     __nv_bfloat16* __restrict__ out, int rows, int d) {
+                                     __nv_bfloat16* __restrict__ out, int rows, int d, int stride) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     const int total = rows * d;
     if (i >= total) return;
     const int r = i / d, c = i - r * d;
-    out[i] = __ldg(e + (size_t)__ldg(ids + r) * d + c);
+    out[(size_t)r * stride + c] = __ldg(e + (size_t)__ldg(ids + r) * d + c);
 }
 
 // y[r, c] = w[c] * bf16(x[r, c] * inv_rms), fp32 square sum; grid rows, block 512 x 8.
@@ -88,12 +88,12 @@ extern "C" __global__ void glm_combine(const __nv_bfloat16* __restrict__ ys, con
 }
 
 extern "C" __global__ void glm_embed_f32(const int* __restrict__ ids, const __nv_bfloat16* __restrict__ e,
-                                         float* __restrict__ out, int rows, int d) {
+                                         float* __restrict__ out, int rows, int d, int stride) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     const int total = rows * d;
     if (i >= total) return;
     const int r = i / d, c = i - r * d;
-    out[i] = __bfloat162float(__ldg(e + (size_t)__ldg(ids + r) * d + c));
+    out[(size_t)r * stride + c] = __bfloat162float(__ldg(e + (size_t)__ldg(ids + r) * d + c));
 }
 
 // y[r, d] = bf16(sum of the 4 f32 streams in order, * 0.25).

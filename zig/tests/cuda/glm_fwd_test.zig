@@ -205,7 +205,7 @@ pub fn run(gpu: Gpu, dir: []const u8, rest: []const [:0]const u8) !void {
     const ids = ids_buf;
     // probe: embed alone before any block
     try e.ids.upload(0, std.mem.sliceAsBytes(ids[0..rows]));
-    for (0..4) |s_i| try e.ops.embed(e.stream, e.ids.ptr, e.w.embed, e.x[0].ptr + s_i * e.c.hidden * 2, rows, e.c.hidden);
+    for (0..4) |s_i| try e.ops.embed(e.stream, e.ids.ptr, e.w.embed, e.x[0].ptr + s_i * e.c.hidden * 2, rows, e.c.hidden, 4 * e.c.hidden);
     try e.stream.synchronize();
     {
         const xb = try check.download(gpu, e.x[0]);
@@ -310,6 +310,9 @@ fn runSplit(gpu: Gpu, dir: []const u8, split_at: usize, nm: usize) !void {
             } else |_| {}
         } else |_| {}
     }
+    const sumsW = try a.alloc(f64, 46);
+    @memset(sumsW, 0);
+    ea.block_sums = sumsW;
     try ea.forward(&ids, rows, 0);
     try ea.stream.synchronize();
     // the handoff state through the host: x (both planes), branch, post, comb
@@ -326,6 +329,9 @@ fn runSplit(gpu: Gpu, dir: []const u8, split_at: usize, nm: usize) !void {
     defer ctx1.deinit();
     var eb = try glm.engine.Engine.init(a, gpu.io, gpu.d, dir, .{ .blocks_lo = split_at, .blocks_hi = @max(nm, split_at + 1), .cont = true });
     defer eb.deinit();
+    const sumsWb = try a.alloc(f64, 46);
+    @memset(sumsWb, 0);
+    eb.block_sums = sumsWb;
     try eb.x[0].upload(0, ho.x0);
     try eb.x[1].upload(0, ho.x1);
     try eb.branch.upload(0, ho.branch);
@@ -342,6 +348,10 @@ fn runSplit(gpu: Gpu, dir: []const u8, split_at: usize, nm: usize) !void {
     eb.fwd_count = 0;
     try eb.forward(&ids, rows, 0);
     try eb.stream.synchronize();
+    const snapA1 = try a.alloc(f64, 46);
+    const snapB1 = try a.alloc(f64, 46);
+    @memcpy(snapA1, sumsW);
+    @memcpy(snapB1, sumsWb);
     const lg = try check.download(gpu, eb.logits);
     defer a.free(lg);
     var sum: f64 = 0;
@@ -406,6 +416,163 @@ fn runSplit(gpu: Gpu, dir: []const u8, split_at: usize, nm: usize) !void {
             wd += printed.len;
         }
         std.debug.print("  split-decode[{d}]: {s}" ++ "\n", .{ ntok, outd[0..wd] });
+    }
+    // WINDOW 2: same prompt+decode after resetState — serving replays this per request.
+    // If picks diverge, some state survives the reset.
+    {
+        const toks1 = toks;
+        const ntok1 = ntok;
+        try gpu.ctx.makeCurrent();
+        try ea.resetState();
+        try ctx1.makeCurrent();
+        try eb.resetState();
+        try gpu.ctx.makeCurrent();
+        try ea.forward(&ids, rows, 0);
+        try ea.stream.synchronize();
+        const hx0 = try check.download(gpu, ea.x[0]);
+        const hx1 = try check.download(gpu, ea.x[1]);
+        const hbr = try check.download(gpu, ea.branch);
+        const hpo = try check.download(gpu, ea.post);
+        const hco = try check.download(gpu, ea.comb);
+        try ctx1.makeCurrent();
+        try eb.x[0].upload(0, hx0);
+        try eb.x[1].upload(0, hx1);
+        try eb.branch.upload(0, hbr);
+        try eb.post.upload(0, hpo);
+        try eb.comb.upload(0, hco);
+        eb.xi = ea.xi;
+        eb.fwd_count = 0;
+        try eb.forward(&ids, rows, 0);
+        try eb.stream.synchronize();
+        {
+            var diverged = false;
+            for (0..split_at) |bi| {
+                const d = sumsW[bi] - snapA1[bi];
+                if (@abs(d) > 1e-3 * (1 + @abs(snapA1[bi]))) {
+                    std.debug.print("  W2 A blk {d}: {d:.5} -> {d:.5} (diff {d:.5})\n", .{ bi, snapA1[bi], sumsW[bi], d });
+                    diverged = true;
+                }
+            }
+            for (split_at..nm) |bi| {
+                const d = sumsWb[bi] - snapB1[bi];
+                if (@abs(d) > 1e-3 * (1 + @abs(snapB1[bi]))) {
+                    std.debug.print("  W2 B blk {d}: {d:.5} -> {d:.5} (diff {d:.5})\n", .{ bi, snapB1[bi], sumsWb[bi], d });
+                    diverged = true;
+                }
+            }
+            if (!diverged) std.debug.print("  W2 blocks: all fingerprints match\n", .{});
+        }
+        // bit-diff the per-block probe dumps: window1 pb{bi}_{tag}.bin vs window2 pb{bi}_{tag}2.bin
+        {
+            var cdir = std.Io.Dir.cwd();
+            var ndiff: usize = 0;
+            var first = true;
+            const tags = [4][]const u8{ "na", "ba", "nf", "bf" };
+            const fsz = rows * 4096 * 2;
+            const b1 = try a.alloc(u8, fsz);
+            defer a.free(b1);
+            const b2 = try a.alloc(u8, fsz);
+            defer a.free(b2);
+            for (0..nm) |bi| {
+                for (tags) |tg| {
+                    var n1: [24]u8 = undefined;
+                    var n2: [24]u8 = undefined;
+                    const f1n = std.fmt.bufPrint(&n1, "pb{d}_{s}.bin", .{ bi, tg }) catch continue;
+                    const f2n = std.fmt.bufPrint(&n2, "pb{d}_{s}2.bin", .{ bi, tg }) catch continue;
+                    const fh1 = cdir.openFile(gpu.io, f1n, .{}) catch continue;
+                    fh1.close(gpu.io);
+                    const fh2 = cdir.openFile(gpu.io, f2n, .{}) catch continue;
+                    fh2.close(gpu.io);
+                    const h1 = cdir.openFile(gpu.io, f1n, .{}) catch continue;
+                    defer h1.close(gpu.io);
+                    const h2 = cdir.openFile(gpu.io, f2n, .{}) catch continue;
+                    defer h2.close(gpu.io);
+                    _ = h1.readPositional(gpu.io, &[1][]u8{b1[0..]}, 0) catch continue;
+                    _ = h2.readPositional(gpu.io, &[1][]u8{b2[0..]}, 0) catch continue;
+                    var off: usize = 0;
+                    var nbad: usize = 0;
+                    var first_off: usize = 0;
+                    while (off < fsz) : (off += 2) {
+                        const v1 = std.mem.readInt(u16, b1[off..][0..2], .little);
+                        const v2 = std.mem.readInt(u16, b2[off..][0..2], .little);
+                        if (v1 != v2) {
+                            if (nbad == 0) {
+                                first_off = off;
+                                if (first) {
+                                    std.debug.print("  FIRST DIFF blk {d} {s} at byte {d} (elem {d}): {d} vs {d}\n", .{ bi, tg, off, off / 2, v1, v2 });
+                                    first = false;
+                                }
+                            }
+                            nbad += 1;
+                        }
+                    }
+                    if (nbad > 0) {
+                        std.debug.print("  pb{d}_{s}: {d}/{d} elements differ, first at elem {d}\n", .{ bi, tg, nbad, fsz / 2, first_off / 2 });
+                        ndiff += 1;
+                    }
+                }
+            }
+            if (ndiff == 0) std.debug.print("  BIT-EXACT: all probe dumps match between windows\n", .{});
+        }
+        const pk2 = try check.download(gpu, eb.picks);
+        const pv2 = std.mem.bytesAsSlice(u32, @as([]align(1) u8, pk2));
+        var pos2: usize = rows;
+        var toks2: [24]u32 = @splat(0);
+        var ntok2: usize = 0;
+        var cur2: [1]u32 = .{0};
+        toks2[0] = pv2[rows - 1];
+        ntok2 = 1;
+        while (ntok2 < 16 and pos2 < 4000) : (ntok2 += 1) {
+            cur2[0] = toks2[ntok2 - 1];
+            try gpu.ctx.makeCurrent();
+            try ea.forward(cur2[0..1], 1, pos2);
+            const dx0 = try check.download(gpu, ea.x[0]);
+            const dx1 = try check.download(gpu, ea.x[1]);
+            const dbr = try check.download(gpu, ea.branch);
+            const dpo = try check.download(gpu, ea.post);
+            const dco = try check.download(gpu, ea.comb);
+            try ctx1.makeCurrent();
+            try eb.x[0].upload(0, dx0);
+            try eb.x[1].upload(0, dx1);
+            try eb.branch.upload(0, dbr);
+            try eb.post.upload(0, dpo);
+            try eb.comb.upload(0, dco);
+            eb.xi = ea.xi;
+            a.free(dx0);
+            a.free(dx1);
+            a.free(dbr);
+            a.free(dpo);
+            a.free(dco);
+            try eb.forward(cur2[0..1], 1, pos2);
+            try eb.stream.synchronize();
+            const pkd2 = try check.download(gpu, eb.picks);
+            const pvd2 = std.mem.bytesAsSlice(u32, @as([]align(1) u8, pkd2));
+            toks2[ntok2] = pvd2[0];
+            a.free(pkd2);
+            pos2 += 1;
+        }
+        a.free(pk2);
+        a.free(hx0);
+        a.free(hx1);
+        a.free(hbr);
+        a.free(hpo);
+        a.free(hco);
+        a.free(snapA1);
+        a.free(snapB1);
+        a.free(sumsW);
+        a.free(sumsWb);
+        var same: bool = ntok2 == ntok1;
+        if (same) for (0..ntok2) |i| {
+            if (toks2[i] != toks1[i]) same = false;
+        };
+        var outd2: []u8 = try a.alloc(u8, 400);
+        defer a.free(outd2);
+        var wd2: usize = 0;
+        for (toks2[0..ntok2]) |t| {
+            const printed = std.fmt.bufPrint(outd2[wd2..], "{d} ", .{t}) catch unreachable;
+            wd2 += printed.len;
+        }
+        std.debug.print("  split-decode2[{d}]: {s} == window1: {}\n", .{ ntok2, outd2[0..wd2], same });
     }
     {
         var out: []u8 = try a.alloc(u8, 200);

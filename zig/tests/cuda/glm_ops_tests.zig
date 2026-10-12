@@ -70,7 +70,7 @@ pub fn run(gpu: Gpu) !void {
         defer di.free();
         var dout = try cuda.DeviceBuffer.alloc(gpu.d, ROWS * D * 2);
         defer dout.free();
-        try o.embed(s, di.ptr, dt.ptr, dout.ptr, ROWS, D);
+        try o.embed(s, di.ptr, dt.ptr, dout.ptr, ROWS, D, D);
         try s.synchronize();
         const got = try check.download(gpu, dout);
         defer a.free(got);

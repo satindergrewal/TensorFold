@@ -78,13 +78,14 @@ pub const Ops = struct {
         o.mod.unload();
     }
 
-    pub fn embed(o: *const Ops, s: cuda.Stream, ids: u64, e: u64, out: u64, rows: usize, d: usize) !void {
+    pub fn embed(o: *const Ops, s: cuda.Stream, ids: u64, e: u64, out: u64, rows: usize, d: usize, stride: usize) !void {
         var a: cuda.Args = .{};
         a.add(ids);
         a.add(e);
         a.add(out);
         a.add(i(rows));
         a.add(i(d));
+        a.add(i(stride));
         const total = rows * d;
         try cuda.launch.launch(o.embed_fn, .{ .grid = .{ .x = @intCast((total + 255) / 256) }, .block = .{ .x = 256 } }, s, &a);
     }
@@ -128,13 +129,14 @@ pub const Ops = struct {
         try cuda.launch.launch(o.combine_fn, .{ .grid = .{ .x = @intCast((d + 255) / 256), .y = @intCast(rows) }, .block = .{ .x = 256 } }, s, &a);
     }
 
-    pub fn embedF32(o: *const Ops, s: cuda.Stream, ids: u64, e: u64, out: u64, rows: usize, d: usize) !void {
+    pub fn embedF32(o: *const Ops, s: cuda.Stream, ids: u64, e: u64, out: u64, rows: usize, d: usize, stride: usize) !void {
         var a: cuda.Args = .{};
         a.add(ids);
         a.add(e);
         a.add(out);
         a.add(i(rows));
         a.add(i(d));
+        a.add(i(stride));
         const total = rows * d;
         try cuda.launch.launch(o.embed_f32_fn, .{ .grid = .{ .x = @intCast((total + 255) / 256) }, .block = .{ .x = 256 } }, s, &a);
     }
