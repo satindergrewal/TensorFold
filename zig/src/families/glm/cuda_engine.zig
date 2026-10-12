@@ -99,6 +99,7 @@ pub const Engine = struct {
     io: std.Io,
     block_sums: ?[]f64 = null, // set by the test: per-block x-stream fingerprints
     cur_bi: usize = 0,
+    kda_st_cur: []usize = &.{},
     attn_sums: ?[]f64 = null,
     fwd_count: usize = 0,
     f32_streams: bool = true, // set by the test: stream means at their L-points
@@ -129,7 +130,6 @@ pub const Engine = struct {
     kda_st: [2][]f32, // host staging? no - device below
     kda_st0: cuda.DeviceBuffer, // [n_kda, H, D, D] fp32
     kda_st1: cuda.DeviceBuffer,
-    kda_st_cur: usize = 0,
     kda_cs: cuda.DeviceBuffer, // [n_kda, TAPS-1, 3W] bf16 history
     kda_cw: cuda.DeviceBuffer, // [TAPS, 3W] bf16, transposed at load
     kda_conv_p: cuda.DeviceBuffer, // [rows, 3W]: the conv reads cs history + p
@@ -288,6 +288,8 @@ pub const Engine = struct {
         try e.comb.fill32(0, null);
         try e.kda_st0.fill32(0, null);
         try e.kda_st1.fill32(0, null);
+        e.kda_st_cur = try gpa.alloc(usize, n_kda);
+        @memset(e.kda_st_cur, 0);
         try e.kda_cs.fill8(0, null);
         // the KDA conv weights: [TAPS, 3W] transposed from the per-tensor
         // [W, 1, TAPS] uploads (element (c, j) at c*TAPS + j)
@@ -569,8 +571,10 @@ pub const Engine = struct {
             }
             std.debug.print("  [kda0] convq {d:.2} convk {d:.2} convv {d:.2}\n", .{ qq, kk, vv });
         }
-        // the step, state ping-pong
-        const st_in = if (e.kda_st_cur == 0) e.kda_st0.ptr else e.kda_st1.ptr;
+        // the step: this layer's own parity so windows chain (layer li's next
+        // read is always the buffer it last wrote)
+        const cur = e.kda_st_cur[li];
+        const st_in = if (cur == 0) e.kda_st0.ptr else e.kda_st1.ptr;
         if (li <= 4 and e.fwd_count == 1) {
             try e.stream.synchronize();
             const hb = try e.gpa.alloc(u8, 256);
@@ -584,7 +588,7 @@ pub const Engine = struct {
             std.debug.print("  pre-step st_in nonzero {d}/64 first {d:.4}\n", .{ nz, fv[0] });
 
         }
-        const st_out = if (e.kda_st_cur == 0) e.kda_st1.ptr else e.kda_st0.ptr;
+        const st_out = if (cur == 0) e.kda_st1.ptr else e.kda_st0.ptr;
         try e.kdk.step(e.stream, e.qkv.ptr, e.fg.ptr, e.bv.ptr, w.a, w.dt_bias, st_in + li * st_bytes, w.o_norm, c.lower_bound, c.hc_eps, rows, st_out + li * st_bytes, e.y.ptr);
         if (li <= 4 and e.fwd_count == 1) {
             try e.stream.synchronize();
@@ -593,7 +597,19 @@ pub const Engine = struct {
             std.debug.print("  post-step st0 nz {d}/32 st1 nz {d}/32\n", .{ c0, c1 });
 
         }
-        e.kda_st_cur = 1 - e.kda_st_cur; // TODO: per-layer, not global, once windows chain
+        e.kda_st_cur[li] = 1 - cur;
+        // conv-history rotate: cs becomes the last TAPS-1 rows of [cs; proj],
+        // so the next window's conv sees this window's tail (their _conv_shift)
+        {
+            const cs_at2 = e.kda_cs.ptr + li * 3 * Wq * 2;
+            if (rows >= 3) {
+                try e.ops.copy2d(e.stream, e.proj.ptr + (rows - 3) * ps, cs_at2, 3, 3 * Wq, ps);
+            } else {
+                const keep = 3 - rows;
+                try e.ops.copy2d(e.stream, cs_at2 + keep * 3 * Wq * 2, cs_at2, keep, 3 * Wq, 3 * Wq);
+                try e.ops.copy2d(e.stream, e.proj.ptr, cs_at2 + keep * 3 * Wq * 2, rows, 3 * Wq, ps);
+            }
+        }
         // o_proj -> branch
         try e.g.mm(e.stream, e.y.ptr, w.o, e.branch.ptr, rows, c.hidden, Wq, false);
         if (li <= 4 and e.fwd_count == 1) {
@@ -785,7 +801,7 @@ pub const Engine = struct {
     }
 
     /// One window of `rows` tokens: ids -> picks (argmax) + logits on device.
-    pub fn forward(e: *Engine, ids: []const u32, rows: usize) !void {
+    pub fn forward(e: *Engine, ids: []const u32, rows: usize, pos: usize) !void {
         e.fwd_count += 1;
         
         const hidden = e.c.hidden;
@@ -797,7 +813,6 @@ pub const Engine = struct {
         }
         var ki: usize = 0;
         var mi_mla: usize = 0;
-        const pos: usize = 0;
         for (e.w.layers, e.w.blocks_lo..) |*L, bi| {
             e.cur_bi = @intCast(bi);
             const hc_a = L.hc_attn orelse return error.UnexpectedMtp;

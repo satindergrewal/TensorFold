@@ -28,12 +28,68 @@ pub fn run(gpu: Gpu, dir: []const u8, rest: []const [:0]const u8) !void {
     @memset(asumsv, 0);
     e.attn_sums = asumsv;
     if (wantF16) e.f32_streams = false;
+    if (rest.len > 2 and std.mem.eql(u8, rest[2], "decode")) {
+        // incremental decode: one prompt forward at pos 0, then one row at a
+        // time with the carried KDA state / conv history / MLA caches
+        var ids19: [24]u32 = @splat(0);
+        var rows0d: usize = 4;
+        {
+            var cdir1 = std.Io.Dir.cwd();
+            if (cdir1.openFile(gpu.io, "pf.ids", .{})) |fh1| {
+                var f1 = fh1;
+                defer f1.close(gpu.io);
+                var buf1: [96]u8 = undefined;
+                if (f1.readPositional(gpu.io, &[1][]u8{buf1[0..]}, 0)) |n1| {
+                    const cnt1 = @min(n1 / 4, 24);
+                    for (0..cnt1) |i| ids19[i] = std.mem.readInt(u32, buf1[i * 4 ..][0..4], .little);
+                    rows0d = cnt1;
+                } else |_| {}
+            } else |_| {}
+        }
+        var pos: usize = 0;
+        try e.forward(ids19[0..rows0d], rows0d, pos);
+        pos += rows0d;
+        var outd: []u8 = try a.alloc(u8, 4096);
+        defer a.free(outd);
+        var wd: usize = 0;
+        var toks: [24]u32 = @splat(0);
+        var ntok: usize = 0;
+        {
+            try e.stream.synchronize();
+            const pk = try check.download(gpu, e.picks);
+            defer a.free(pk);
+            const pv = std.mem.bytesAsSlice(u32, @as([]align(1) u8, pk));
+            toks[ntok] = pv[rows0d - 1];
+            std.debug.print("  prompt pick {d} pv0 {d}\n", .{ pv[rows0d - 1], pv[0] });
+
+            ntok += 1;
+        }
+        var cur_tok: [1]u32 = .{0};
+        while (ntok < 16 and pos < 4090) : (ntok += 1) {
+            cur_tok[0] = toks[ntok - 1];
+            try e.forward(cur_tok[0..1], 1, pos);
+            pos += 1;
+            try e.stream.synchronize();
+            const pk = try check.download(gpu, e.picks);
+            defer a.free(pk);
+            const pv = std.mem.bytesAsSlice(u32, @as([]align(1) u8, pk));
+            toks[ntok] = pv[0];
+        }
+        for (toks[0..ntok]) |t| {
+            const printed = std.fmt.bufPrint(outd[wd..], "{d} ", .{t}) catch unreachable;
+            wd += printed.len;
+        }
+        std.debug.print("  decode[{d}]: {s}\n", .{ ntok, outd[0..wd] });
+
+        return;
+    }
     if (rest.len > 2 and std.mem.eql(u8, rest[2], "oneshot")) {
         // one 16-row window, full picks: the token-1 parity probe
         var ids16: [16]u32 = .{ 785, 6722, 315, 9621, 374, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
-        try e.forward(&ids16, 5);
+        try e.forward(&ids16, 5, 0);
         try e.stream.synchronize();
-        const pk = try check.download(gpu, e.picks);
+        try e.stream.synchronize();
+            const pk = try check.download(gpu, e.picks);
         defer a.free(pk);
         const pv = std.mem.bytesAsSlice(u32, @as([]align(1) u8, pk));
         var out: []u8 = try a.alloc(u8, 160);
@@ -91,9 +147,10 @@ pub fn run(gpu: Gpu, dir: []const u8, rest: []const [:0]const u8) !void {
     while (n_gen < 5) : (n_gen += 1) {
         const rows_now = rows0 + n_gen;
         if (rows_now > 23) break;
-        try e.forward(ids_buf[0..rows_now], rows_now);
+        try e.forward(ids_buf[0..rows_now], rows_now, 0);
         try e.stream.synchronize();
-        const pk = try check.download(gpu, e.picks);
+        try e.stream.synchronize();
+            const pk = try check.download(gpu, e.picks);
         defer a.free(pk);
         const pv = std.mem.bytesAsSlice(u32, @as([]align(1) u8, pk));
         ids_buf[rows_now] = pv[rows_now - 1];
@@ -168,8 +225,8 @@ pub fn run(gpu: Gpu, dir: []const u8, rest: []const [:0]const u8) !void {
     try e.kda_st0.fill32(0, e.stream.handle);
     try e.kda_st1.fill32(0, e.stream.handle);
     try e.kda_cs.fill8(0, e.stream.handle);
-    e.kda_st_cur = 0;
-    try e.forward(&ids, rows);
+@memset(e.kda_st_cur, 0);
+    try e.forward(&ids, rows, 0);
     try e.stream.synchronize();
     // per-buffer NaN census after the walk
     {
@@ -253,7 +310,7 @@ fn runSplit(gpu: Gpu, dir: []const u8, split_at: usize, nm: usize) !void {
             } else |_| {}
         } else |_| {}
     }
-    try ea.forward(&ids, rows);
+    try ea.forward(&ids, rows, 0);
     try ea.stream.synchronize();
     // the handoff state through the host: x (both planes), branch, post, comb
     // download the handoff under A's context BEFORE B's context becomes current
@@ -283,7 +340,7 @@ fn runSplit(gpu: Gpu, dir: []const u8, split_at: usize, nm: usize) !void {
     }
     eb.xi = xi_hand;
     eb.fwd_count = 0;
-    try eb.forward(&ids, rows);
+    try eb.forward(&ids, rows, 0);
     try eb.stream.synchronize();
     const lg = try check.download(gpu, eb.logits);
     defer a.free(lg);
@@ -302,6 +359,54 @@ fn runSplit(gpu: Gpu, dir: []const u8, split_at: usize, nm: usize) !void {
     const pk = try check.download(gpu, eb.picks);
     defer a.free(pk);
     const pv = std.mem.bytesAsSlice(u32, @as([]align(1) u8, pk));
+    // incremental decode through the split (A -> handoff -> B per token); the
+    // handoff shuttles x/branch/post/comb under A's context, then B runs one row
+    var pos: usize = rows;
+    var toks: [24]u32 = @splat(0);
+    var ntok: usize = 0;
+    var cur_tok: [1]u32 = .{0};
+    toks[0] = pv[rows - 1];
+    ntok = 1;
+    while (ntok < 16 and pos < 4000) : (ntok += 1) {
+        cur_tok[0] = toks[ntok - 1];
+        try gpu.ctx.makeCurrent();
+        try ea.forward(cur_tok[0..1], 1, pos);
+        // handoff A -> B
+        ho.x0 = try check.download(gpu, ea.x[0]);
+        ho.x1 = try check.download(gpu, ea.x[1]);
+        ho.branch = try check.download(gpu, ea.branch);
+        ho.post = try check.download(gpu, ea.post);
+        ho.comb = try check.download(gpu, ea.comb);
+        try eb.x[0].upload(0, ho.x0);
+        try eb.x[1].upload(0, ho.x1);
+        try eb.branch.upload(0, ho.branch);
+        try eb.post.upload(0, ho.post);
+        try eb.comb.upload(0, ho.comb);
+        eb.xi = ea.xi;
+        try ctx1.makeCurrent();
+        try eb.forward(cur_tok[0..1], 1, pos);
+        try eb.stream.synchronize();
+        const pkd = try check.download(gpu, eb.picks);
+        defer a.free(pkd);
+        const pvd = std.mem.bytesAsSlice(u32, @as([]align(1) u8, pkd));
+        toks[ntok] = pvd[0];
+        a.free(ho.x0);
+        a.free(ho.x1);
+        a.free(ho.branch);
+        a.free(ho.post);
+        a.free(ho.comb);
+        pos += 1;
+    }
+    {
+        var outd: []u8 = try a.alloc(u8, 400);
+        defer a.free(outd);
+        var wd: usize = 0;
+        for (toks[0..ntok]) |t| {
+            const printed = std.fmt.bufPrint(outd[wd..], "{d} ", .{t}) catch unreachable;
+            wd += printed.len;
+        }
+        std.debug.print("  split-decode[{d}]: {s}" ++ "\n", .{ ntok, outd[0..wd] });
+    }
     {
         var out: []u8 = try a.alloc(u8, 200);
         defer a.free(out);
