@@ -806,7 +806,7 @@ pub const Engine = struct {
             const hc_a = L.hc_attn orelse return error.UnexpectedMtp;
             if (e.fwd_count == 1 and bi == 4) {
                 try e.stream.synchronize();
-                try e.dumpBin("at4_xpre.bin", e.x[e.xi].ptr, rows * 4 * e.c.hidden * 2);
+                try e.dumpBin("at4_xpre.bin", e.x[e.xi].ptr, rows * 4 * e.c.hidden * 4);
                 try e.dumpBin("at4_branch.bin", e.branch.ptr, rows * e.c.hidden * 2);
                 try e.dumpBin("at4_afn.bin", hc_a.fnp, 24 * 4 * e.c.hidden * 2);
             }
@@ -815,7 +815,7 @@ pub const Engine = struct {
                 try e.stream.synchronize();
                 try e.dumpBin("at4_post.bin", e.post.ptr, 16 * 4);
                 try e.dumpBin("at4_comb.bin", e.comb.ptr, 16 * 4 * 4);
-                try e.dumpBin("at4_xpost.bin", e.x[e.xi].ptr, rows * 4 * e.c.hidden * 2);
+                try e.dumpBin("at4_xpost.bin", e.x[e.xi].ptr, rows * 4 * e.c.hidden * 4);
                 try e.dumpBin("at4_abase.bin", hc_a.base, 24 * 4);
                 try e.dumpBin("at4_ascale.bin", hc_a.scale, 3 * 4);
             }
@@ -864,7 +864,7 @@ pub const Engine = struct {
             if (e.fwd_count == 1 and bi <= 45) {
                 try e.stream.synchronize();
                 var n1: [24]u8 = undefined;
-                try e.dumpBin(std.fmt.bufPrint(&n1, "pb{d}_xpre.bin", .{bi}) catch unreachable, e.x[if (e.xi < 2) e.xi else 0].ptr, rows * 4 * e.c.hidden * 2);
+                try e.dumpBin(std.fmt.bufPrint(&n1, "pb{d}_xpre.bin", .{bi}) catch unreachable, e.x[if (e.xi < 2) e.xi else 0].ptr, rows * 4 * e.c.hidden * 4);
                 var n2: [24]u8 = undefined;
                 try e.dumpBin(std.fmt.bufPrint(&n2, "pb{d}_fnp.bin", .{bi}) catch unreachable, (L.hc_ffn orelse unreachable).fnp, 24 * 4 * e.c.hidden * 2);
                 try e.dumpBin("hc_fbase.bin", (L.hc_ffn orelse unreachable).base, 24 * 4);
@@ -878,7 +878,7 @@ pub const Engine = struct {
                 var n4: [24]u8 = undefined;
                 try e.dumpBin(std.fmt.bufPrint(&n4, "pb{d}_comb.bin", .{bi}) catch unreachable, e.comb.ptr, rows * 16 * 4);
                 var n5: [24]u8 = undefined;
-                try e.dumpBin(std.fmt.bufPrint(&n5, "pb{d}_xpost.bin", .{bi}) catch unreachable, e.x[if (e.xi < 2) e.xi else 0].ptr, rows * 4 * e.c.hidden * 2);
+                try e.dumpBin(std.fmt.bufPrint(&n5, "pb{d}_xpost.bin", .{bi}) catch unreachable, e.x[if (e.xi < 2) e.xi else 0].ptr, rows * 4 * e.c.hidden * 4);
                 var n7: [24]u8 = undefined;
                 try e.dumpBin(std.fmt.bufPrint(&n7, "pb{d}_part.bin", .{bi}) catch unreachable, e.part.ptr, rows * hc.partBytes(1));
             }

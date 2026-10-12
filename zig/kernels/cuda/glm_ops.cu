@@ -211,8 +211,9 @@ extern "C" __global__ void glm_route(const float* __restrict__ logits, const flo
         }
         __syncthreads();
         if (warp == 0) {
-            best = rb[lane];
-            at = ra[lane];
+            // all 32 lanes join the shuffle; only the low 16 read the stage array
+            best = lane < 16 ? rb[lane] : -INFINITY;
+            at = lane < 16 ? ra[lane] : 0x7fffffff;
             for (int off = 8; off > 0; off >>= 1) { // 16 warps
                 const float ob = __shfl_xor_sync(0xffffffff, best, off);
                 const int oa = __shfl_xor_sync(0xffffffff, at, off);

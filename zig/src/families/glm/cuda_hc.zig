@@ -140,7 +140,7 @@ pub const Kernels = struct {
         a.add(post_out);
         a.add(comb_out);
         a.add(@as(i32, @intCast(rows)));
-        try launch_.launch(k.split_f32_fn, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 } }, s, &a);
+        try launch_.launch(k.split_f32_fn, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 1024 } }, s, &a);
     }
 
 };
