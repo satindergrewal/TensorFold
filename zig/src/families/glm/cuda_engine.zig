@@ -518,6 +518,26 @@ pub const Engine = struct {
     fn kdaLayer(e: *Engine, li: usize, w: *const weights.Kda, rows: usize) !void {
         if (e.dump_on and li == 0) {
             try e.stream.synchronize();
+            {
+                const np = rows * 12288 * 2;
+                if (e.proj.len >= np) {
+                    const pb = try e.gpa.alloc(u8, np);
+                    defer e.gpa.free(pb);
+                    try e.proj.download(0, pb);
+                    var nm3: [32]u8 = undefined;
+                    const f3 = std.fmt.bufPrint(&nm3, "kproj{d}.bin", .{e.dump_epoch}) catch unreachable;
+                    var dir = std.Io.Dir.cwd();
+                    dir.writeFile(e.io, .{ .sub_path = f3, .data = pb }) catch {};
+                }
+                const nc = 3 * 12288 * 2;
+                const cb = try e.gpa.alloc(u8, nc);
+                defer e.gpa.free(cb);
+                try (cuda.DeviceBuffer{ .d = e.d, .ptr = e.kda_cs.ptr, .len = nc, .borrowed = true }).download(0, cb);
+                var nm4: [32]u8 = undefined;
+                const f4 = std.fmt.bufPrint(&nm4, "kcs{d}.bin", .{e.dump_epoch}) catch unreachable;
+                var dir2 = std.Io.Dir.cwd();
+                dir2.writeFile(e.io, .{ .sub_path = f4, .data = cb }) catch {};
+            }
             const nq = rows * 3 * 12288 * 2;
             if (e.qkv.len >= nq) {
                 const qb = try e.gpa.alloc(u8, nq);
@@ -664,7 +684,10 @@ pub const Engine = struct {
                 try e.ops.copy2d(e.stream, e.proj.ptr + (rows - 3) * ps, cs_at2, 3, 3 * Wq, ps);
             } else {
                 const keep = 3 - rows;
-                try e.ops.copy2d(e.stream, cs_at2 + keep * 3 * Wq * 2, cs_at2, keep, 3 * Wq, 3 * Wq);
+                // the kept slice is cs[rows..3) (the LAST keep rows); the old code
+                // read from keep*3W - for rows=1 it took cs[2] + an out-of-bounds
+                // row of the NEXT layer's cs, corrupting every decode window
+                try e.ops.copy2d(e.stream, cs_at2 + rows * 3 * Wq * 2, cs_at2, keep, 3 * Wq, 3 * Wq);
                 try e.ops.copy2d(e.stream, e.proj.ptr, cs_at2 + keep * 3 * Wq * 2, rows, 3 * Wq, ps);
             }
         }
