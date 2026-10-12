@@ -110,6 +110,7 @@ pub const Engine = struct {
     dump_epoch: u8 = 1, // resetState bumps: window-2 probe dumps get a 2 suffix
     quiet: bool = false, // serving: no probe dumps or debug prints
     dump_on: bool = false, // test: dump this window's probes regardless of fwd_count
+    hc_calls: usize = 0, // probe: counts hcGates calls within a forward
     f32_streams: bool = true, // set by the test: stream means at their L-points
     d: *const cuda.Driver,
     stream: cuda.Stream,
@@ -487,6 +488,18 @@ pub const Engine = struct {
 
     fn hcGates(e: *Engine, rows: usize, hc_w: weights.Hc, norm_w: u64) !void {
         const x_old = e.x[e.xi].ptr;
+        e.hc_calls += 1;
+        if (e.dump_on and e.hc_calls == 1) { // the very first gates call: the x entering block 0's attention
+            try e.stream.synchronize();
+            const n = rows * 4 * e.c.hidden * 4;
+            const xb = try e.gpa.alloc(u8, n);
+            defer e.gpa.free(xb);
+            try e.x[e.xi].download(0, xb);
+            var nm7: [32]u8 = undefined;
+            const f7 = std.fmt.bufPrint(&nm7, "kxo{d}.bin", .{e.dump_epoch}) catch unreachable;
+            var dir7 = std.Io.Dir.cwd();
+            dir7.writeFile(e.io, .{ .sub_path = f7, .data = xb }) catch {};
+        }
         const x_new = e.x[1 - e.xi].ptr;
         const layer_h = hc_w;
         // glue's hc_pre: this boundary's gates + normed from the x entering it;
@@ -937,6 +950,7 @@ pub const Engine = struct {
     /// One window of `rows` tokens: ids -> picks (argmax) + logits on device.
     pub fn forward(e: *Engine, ids: []const u32, rows: usize, pos: usize) !void {
         e.fwd_count += 1;
+        e.hc_calls = 0;
         
         const hidden = e.c.hidden;
         if (!e.cont) {
