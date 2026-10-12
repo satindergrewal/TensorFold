@@ -493,10 +493,9 @@ fn runSplit(gpu: Gpu, dir: []const u8, split_at: usize, nm: usize) !void {
             while (nspec < 16 and spos < 4000) {
                 if (d != 0 and rounds % 2 == 1) {
                     var two: [2]u32 = .{ spec[nspec - 1], d };
-                    if (rounds == 1) {
+                    if (rounds == 99) { // disabled: keep the bisect dump set unambiguous
                         ea.dump_on = true;
                         eb.dump_on = true;
-                        std.debug.print("  DUMPSER verify start a={d} b={d}\n", .{ ea.dump_serial, eb.dump_serial });
                     }
                     try gpu.ctx.makeCurrent();
                     try ea.backupCs();
@@ -549,19 +548,17 @@ fn runSplit(gpu: Gpu, dir: []const u8, split_at: usize, nm: usize) !void {
                     a.free(vme);
                     a.free(vp);
                     a.free(vd);
-                    if (rounds == 1) {
+                    if (rounds == 99) {
                         ea.dump_on = false;
                         eb.dump_on = false;
-                        std.debug.print("  DUMPSER verify end a={d} b={d}\n", .{ ea.dump_serial, eb.dump_serial });
                     }
                     rounds += 1;
                     continue;
                 }
                 var one: [1]u32 = .{spec[nspec - 1]};
-                if (rounds == 2) { // the reject-redo 1-row round: same token+pos as verify row 0
+                if (rounds == 99) {
                     ea.dump_on = true;
                     eb.dump_on = true;
-                    std.debug.print("  DUMPSER onerow start a={d} b={d}\n", .{ ea.dump_serial, eb.dump_serial });
                 }
                 try gpu.ctx.makeCurrent();
                 try ea.forward(one[0..1], 1, spos);
@@ -586,10 +583,9 @@ fn runSplit(gpu: Gpu, dir: []const u8, split_at: usize, nm: usize) !void {
                 const od = try check.download(gpu, eb.mtp_pick);
                 const odv = std.mem.bytesAsSlice(u32, @as([]align(1) u8, od));
                 std.debug.print("  round 1: fed {d} p={d} d={d}\n", .{ one[0], opv[0], odv[0] });
-                if (rounds == 2) {
+                if (rounds == 99) {
                     ea.dump_on = false;
                     eb.dump_on = false;
-                    std.debug.print("  DUMPSER onerow end a={d} b={d}\n", .{ ea.dump_serial, eb.dump_serial });
                 }
                 spec[nspec] = opv[0];
                 nspec += 1;
@@ -627,7 +623,9 @@ fn runSplit(gpu: Gpu, dir: []const u8, split_at: usize, nm: usize) !void {
             // lane A: 2-row window, dumps at epoch eA
             try gpu.ctx.makeCurrent();
             try ea.resetState();
+            ea.dump_on = true;
             try ea.forward(&ids, rows, 0);
+            ea.dump_on = false;
             try ea.stream.synchronize();
             const ax0 = try check.download(gpu, ea.x[0]);
             const ax1 = try check.download(gpu, ea.x[1]);
@@ -666,7 +664,9 @@ fn runSplit(gpu: Gpu, dir: []const u8, split_at: usize, nm: usize) !void {
             // lane B: reset, prompt, 1-row [a] (dump off), 1-row [b] (dump on)
             try gpu.ctx.makeCurrent();
             try ea.resetState();
+            ea.dump_on = true;
             try ea.forward(&ids, rows, 0);
+            ea.dump_on = false;
             try ea.stream.synchronize();
             const cx0 = try check.download(gpu, ea.x[0]);
             const cx1 = try check.download(gpu, ea.x[1]);
