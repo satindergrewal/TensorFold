@@ -519,6 +519,16 @@ pub const Engine = struct {
         if (e.dump_on and li == 0) {
             try e.stream.synchronize();
             {
+                const nn = rows * e.c.hidden * 2;
+                const nb = try e.gpa.alloc(u8, nn);
+                defer e.gpa.free(nb);
+                try e.normed.download(0, nb);
+                var nm5: [32]u8 = undefined;
+                const f5 = std.fmt.bufPrint(&nm5, "kna{d}.bin", .{e.dump_epoch}) catch unreachable;
+                var dir5 = std.Io.Dir.cwd();
+                dir5.writeFile(e.io, .{ .sub_path = f5, .data = nb }) catch {};
+            }
+            {
                 const np = rows * 12288 * 2;
                 if (e.proj.len >= np) {
                     const pb = try e.gpa.alloc(u8, np);
