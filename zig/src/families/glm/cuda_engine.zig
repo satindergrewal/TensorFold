@@ -470,7 +470,8 @@ pub const Engine = struct {
     /// Per-block probe dump: pb{bi}_{tag}.bin, rows*hidden bf16 at a raw pointer.
     fn dumpPb(e: *Engine, bi: usize, tag: []const u8, ptr: u64, rows: usize) !void {
         var name: [24]u8 = undefined;
-        const n = if (e.dump_epoch == 1) (std.fmt.bufPrint(&name, "pb{d}_{s}.bin", .{ bi, tag }) catch return) else (std.fmt.bufPrint(&name, "pb{d}_{s}{d}.bin", .{ bi, tag, e.dump_epoch }) catch return);
+        e.dump_serial += 1;
+        const n = std.fmt.bufPrint(&name, "pb{d}_{s}S{d}.bin", .{ bi, tag, e.dump_serial }) catch return;
         try e.dumpBin(n, ptr, rows * e.c.hidden * 2);
     }
 
