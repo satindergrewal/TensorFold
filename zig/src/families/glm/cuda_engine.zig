@@ -55,12 +55,13 @@ const Gemms = struct {
     /// D . W^T with independent row strides (bytes) for x, W and out.
     fn mmStrided(g: *Gemms, s: cuda.Stream, x: u64, xs: usize, w: u64, ws_: usize, out: u64, os: usize, rows: usize, n: usize, k: usize) !void {
         // a dedicated Linear per stride combo
-        const id = key(rows | (xs << 8), n, k, false) ^ (ws_ << 20) ^ (os << 26);
+        const m: usize = if (rows == 1) 2 else rows; // 1-row pads to the 2-row plan (spec-decode bit parity)
+        const id = key(m | (xs << 8), n, k, false) ^ (ws_ << 20) ^ (os << 26);
         const gop = try g.map.getOrPut(id);
         if (!gop.found_existing) {
             // build with custom layouts (the shared init hardcodes ld=k)
             var lin: cuda.cublaslt.Linear = undefined;
-            lin = try cuda.cublaslt.Linear.initStrided(&g.lt, rows, n, k, .bf16, 64 << 20, xs / 2, ws_ / 2, os / 2);
+            lin = try cuda.cublaslt.Linear.initStrided(&g.lt, m, n, k, .bf16, 64 << 20, xs / 2, ws_ / 2, os / 2);
             gop.value_ptr.* = lin;
         }
         gop.value_ptr.run(x, w, out, g.ws.ptr, g.ws.len, s.handle) catch |err| {
@@ -71,10 +72,11 @@ const Gemms = struct {
 
     /// D[rows, n] = X[rows, k] . W[k, n] (W UNtransposed: row-major x @ W).
     fn mmNT(g: *Gemms, s: cuda.Stream, x: u64, xs: usize, w: u64, ws_: usize, out: u64, os: usize, rows: usize, n: usize, k: usize) !void {
-        const id = key(rows | (xs << 8), n, k, false) ^ (ws_ << 20) ^ (os << 26) ^ 0x5A5A;
+        const m: usize = if (rows == 1) 2 else rows; // 1-row pads to the 2-row plan (spec-decode bit parity)
+        const id = key(m | (xs << 8), n, k, false) ^ (ws_ << 20) ^ (os << 26) ^ 0x5A5A;
         const gop = try g.map.getOrPut(id);
         if (!gop.found_existing)
-            gop.value_ptr.* = try cuda.cublaslt.Linear.initNT(&g.lt, rows, n, k, .bf16, 64 << 20, xs / 2, ws_ / 2, os / 2);
+            gop.value_ptr.* = try cuda.cublaslt.Linear.initNT(&g.lt, m, n, k, .bf16, 64 << 20, xs / 2, ws_ / 2, os / 2);
         gop.value_ptr.run(x, w, out, g.ws.ptr, g.ws.len, s.handle) catch |err| {
             std.debug.print("mmNT FAIL rows={d} n={d} k={d}" ++ "\n", .{ rows, n, k });
             return err;
@@ -83,10 +85,13 @@ const Gemms = struct {
 
     /// D[rows, n] bf16 (or fp32) = X[rows, k] . W[n, k]^T.
     fn mm(g: *Gemms, s: cuda.Stream, x: u64, w: u64, out: u64, rows: usize, n: usize, k: usize, f32_out: bool) !void {
-        const id = key(rows, n, k, f32_out);
+        // m=1 pads to an m=2 plan: 1-row and 2-row windows then share GEMM bits
+        // for row 0, so speculative verify rounds agree with plain greedy rounds
+        const m: usize = if (rows == 1) 2 else rows;
+        const id = key(m, n, k, f32_out);
         const gop = try g.map.getOrPut(id);
         if (!gop.found_existing)
-            gop.value_ptr.* = try cuda.cublaslt.Linear.init(&g.lt, rows, n, k, if (f32_out) .f32 else .bf16, 64 << 20);
+            gop.value_ptr.* = try cuda.cublaslt.Linear.init(&g.lt, m, n, k, if (f32_out) .f32 else .bf16, 64 << 20);
         gop.value_ptr.run(x, w, out, g.ws.ptr, g.ws.len, s.handle) catch |err| {
             std.debug.print("mm FAIL rows={d} n={d} k={d} f32={}" ++ "\n", .{ rows, n, k, f32_out });
             return err;
@@ -180,6 +185,7 @@ pub const Engine = struct {
     mtp_out: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
     mtp_pick: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
     mtp_emb: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true }, // bf16 [1, D]: the last token's embedding
+    kda_cs_bak: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true }, // spec-decode rollback
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, dir: []const u8, opts: Options) !*Engine {
         const e = try gpa.create(Engine);
@@ -844,6 +850,22 @@ pub const Engine = struct {
         if (e.mtp_emb.len == 0) e.mtp_emb = try cuda.DeviceBuffer.alloc(e.d, e.c.hidden * 2);
     }
 
+    /// Spec decode: snapshot the conv history before a verify round.
+    pub fn backupCs(e: *Engine) !void {
+        if (e.kda_cs_bak.len == 0) e.kda_cs_bak = try cuda.DeviceBuffer.alloc(e.d, e.kda_cs.len);
+        try e.kda_cs_bak.copyFrom(0, e.kda_cs.ptr, e.kda_cs.len, e.stream.handle);
+    }
+
+    /// Undo one forward's recurrent advance (a rejected verify round): the KDA
+    /// step never overwrites its input buffer, so flipping the per-layer parity
+    /// back restores the pre-round state view; cs comes back from the backup.
+    /// MLA/MTP caches need nothing: slots are rewritten before they are read.
+    pub fn rollbackRound(e: *Engine) !void {
+        for (e.kda_st_cur) |*c| c.* = 1 - c.*;
+        try e.kda_cs.copyFrom(0, e.kda_cs_bak.ptr, e.kda_cs.len, e.stream.handle);
+        try e.stream.synchronize();
+    }
+
     /// One window of `rows` tokens: ids -> picks (argmax) + logits on device.
     pub fn forward(e: *Engine, ids: []const u32, rows: usize, pos: usize) !void {
         e.fwd_count += 1;
@@ -1040,7 +1062,7 @@ pub const Engine = struct {
 
     pub fn deinit(e: *Engine) void {
         const gpa = e.gpa;
-        inline for (.{ "mtp_eh", "mtp_x", "mtp_out", "mtp_pick", "mtp_emb" }) |f| {
+        inline for (.{ "mtp_eh", "mtp_x", "mtp_out", "mtp_pick", "mtp_emb", "kda_cs_bak" }) |f| {
             if (@field(e, f).len != 0) @field(e, f).free();
         }
         inline for (.{ "ids", "branch", "normed", "part", "post", "comb", "y", "proj", "qkv", "fg", "bv", "kda_st0", "kda_st1", "kda_cs", "kda_cw", "kda_conv_p", "logits", "picks", "scratch" }) |f| {

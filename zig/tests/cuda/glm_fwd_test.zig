@@ -448,6 +448,157 @@ fn runSplit(gpu: Gpu, dir: []const u8, split_at: usize, nm: usize) !void {
             }
             std.debug.print("  mtp drafts: {s} acceptance {d}/{d}\n", .{ dl[0..wl], hit, tot });
         }
+        // SPEC LOOP: alternate 1-row rounds (fresh draft) with 2-row verify rounds;
+        // invariant: the emitted sequence must equal plain greedy (toks).
+        // Starts from a fresh redo of the prompt (the greedy loop above left the
+        // recurrent state at its own decode end, not the prompt's).
+        {
+            try gpu.ctx.makeCurrent();
+            try ea.resetState();
+            try ea.forward(&ids, rows, 0);
+            try ea.stream.synchronize();
+            const px0 = try check.download(gpu, ea.x[0]);
+            const px1 = try check.download(gpu, ea.x[1]);
+            const pbr = try check.download(gpu, ea.branch);
+            const ppo = try check.download(gpu, ea.post);
+            const pco = try check.download(gpu, ea.comb);
+            const pme = try check.download(gpu, ea.mtp_emb);
+            try ctx1.makeCurrent();
+            try eb.resetState();
+            try eb.x[0].upload(0, px0);
+            try eb.x[1].upload(0, px1);
+            try eb.branch.upload(0, pbr);
+            try eb.post.upload(0, ppo);
+            try eb.comb.upload(0, pco);
+            try eb.mtp_emb.upload(0, pme);
+            eb.xi = ea.xi;
+            eb.fwd_count = 0;
+            try eb.forward(&ids, rows, 0);
+            try eb.stream.synchronize();
+            a.free(px0);
+            a.free(px1);
+            a.free(pbr);
+            a.free(ppo);
+            a.free(pco);
+            a.free(pme);
+            var spec: [24]u32 = @splat(0);
+            var nspec: usize = 0;
+            spec[0] = toks[0];
+            nspec = 1;
+            var d: u32 = drafts[0];
+            var spos: usize = rows;
+            var accepts: usize = 0;
+            var rejects: usize = 0;
+            var rounds: usize = 0;
+            while (nspec < 16 and spos < 4000) {
+                if (d != 0 and rounds % 2 == 1) {
+                    var two: [2]u32 = .{ spec[nspec - 1], d };
+                    try gpu.ctx.makeCurrent();
+                    try ea.backupCs();
+                    try ea.forward(two[0..2], 2, spos);
+                    const vx0 = try check.download(gpu, ea.x[0]);
+                    const vx1 = try check.download(gpu, ea.x[1]);
+                    const vbr = try check.download(gpu, ea.branch);
+                    const vpo = try check.download(gpu, ea.post);
+                    const vco = try check.download(gpu, ea.comb);
+                    const vme = try check.download(gpu, ea.mtp_emb);
+                    try ctx1.makeCurrent();
+                    try eb.backupCs();
+                    try eb.x[0].upload(0, vx0);
+                    try eb.x[1].upload(0, vx1);
+                    try eb.branch.upload(0, vbr);
+                    try eb.post.upload(0, vpo);
+                    try eb.comb.upload(0, vco);
+                    try eb.mtp_emb.upload(0, vme);
+                    eb.xi = ea.xi;
+                    try eb.forward(two[0..2], 2, spos);
+                    try eb.stream.synchronize();
+                    const vp = try check.download(gpu, eb.picks);
+                    const vpv = std.mem.bytesAsSlice(u32, @as([]align(1) u8, vp));
+                    const vd = try check.download(gpu, eb.mtp_pick);
+                    const vdv = std.mem.bytesAsSlice(u32, @as([]align(1) u8, vd));
+                    std.debug.print("  round v: fed [{d},{d}] p0={d} p1={d} dnew={d}\n", .{ two[0], two[1], vpv[0], vpv[1], vdv[0] });
+                    if (vpv[0] == d) {
+                        accepts += 1;
+                        spec[nspec] = d;
+                        nspec += 1;
+                        if (nspec < 16) {
+                            spec[nspec] = vpv[1];
+                            nspec += 1;
+                        }
+                        d = vdv[0];
+                        spos += 2;
+                    } else {
+                        rejects += 1;
+                        try gpu.ctx.makeCurrent();
+                        try ea.rollbackRound();
+                        try ctx1.makeCurrent();
+                        try eb.rollbackRound();
+                        d = 0;
+                    }
+                    a.free(vx0);
+                    a.free(vx1);
+                    a.free(vbr);
+                    a.free(vpo);
+                    a.free(vco);
+                    a.free(vme);
+                    a.free(vp);
+                    a.free(vd);
+                    rounds += 1;
+                    continue;
+                }
+                var one: [1]u32 = .{spec[nspec - 1]};
+                try gpu.ctx.makeCurrent();
+                try ea.forward(one[0..1], 1, spos);
+                const ox0 = try check.download(gpu, ea.x[0]);
+                const ox1 = try check.download(gpu, ea.x[1]);
+                const obr = try check.download(gpu, ea.branch);
+                const opo = try check.download(gpu, ea.post);
+                const oco = try check.download(gpu, ea.comb);
+                const ome = try check.download(gpu, ea.mtp_emb);
+                try ctx1.makeCurrent();
+                try eb.x[0].upload(0, ox0);
+                try eb.x[1].upload(0, ox1);
+                try eb.branch.upload(0, obr);
+                try eb.post.upload(0, opo);
+                try eb.comb.upload(0, oco);
+                try eb.mtp_emb.upload(0, ome);
+                eb.xi = ea.xi;
+                try eb.forward(one[0..1], 1, spos);
+                try eb.stream.synchronize();
+                const op = try check.download(gpu, eb.picks);
+                const opv = std.mem.bytesAsSlice(u32, @as([]align(1) u8, op));
+                const od = try check.download(gpu, eb.mtp_pick);
+                const odv = std.mem.bytesAsSlice(u32, @as([]align(1) u8, od));
+                std.debug.print("  round 1: fed {d} p={d} d={d}\n", .{ one[0], opv[0], odv[0] });
+                spec[nspec] = opv[0];
+                nspec += 1;
+                d = odv[0];
+                spos += 1;
+                a.free(ox0);
+                a.free(ox1);
+                a.free(obr);
+                a.free(opo);
+                a.free(oco);
+                a.free(ome);
+                a.free(op);
+                a.free(od);
+                rounds += 1;
+            }
+            var eq = nspec == ntok;
+            if (eq) for (0..nspec) |i| {
+                if (spec[i] != toks[i]) eq = false;
+            };
+            const sl = try a.alloc(u8, 300);
+            defer a.free(sl);
+            var sw: usize = 0;
+            for (spec[0..nspec]) |t| {
+                const pr = std.fmt.bufPrint(sl[sw..], "{d} ", .{t}) catch unreachable;
+                sw += pr.len;
+            }
+            std.debug.print("  spec[{d}]: {s} accepts {d} rejects {d} == greedy: {}\n", .{ nspec, sl[0..sw], accepts, rejects, eq });
+        }
+
     }
     // WINDOW 2: same prompt+decode after resetState — serving replays this per request.
     // If picks diverge, some state survives the reset.
