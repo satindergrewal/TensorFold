@@ -109,6 +109,7 @@ pub const Engine = struct {
     fwd_count: usize = 0,
     dump_epoch: u8 = 1, // resetState bumps: window-2 probe dumps get a 2 suffix
     quiet: bool = false, // serving: no probe dumps or debug prints
+    dump_on: bool = false, // test: dump this window's probes regardless of fwd_count
     f32_streams: bool = true, // set by the test: stream means at their L-points
     d: *const cuda.Driver,
     stream: cuda.Stream,
@@ -403,7 +404,7 @@ pub const Engine = struct {
         @memset(e.kda_st_cur, 0);
         e.xi = 0;
         e.fwd_count = 0;
-        if (e.dump_epoch < 2) e.dump_epoch += 1;
+        e.dump_epoch += 1;
         try e.stream.synchronize();
 
     }
@@ -467,7 +468,7 @@ pub const Engine = struct {
     /// Per-block probe dump: pb{bi}_{tag}.bin, rows*hidden bf16 at a raw pointer.
     fn dumpPb(e: *Engine, bi: usize, tag: []const u8, ptr: u64, rows: usize) !void {
         var name: [24]u8 = undefined;
-        const n = if (e.dump_epoch == 1) (std.fmt.bufPrint(&name, "pb{d}_{s}.bin", .{ bi, tag }) catch return) else (std.fmt.bufPrint(&name, "pb{d}_{s}2.bin", .{ bi, tag }) catch return);
+        const n = if (e.dump_epoch == 1) (std.fmt.bufPrint(&name, "pb{d}_{s}.bin", .{ bi, tag }) catch return) else (std.fmt.bufPrint(&name, "pb{d}_{s}{d}.bin", .{ bi, tag, e.dump_epoch }) catch return);
         try e.dumpBin(n, ptr, rows * e.c.hidden * 2);
     }
 
@@ -758,7 +759,7 @@ pub const Engine = struct {
             const kl = try e.gpa.alloc(i32, 1);
             defer e.gpa.free(kl);
             kl[0] = @intCast(key_len);
-            try e.mla_klen.upload(0, std.mem.sliceAsBytes(kl));
+            try e.mla_klen.uploadAsync(0, std.mem.sliceAsBytes(kl), e.stream.handle);
         }
         try e.dsa.?.attention(e.stream, e.mla_ql.ptr, e.mla_keys.ptr + mi * cap * RANK * 2, e.mla_idx.ptr, e.mla_scale.ptr, e.mla_klen.ptr, e.mla_att.ptr, rows, H);
         // unabsorb: v[h, vdim] = V_h[vdim, latent] @ att[h, latent] (the v rows at
@@ -873,11 +874,22 @@ pub const Engine = struct {
         const hidden = e.c.hidden;
         if (!e.cont) {
             // embed into the four streams
-            try e.ids.upload(0, std.mem.sliceAsBytes(ids)[0 .. rows * 4]);
+            try e.ids.uploadAsync(0, std.mem.sliceAsBytes(ids)[0 .. rows * 4], e.stream.handle); // stream-ordered: a null-stream upload races the embed kernel
             for (0..4) |s_i| { if (e.f32_streams) try e.ops.embedF32(e.stream, e.ids.ptr, e.w.embed, e.x[e.xi].ptr + s_i * hidden * 4, rows, hidden, 4 * hidden) else try e.ops.embed(e.stream, e.ids.ptr, e.w.embed, e.x[e.xi].ptr + s_i * hidden * 2, rows, hidden, 4 * hidden); }
             e.xi = 0;
             if (e.mtp_emb.len != 0)
                 try e.ops.embed(e.stream, e.ids.ptr + (rows - 1) * 4, e.w.embed, e.mtp_emb.ptr, 1, hidden, hidden);
+            if (e.dump_on) {
+                try e.stream.synchronize();
+                const n = rows * 4 * hidden * 4;
+                const hb2 = try e.gpa.alloc(u8, n);
+                defer e.gpa.free(hb2);
+                try e.x[0].download(0, hb2);
+                var fn2: [32]u8 = undefined;
+                const fname = std.fmt.bufPrint(&fn2, "xemb{d}.bin", .{e.dump_epoch}) catch unreachable;
+                var dir = std.Io.Dir.cwd();
+                dir.writeFile(e.io, .{ .sub_path = fname, .data = hb2 }) catch {};
+            }
         }
         var ki: usize = 0;
         var mi_mla: usize = 0;
@@ -925,7 +937,7 @@ pub const Engine = struct {
                 asums[bi - 1] = acc;
                 }
             }
-            if ((e.fwd_count == 1 and !e.quiet) and bi <= 45) try e.dumpPb(bi, "na", e.normed.ptr, rows);
+            if (((e.fwd_count == 1 or e.dump_on) and !e.quiet) and bi <= 45) try e.dumpPb(bi, "na", e.normed.ptr, rows);
             if (bi == 0 and !e.quiet) {
                 try e.b0Print("normed", e.normed);
                 const nb = try e.gpa.alloc(u8, e.c.hidden * 2);
@@ -949,7 +961,7 @@ pub const Engine = struct {
                     mi_mla += 1;
                 },
             }
-            if ((e.fwd_count == 1 and !e.quiet) and bi <= 45) try e.dumpPb(bi, "ba", e.branch.ptr, rows);
+            if (((e.fwd_count == 1 or e.dump_on) and !e.quiet) and bi <= 45) try e.dumpPb(bi, "ba", e.branch.ptr, rows);
             if ((e.fwd_count == 1 and !e.quiet) and bi <= 45) {
                 try e.stream.synchronize();
                 var n1: [24]u8 = undefined;
@@ -961,7 +973,7 @@ pub const Engine = struct {
             }
             try e.hcFold(hc_a.fnp, rows);
             try e.hcGates(rows, L.hc_ffn orelse return error.UnexpectedMtp, L.post_norm);
-            if ((e.fwd_count == 1 and !e.quiet) and bi <= 45) try e.dumpPb(bi, "nf", e.normed.ptr, rows);
+            if (((e.fwd_count == 1 or e.dump_on) and !e.quiet) and bi <= 45) try e.dumpPb(bi, "nf", e.normed.ptr, rows);
             if ((e.fwd_count == 1 and !e.quiet) and bi <= 45) {
                 var n3: [24]u8 = undefined;
                 try e.dumpBin(std.fmt.bufPrint(&n3, "pb{d}_post.bin", .{bi}) catch unreachable, e.post.ptr, rows * 4 * 4);
@@ -977,7 +989,7 @@ pub const Engine = struct {
                 .moe => |*w| try e.moeBlock(w, rows),
             }
             try e.hcFold((L.hc_ffn orelse return error.UnexpectedMtp).fnp, rows);
-            if ((e.fwd_count == 1 and !e.quiet) and bi <= 45) try e.dumpPb(bi, "bf", e.branch.ptr, rows);
+            if (((e.fwd_count == 1 or e.dump_on) and !e.quiet) and bi <= 45) try e.dumpPb(bi, "bf", e.branch.ptr, rows);
             if (e.block_sums) |sums| {
                 // their tap metric: row 0's mean of the 4 streams, summed over D
                 const hd = e.c.hidden;

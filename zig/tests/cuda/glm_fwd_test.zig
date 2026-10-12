@@ -598,6 +598,169 @@ fn runSplit(gpu: Gpu, dir: []const u8, split_at: usize, nm: usize) !void {
             }
             std.debug.print("  spec[{d}]: {s} accepts {d} rejects {d} == greedy: {}\n", .{ nspec, sl[0..sw], accepts, rejects, eq });
         }
+        // ROW-1 BISECT: lane A = one 2-row window [a,b] on the prompt state;
+        // lane B = 1-row [a] then 1-row [b]. Row 1 of A must equal row 0 of B's
+        // second window, per block, when the engine is shape-independent.
+        {
+            const ta = toks[0];
+            const tb = toks[1];
+            // lane A: 2-row window, dumps at epoch eA
+            try gpu.ctx.makeCurrent();
+            try ea.resetState();
+            try ea.forward(&ids, rows, 0);
+            try ea.stream.synchronize();
+            const ax0 = try check.download(gpu, ea.x[0]);
+            const ax1 = try check.download(gpu, ea.x[1]);
+            const abr = try check.download(gpu, ea.branch);
+            const apo = try check.download(gpu, ea.post);
+            const aco = try check.download(gpu, ea.comb);
+            const ame = try check.download(gpu, ea.mtp_emb);
+            var two: [2]u32 = .{ ta, tb };
+            ea.dump_on = true;
+            try ea.forward(two[0..2], 2, rows);
+            try ea.stream.synchronize();
+            ea.dump_on = false;
+            const bx0 = try check.download(gpu, ea.x[0]);
+            const bx1 = try check.download(gpu, ea.x[1]);
+            const bbr = try check.download(gpu, ea.branch);
+            const bpo = try check.download(gpu, ea.post);
+            const bco = try check.download(gpu, ea.comb);
+            const bme = try check.download(gpu, ea.mtp_emb);
+            try ctx1.makeCurrent();
+            try eb.resetState();
+            try eb.x[0].upload(0, ax0);
+            try eb.x[1].upload(0, ax1);
+            try eb.branch.upload(0, abr);
+            try eb.post.upload(0, apo);
+            try eb.comb.upload(0, aco);
+            try eb.mtp_emb.upload(0, ame);
+            eb.xi = ea.xi;
+            eb.fwd_count = 0;
+            eb.dump_on = true;
+            try eb.forward(two[0..2], 2, rows);
+            try eb.stream.synchronize();
+            eb.dump_on = false;
+            const eB = eb.dump_epoch;
+            // lane B: reset, prompt, 1-row [a] (dump off), 1-row [b] (dump on)
+            try gpu.ctx.makeCurrent();
+            try ea.resetState();
+            try ea.forward(&ids, rows, 0);
+            try ea.stream.synchronize();
+            const cx0 = try check.download(gpu, ea.x[0]);
+            const cx1 = try check.download(gpu, ea.x[1]);
+            const cbr = try check.download(gpu, ea.branch);
+            const cpo = try check.download(gpu, ea.post);
+            const cco = try check.download(gpu, ea.comb);
+            const cme = try check.download(gpu, ea.mtp_emb);
+            var one_a: [1]u32 = .{ta};
+            try ea.forward(one_a[0..1], 1, rows);
+            try ea.stream.synchronize();
+            const dx0 = try check.download(gpu, ea.x[0]);
+            const dx1 = try check.download(gpu, ea.x[1]);
+            const dbr = try check.download(gpu, ea.branch);
+            const dpo = try check.download(gpu, ea.post);
+            const dco = try check.download(gpu, ea.comb);
+            const dme = try check.download(gpu, ea.mtp_emb);
+            var one_b: [1]u32 = .{tb};
+            ea.dump_on = true;
+            try ea.forward(one_b[0..1], 1, rows + 1);
+            try ea.stream.synchronize();
+            ea.dump_on = false;
+            const eA2 = ea.dump_epoch;
+            try ctx1.makeCurrent();
+            try eb.resetState();
+            try eb.x[0].upload(0, cx0);
+            try eb.x[1].upload(0, cx1);
+            try eb.branch.upload(0, cbr);
+            try eb.post.upload(0, cpo);
+            try eb.comb.upload(0, cco);
+            try eb.mtp_emb.upload(0, cme);
+            eb.xi = ea.xi;
+            eb.fwd_count = 0;
+            try eb.forward(one_a[0..1], 1, rows);
+            try eb.stream.synchronize();
+            try eb.x[0].upload(0, dx0);
+            try eb.x[1].upload(0, dx1);
+            try eb.branch.upload(0, dbr);
+            try eb.post.upload(0, dpo);
+            try eb.comb.upload(0, dco);
+            try eb.mtp_emb.upload(0, dme);
+            eb.xi = ea.xi;
+            eb.dump_on = true;
+            try eb.forward(one_b[0..1], 1, rows + 1);
+            try eb.stream.synchronize();
+            eb.dump_on = false;
+            const eB2 = eb.dump_epoch;
+            _ = eA2;
+            // host compare: A row1 (epoch eB on engine B) vs B row0 (epoch eB2)
+            {
+                var cdir = std.Io.Dir.cwd();
+                const tags = [4][]const u8{ "na", "ba", "nf", "bf" };
+                const b1 = try a.alloc(u8, 2 * 4096 * 2);
+                defer a.free(b1);
+                const b2 = try a.alloc(u8, 4096 * 2);
+                defer a.free(b2);
+                var nA: [32]u8 = undefined;
+                var nB: [32]u8 = undefined;
+                var first = true;
+                for (0..nm + 1) |bi| {
+                    for (tags) |tg| {
+                        const fA = std.fmt.bufPrint(&nA, "pb{d}_{s}{d}.bin", .{ bi, tg, eB }) catch continue;
+                        const fB = std.fmt.bufPrint(&nB, "pb{d}_{s}{d}.bin", .{ bi, tg, eB2 }) catch continue;
+                        const hA = cdir.openFile(gpu.io, fA, .{}) catch continue;
+                        defer hA.close(gpu.io);
+                        const hB = cdir.openFile(gpu.io, fB, .{}) catch continue;
+                        defer hB.close(gpu.io);
+                        _ = hA.readPositional(gpu.io, &[1][]u8{b1[0..]}, 0) catch continue;
+                        _ = hB.readPositional(gpu.io, &[1][]u8{b2[0..]}, 0) catch continue;
+                        var nbad: usize = 0;
+                        var first_off: usize = 0;
+                        var off: usize = 0;
+                        while (off < 4096 * 2) : (off += 2) {
+                            const v1 = std.mem.readInt(u16, b1[4096 * 2 + off ..][0..2], .little);
+                            const v2 = std.mem.readInt(u16, b2[off..][0..2], .little);
+                            if (v1 != v2) {
+                                if (nbad == 0) first_off = off;
+                                nbad += 1;
+                            }
+                        }
+                        if (nbad > 0) {
+                            std.debug.print("  bisect blk {d} {s}: {d}/4096 differ, first at elem {d}\n", .{ bi, tg, nbad, first_off / 2 });
+                            if (first) {
+                                std.debug.print("  FIRST DIVERGENT BLOCK: {d} tag {s}\n", .{ bi, tg });
+                                first = false;
+                            }
+                        }
+                    }
+                }
+                if (first) std.debug.print("  bisect: row1 == row0 everywhere (all blocks bit-exact)\n", .{});
+            }
+            a.free(ax0);
+            a.free(ax1);
+            a.free(abr);
+            a.free(apo);
+            a.free(aco);
+            a.free(ame);
+            a.free(bx0);
+            a.free(bx1);
+            a.free(bbr);
+            a.free(bpo);
+            a.free(bco);
+            a.free(bme);
+            a.free(cx0);
+            a.free(cx1);
+            a.free(cbr);
+            a.free(cpo);
+            a.free(cco);
+            a.free(cme);
+            a.free(dx0);
+            a.free(dx1);
+            a.free(dbr);
+            a.free(dpo);
+            a.free(dco);
+            a.free(dme);
+        }
+
 
     }
     // WINDOW 2: same prompt+decode after resetState — serving replays this per request.
