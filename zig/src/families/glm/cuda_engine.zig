@@ -172,6 +172,14 @@ pub const Engine = struct {
     skip_mla: bool = false,
     cont: bool = false,
     stop_after_blocks: bool = false,
+    // the MTP draft head (the block trailing the backbone, when in range)
+    mtp_li: ?usize = null, // its index in w.layers
+    mtp_mi: usize = 0, // its MLA cache plane (local)
+    mtp_eh: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
+    mtp_x: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
+    mtp_out: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
+    mtp_pick: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
+    mtp_emb: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true }, // bf16 [1, D]: the last token's embedding
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, dir: []const u8, opts: Options) !*Engine {
         const e = try gpa.create(Engine);
@@ -321,6 +329,18 @@ pub const Engine = struct {
         e.moe_ye = try cuda.DeviceBuffer.alloc(d, e.rows_max * 8 * e.c.hidden * 2);
         e.moe_gu = try cuda.DeviceBuffer.alloc(d, 2 * e.c.moe_inter * 2);
         e.moe_act = try cuda.DeviceBuffer.alloc(d, e.c.moe_inter * 2);
+        if (e.w.layers.len > 0 and e.w.layers[e.w.layers.len - 1].hc_attn == null) {
+            // the MTP draft head trails the backbone: 1-row draft buffers + its own MLA plane
+            e.mtp_li = e.w.layers.len - 1;
+            for (e.w.layers[0 .. e.w.layers.len - 1]) |*L2| {
+                if (L2.attn == .mla) e.mtp_mi += 1;
+            }
+            e.mtp_eh = try cuda.DeviceBuffer.alloc(d, 2 * e.c.hidden * 2);
+            e.mtp_x = try cuda.DeviceBuffer.alloc(d, e.c.hidden * 2);
+            e.mtp_out = try cuda.DeviceBuffer.alloc(d, e.c.hidden * 2);
+            e.mtp_pick = try cuda.DeviceBuffer.alloc(d, 4);
+            e.mtp_emb = try cuda.DeviceBuffer.alloc(d, e.c.hidden * 2);
+        }
         {
             const cap = opts.context;
             const nm: usize = e.c.countKind(.mla);
@@ -818,6 +838,12 @@ pub const Engine = struct {
         }
     }
 
+    /// Serving split: the head's engine owns no embedding table, so THIS engine
+    /// (block 0's) tucks the window's last-token embedding into the handoff.
+    pub fn wantMtpEmb(e: *Engine) !void {
+        if (e.mtp_emb.len == 0) e.mtp_emb = try cuda.DeviceBuffer.alloc(e.d, e.c.hidden * 2);
+    }
+
     /// One window of `rows` tokens: ids -> picks (argmax) + logits on device.
     pub fn forward(e: *Engine, ids: []const u32, rows: usize, pos: usize) !void {
         e.fwd_count += 1;
@@ -828,12 +854,14 @@ pub const Engine = struct {
             try e.ids.upload(0, std.mem.sliceAsBytes(ids)[0 .. rows * 4]);
             for (0..4) |s_i| { if (e.f32_streams) try e.ops.embedF32(e.stream, e.ids.ptr, e.w.embed, e.x[e.xi].ptr + s_i * hidden * 4, rows, hidden, 4 * hidden) else try e.ops.embed(e.stream, e.ids.ptr, e.w.embed, e.x[e.xi].ptr + s_i * hidden * 2, rows, hidden, 4 * hidden); }
             e.xi = 0;
+            if (e.mtp_emb.len != 0)
+                try e.ops.embed(e.stream, e.ids.ptr + (rows - 1) * 4, e.w.embed, e.mtp_emb.ptr, 1, hidden, hidden);
         }
         var ki: usize = 0;
         var mi_mla: usize = 0;
         for (e.w.layers, e.w.blocks_lo..) |*L, bi| {
             e.cur_bi = @intCast(bi);
-            const hc_a = L.hc_attn orelse return error.UnexpectedMtp;
+            const hc_a = L.hc_attn orelse break; // the MTP block runs after the tail
             if ((e.fwd_count == 1 and !e.quiet) and bi == 4) {
                 try e.stream.synchronize();
                 try e.dumpBin("at4_xpre.bin", e.x[e.xi].ptr, rows * 4 * e.c.hidden * 4);
@@ -987,10 +1015,34 @@ pub const Engine = struct {
         }
         try e.g.mm(e.stream, e.normed.ptr, e.w.head, e.logits.ptr, e.rows_max, e.c.vocab, hidden, false);
         try e.ops.argmax(e.stream, e.logits.ptr, e.picks.ptr, rows, e.c.vocab);
+        if (e.mtp_li != null) try e.mtpDraft(rows, pos + rows - 1);
+    }
+
+    /// The MTP draft head over the window's LAST row: enorm(embed(next)) | hnorm(h),
+    /// eh_proj, a plain MLA + MoE block (own cache plane), shared_head norm, the
+    /// shared lm_head. Leaves the draft pick in mtp_pick.
+    fn mtpDraft(e: *Engine, rows: usize, pos: usize) !void {
+        const D = e.c.hidden;
+        const L = &e.w.layers[e.mtp_li.?];
+        try e.ops.rms(e.stream, e.mtp_emb.ptr, L.enorm, e.mtp_eh.ptr, 1, D, D, 2 * D, e.c.eps);
+        try e.ops.rms(e.stream, e.y.ptr + (rows - 1) * D * 2, L.hnorm, e.mtp_eh.ptr + D * 2, 1, D, D, 2 * D, e.c.eps);
+        try e.g.mm(e.stream, e.mtp_eh.ptr, L.eh_proj, e.mtp_x.ptr, 1, D, 2 * D, false);
+        try e.ops.rms(e.stream, e.mtp_x.ptr, L.in_norm, e.normed.ptr, 1, D, D, D, e.c.eps);
+        try e.mlaLayer(e.mtp_mi, &L.attn.mla, 1, pos); // -> e.branch
+        try e.ops.add(e.stream, e.mtp_x.ptr, e.branch.ptr, e.mtp_out.ptr, D);
+        try e.ops.rms(e.stream, e.mtp_out.ptr, L.post_norm, e.normed.ptr, 1, D, D, D, e.c.eps);
+        try e.moeBlock(&L.mlp.moe, 1); // -> e.branch
+        try e.ops.add(e.stream, e.mtp_out.ptr, e.branch.ptr, e.mtp_x.ptr, D);
+        try e.ops.rms(e.stream, e.mtp_x.ptr, L.shared_head_norm, e.normed.ptr, 1, D, D, D, e.c.eps);
+        try e.g.mm(e.stream, e.normed.ptr, e.w.head, e.logits.ptr, e.rows_max, e.c.vocab, D, false);
+        try e.ops.argmax(e.stream, e.logits.ptr, e.mtp_pick.ptr, 1, e.c.vocab);
     }
 
     pub fn deinit(e: *Engine) void {
         const gpa = e.gpa;
+        inline for (.{ "mtp_eh", "mtp_x", "mtp_out", "mtp_pick", "mtp_emb" }) |f| {
+            if (@field(e, f).len != 0) @field(e, f).free();
+        }
         inline for (.{ "ids", "branch", "normed", "part", "post", "comb", "y", "proj", "qkv", "fg", "bv", "kda_st0", "kda_st1", "kda_cs", "kda_cw", "kda_conv_p", "logits", "picks", "scratch" }) |f| {
             if (@field(e, f).len != 0) @field(e, f).free();
         }

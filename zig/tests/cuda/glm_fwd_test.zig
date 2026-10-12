@@ -310,6 +310,7 @@ fn runSplit(gpu: Gpu, dir: []const u8, split_at: usize, nm: usize) !void {
             } else |_| {}
         } else |_| {}
     }
+    try ea.wantMtpEmb();
     const sumsW = try a.alloc(f64, 46);
     @memset(sumsW, 0);
     ea.block_sums = sumsW;
@@ -324,10 +325,11 @@ fn runSplit(gpu: Gpu, dir: []const u8, split_at: usize, nm: usize) !void {
     ho.branch = try check.download(gpu, ea.branch);
     ho.post = try check.download(gpu, ea.post);
     ho.comb = try check.download(gpu, ea.comb);
+    const ho_me = try check.download(gpu, ea.mtp_emb);
     const xi_hand = ea.xi;
     var ctx1 = try cuda.Context.init(gpu.d, 1);
     defer ctx1.deinit();
-    var eb = try glm.engine.Engine.init(a, gpu.io, gpu.d, dir, .{ .blocks_lo = split_at, .blocks_hi = @max(nm, split_at + 1), .cont = true });
+    var eb = try glm.engine.Engine.init(a, gpu.io, gpu.d, dir, .{ .blocks_lo = split_at, .blocks_hi = @max(nm + 1, split_at + 1), .cont = true });
     defer eb.deinit();
     const sumsWb = try a.alloc(f64, 46);
     @memset(sumsWb, 0);
@@ -337,12 +339,14 @@ fn runSplit(gpu: Gpu, dir: []const u8, split_at: usize, nm: usize) !void {
     try eb.branch.upload(0, ho.branch);
     try eb.post.upload(0, ho.post);
     try eb.comb.upload(0, ho.comb);
+    try eb.mtp_emb.upload(0, ho_me);
     defer {
         a.free(ho.x0);
         a.free(ho.x1);
         a.free(ho.branch);
         a.free(ho.post);
         a.free(ho.comb);
+        a.free(ho_me);
     }
     eb.xi = xi_hand;
     eb.fwd_count = 0;
@@ -373,6 +377,7 @@ fn runSplit(gpu: Gpu, dir: []const u8, split_at: usize, nm: usize) !void {
     // handoff shuttles x/branch/post/comb under A's context, then B runs one row
     var pos: usize = rows;
     var toks: [24]u32 = @splat(0);
+    var drafts: [24]u32 = @splat(0);
     var ntok: usize = 0;
     var cur_tok: [1]u32 = .{0};
     toks[0] = pv[rows - 1];
@@ -387,11 +392,13 @@ fn runSplit(gpu: Gpu, dir: []const u8, split_at: usize, nm: usize) !void {
         ho.branch = try check.download(gpu, ea.branch);
         ho.post = try check.download(gpu, ea.post);
         ho.comb = try check.download(gpu, ea.comb);
+        const dme = try check.download(gpu, ea.mtp_emb);
         try eb.x[0].upload(0, ho.x0);
         try eb.x[1].upload(0, ho.x1);
         try eb.branch.upload(0, ho.branch);
         try eb.post.upload(0, ho.post);
         try eb.comb.upload(0, ho.comb);
+        try eb.mtp_emb.upload(0, dme);
         eb.xi = ea.xi;
         try ctx1.makeCurrent();
         try eb.forward(cur_tok[0..1], 1, pos);
@@ -400,11 +407,18 @@ fn runSplit(gpu: Gpu, dir: []const u8, split_at: usize, nm: usize) !void {
         defer a.free(pkd);
         const pvd = std.mem.bytesAsSlice(u32, @as([]align(1) u8, pkd));
         toks[ntok] = pvd[0];
+        if (eb.mtp_li != null and ntok < 15) {
+            const dp = try check.download(gpu, eb.mtp_pick);
+            defer a.free(dp);
+            const dpv = std.mem.bytesAsSlice(u32, @as([]align(1) u8, dp));
+            drafts[ntok - 1] = dpv[0];
+        }
         a.free(ho.x0);
         a.free(ho.x1);
         a.free(ho.branch);
         a.free(ho.post);
         a.free(ho.comb);
+        a.free(dme);
         pos += 1;
     }
     {
@@ -416,6 +430,24 @@ fn runSplit(gpu: Gpu, dir: []const u8, split_at: usize, nm: usize) !void {
             wd += printed.len;
         }
         std.debug.print("  split-decode[{d}]: {s}" ++ "\n", .{ ntok, outd[0..wd] });
+        if (eb.mtp_li != null) {
+            var hit: usize = 0;
+            var tot: usize = 0;
+            const dl = try a.alloc(u8, 400);
+            defer a.free(dl);
+            var wl: usize = 0;
+            // a draft made at step i predicts toks[i+2] (MTP ahead-of-one: it
+            // sees the token the main model just picked)
+            for (0..ntok - 1) |i| {
+                const pr = std.fmt.bufPrint(dl[wl..], "{d} ", .{drafts[i]}) catch unreachable;
+                wl += pr.len;
+                if (i + 2 < ntok) {
+                    tot += 1;
+                    if (drafts[i] == toks[i + 2]) hit += 1;
+                }
+            }
+            std.debug.print("  mtp drafts: {s} acceptance {d}/{d}\n", .{ dl[0..wl], hit, tot });
+        }
     }
     // WINDOW 2: same prompt+decode after resetState — serving replays this per request.
     // If picks diverge, some state survives the reset.
@@ -434,12 +466,14 @@ fn runSplit(gpu: Gpu, dir: []const u8, split_at: usize, nm: usize) !void {
         const hbr = try check.download(gpu, ea.branch);
         const hpo = try check.download(gpu, ea.post);
         const hco = try check.download(gpu, ea.comb);
+        const hme = try check.download(gpu, ea.mtp_emb);
         try ctx1.makeCurrent();
         try eb.x[0].upload(0, hx0);
         try eb.x[1].upload(0, hx1);
         try eb.branch.upload(0, hbr);
         try eb.post.upload(0, hpo);
         try eb.comb.upload(0, hco);
+        try eb.mtp_emb.upload(0, hme);
         eb.xi = ea.xi;
         eb.fwd_count = 0;
         try eb.forward(&ids, rows, 0);
@@ -531,18 +565,21 @@ fn runSplit(gpu: Gpu, dir: []const u8, split_at: usize, nm: usize) !void {
             const dbr = try check.download(gpu, ea.branch);
             const dpo = try check.download(gpu, ea.post);
             const dco = try check.download(gpu, ea.comb);
+            const dme2 = try check.download(gpu, ea.mtp_emb);
             try ctx1.makeCurrent();
             try eb.x[0].upload(0, dx0);
             try eb.x[1].upload(0, dx1);
             try eb.branch.upload(0, dbr);
             try eb.post.upload(0, dpo);
             try eb.comb.upload(0, dco);
+            try eb.mtp_emb.upload(0, dme2);
             eb.xi = ea.xi;
             a.free(dx0);
             a.free(dx1);
             a.free(dbr);
             a.free(dpo);
             a.free(dco);
+            a.free(dme2);
             try eb.forward(cur2[0..1], 1, pos2);
             try eb.stream.synchronize();
             const pkd2 = try check.download(gpu, eb.picks);
@@ -557,6 +594,7 @@ fn runSplit(gpu: Gpu, dir: []const u8, split_at: usize, nm: usize) !void {
         a.free(hbr);
         a.free(hpo);
         a.free(hco);
+        a.free(hme);
         a.free(snapA1);
         a.free(snapB1);
         a.free(sumsW);

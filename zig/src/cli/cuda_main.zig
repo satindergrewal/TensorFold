@@ -228,7 +228,11 @@ fn glmServe(gpa: std.mem.Allocator, init: std.process.Init, rest: []const [:0]co
     var ctx1 = try cuda.Context.init(&driver, 1);
     defer ctx1.deinit();
     try ctx1.makeCurrent();
-    var eng_b = try glm.engine.Engine.init(gpa, init.io, &driver, rest[0], .{ .context = context, .blocks_lo = 22, .blocks_hi = 45, .cont = true });
+    var eng_b = try glm.engine.Engine.init(gpa, init.io, &driver, rest[0], .{ .context = context, .blocks_lo = 22, .blocks_hi = 46, .cont = true });
+    // engine A's mtp_emb relay buffer must land on GPU 0: allocate under A's context
+    try ctx.makeCurrent();
+    try eng.wantMtpEmb();
+    try ctx1.makeCurrent();
     eng_b.quiet = true;
     defer eng_b.deinit();
     // the server listener (their listener.zig pattern, raw posix here)
@@ -344,11 +348,12 @@ fn serveSplit(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engin
     const lbr = eng.branch.len;
     const lpo = eng.post.len;
     const lco = eng.comb.len;
+    const lme = eng.mtp_emb.len;
     const o1 = lx0;
     const o2 = o1 + lx1;
     const o3 = o2 + lbr;
     const o4 = o3 + lpo;
-    const ot = o4 + lco;
+    const ot = o4 + lco + lme;
     try eng.forward(ids_buf[0..n_ids], n_ids, 0);
     try eng.stream.synchronize();
     const hb = try gpa.alloc(u8, 32 * 1024 * 1024);
@@ -357,7 +362,8 @@ fn serveSplit(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engin
     try eng.x[1].download(0, hb[o1..o2]);
     try eng.branch.download(0, hb[o2..o3]);
     try eng.post.download(0, hb[o3..o4]);
-    try eng.comb.download(0, hb[o4..ot]);
+    try eng.comb.download(0, hb[o4 .. o4 + lco]);
+    if (lme != 0) try eng.mtp_emb.download(0, hb[o4 + lco .. ot]);
     const xi_hand = eng.xi;
     try ctx1.makeCurrent();
     try eng_b.resetState();
@@ -365,16 +371,23 @@ fn serveSplit(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engin
     try eng_b.x[1].upload(0, hb[o1..o2]);
     try eng_b.branch.upload(0, hb[o2..o3]);
     try eng_b.post.upload(0, hb[o3..o4]);
-    try eng_b.comb.upload(0, hb[o4..ot]);
+    try eng_b.comb.upload(0, hb[o4 .. o4 + lco]);
+    if (lme != 0) try eng_b.mtp_emb.upload(0, hb[o4 + lco .. ot]);
     eng_b.xi = xi_hand;
     eng_b.fwd_count = 0;
     try eng_b.forward(ids_buf[0..n_ids], n_ids, 0);
     try eng_b.stream.synchronize();
     var pick: [128]u8 = undefined;
+    var draft_ids: [512]u32 = @splat(0); // draft[i] = MTP pick made at step i (predicts token i+1)
     const pv = std.mem.bytesAsSlice(u32, @as([]align(1) u8, &pick));
     try eng_b.picks.download(0, pick[0 .. 4 * n_ids]);
+    if (eng_b.mtp_li != null) {
+        try eng_b.mtp_pick.download(0, pick[8..12]);
+        draft_ids[0] = pv[2];
+    }
     var pos: usize = n_ids;
     var out_ids: [512]u32 = @splat(0);
+
     var n_out: usize = 0;
     out_ids[0] = pv[n_ids - 1];
     n_out = 1;
@@ -388,18 +401,24 @@ fn serveSplit(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engin
         try eng.x[1].download(0, hb[o1..o2]);
         try eng.branch.download(0, hb[o2..o3]);
         try eng.post.download(0, hb[o3..o4]);
-        try eng.comb.download(0, hb[o4..ot]);
+        try eng.comb.download(0, hb[o4 .. o4 + lco]);
+        if (lme != 0) try eng.mtp_emb.download(0, hb[o4 + lco .. ot]);
         const xi2 = eng.xi;
         try ctx1.makeCurrent();
         try eng_b.x[0].upload(0, hb[0..o1]);
         try eng_b.x[1].upload(0, hb[o1..o2]);
         try eng_b.branch.upload(0, hb[o2..o3]);
         try eng_b.post.upload(0, hb[o3..o4]);
-        try eng_b.comb.upload(0, hb[o4..ot]);
+        try eng_b.comb.upload(0, hb[o4 .. o4 + lco]);
+        if (lme != 0) try eng_b.mtp_emb.upload(0, hb[o4 + lco .. ot]);
         eng_b.xi = xi2;
         try eng_b.forward(one[0..1], 1, pos);
         try eng_b.stream.synchronize();
         try eng_b.picks.download(0, pick[0..8]);
+        if (eng_b.mtp_li != null and n_out < draft_ids.len) {
+            try eng_b.mtp_pick.download(0, pick[8..12]);
+            draft_ids[n_out - 1] = pv[2];
+        }
         out_ids[n_out] = pv[0];
         n_out += 1;
         pos += 1;
@@ -411,7 +430,12 @@ fn serveSplit(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engin
         const sep: []const u8 = if (ti > 0) "," else "";
         w += (std.fmt.bufPrint(jbuf[w..], "{s}{d}", .{ sep, t }) catch unreachable).len;
     }
-    w += (std.fmt.bufPrint(jbuf[w..], "],\"count\":{d}}}", .{ n_out }) catch unreachable).len;
+    w += (std.fmt.bufPrint(jbuf[w..], "],\"count\":{d},\"drafts\":[", .{ n_out }) catch unreachable).len;
+    for (draft_ids[0..n_out], 0..) |t, ti| {
+        const sep: []const u8 = if (ti > 0) "," else "";
+        w += (std.fmt.bufPrint(jbuf[w..], "{s}{d}", .{ sep, t }) catch unreachable).len;
+    }
+    w += (std.fmt.bufPrint(jbuf[w..], "]}}", .{}) catch unreachable).len;
     var hdr: [128]u8 = undefined;
     const h = try std.fmt.bufPrint(&hdr, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{w});
     _ = posix.system.write(fd, h.ptr, h.len);

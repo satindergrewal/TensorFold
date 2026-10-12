@@ -56,6 +56,7 @@ pub const Api = struct {
 pub const Library = struct {
     lib: std.DynLib,
     api: Api,
+    handle: Handle = null, // one cuBLASLt handle shared by every Linear (per-shape handles eat device pools)
 
     /// The CUDA 13 soname first, then the unversioned link name.
     pub fn open() Error!Library {
@@ -79,10 +80,17 @@ pub const Library = struct {
                 return error.MissingSymbol;
             };
         }
-        return .{ .lib = lib, .api = api };
+        var self = Library{ .lib = lib, .api = api };
+        const st = api.cublasLtCreate(&self.handle);
+        if (st != 0) {
+            lib.close();
+            return error.CublasFailed;
+        }
+        return self;
     }
 
     pub fn close(self: *Library) void {
+        if (self.handle != null) _ = self.api.cublasLtDestroy(self.handle);
         self.lib.close();
     }
 
@@ -110,8 +118,7 @@ pub const Linear = struct {
     pub fn init(lt: *const Library, m: u64, n: u64, k: u64, out: DataType, workspace_limit: usize) Error!Linear {
         var self: Linear = undefined;
         self.lt = lt;
-        try lt.check(lt.api.cublasLtCreate(&self.handle), "cublasLtCreate");
-        errdefer _ = lt.api.cublasLtDestroy(self.handle);
+        self.handle = lt.handle;
         try lt.check(lt.api.cublasLtMatmulDescCreate(&self.desc, compute_32f, .f32), "cublasLtMatmulDescCreate");
         errdefer _ = lt.api.cublasLtMatmulDescDestroy(self.desc);
         const ta: c_int = @backingInt(Op.t);
@@ -143,8 +150,7 @@ pub const Linear = struct {
     pub fn initStrided(lt: *const Library, m: u64, n: u64, k: u64, out: DataType, workspace_limit: usize, xld: u64, wld: u64, dld: u64) Error!Linear {
         var self: Linear = undefined;
         self.lt = lt;
-        try lt.check(lt.api.cublasLtCreate(&self.handle), "cublasLtCreate");
-        errdefer _ = lt.api.cublasLtDestroy(self.handle);
+        self.handle = lt.handle;
         try lt.check(lt.api.cublasLtMatmulDescCreate(&self.desc, compute_32f, .f32), "cublasLtMatmulDescCreate");
         errdefer _ = lt.api.cublasLtMatmulDescDestroy(self.desc);
         const ta: c_int = @backingInt(Op.t);
@@ -176,8 +182,7 @@ pub const Linear = struct {
     pub fn initNT(lt: *const Library, m: u64, n: u64, k: u64, out: DataType, workspace_limit: usize, xld: u64, wld: u64, dld: u64) Error!Linear {
         var self: Linear = undefined;
         self.lt = lt;
-        try lt.check(lt.api.cublasLtCreate(&self.handle), "cublasLtCreate");
-        errdefer _ = lt.api.cublasLtDestroy(self.handle);
+        self.handle = lt.handle;
         try lt.check(lt.api.cublasLtMatmulDescCreate(&self.desc, compute_32f, .f32), "cublasLtMatmulDescCreate");
         errdefer _ = lt.api.cublasLtMatmulDescDestroy(self.desc);
         const ta: c_int = 0;
@@ -210,7 +215,6 @@ pub const Linear = struct {
         _ = api.cublasLtMatrixLayoutDestroy(self.b);
         _ = api.cublasLtMatrixLayoutDestroy(self.a);
         _ = api.cublasLtMatmulDescDestroy(self.desc);
-        _ = api.cublasLtDestroy(self.handle);
         self.* = undefined;
     }
 
