@@ -556,7 +556,7 @@ pub const Engine = struct {
                 dir5.writeFile(e.io, .{ .sub_path = f5, .data = nb }) catch {};
             }
             {
-                const np = rows * 12288 * 2;
+                const np = rows * @as(usize, e.c.kdaProj()) * 2;
                 if (e.proj.len >= np) {
                     const pb = try e.gpa.alloc(u8, np);
                     defer e.gpa.free(pb);
@@ -575,7 +575,28 @@ pub const Engine = struct {
                 var dir2 = std.Io.Dir.cwd();
                 dir2.writeFile(e.io, .{ .sub_path = f4, .data = cb }) catch {};
             }
-            const nq = rows * 3 * 12288 * 2;
+            // one-shot repro: the SAME three mmStrided proj calls into scratch
+            {
+                const Wq2 = e.c.kdaWidth();
+                const ps2 = e.c.kdaProj();
+                const xst2 = e.c.hidden * 2;
+                const wst2 = e.c.hidden * 2;
+                const ost2 = ps2 * 2;
+                try e.g.mmStrided(e.stream, e.normed.ptr, xst2, w.q, wst2, e.scratch.ptr, ost2, rows, Wq2, e.c.hidden);
+                try e.g.mmStrided(e.stream, e.normed.ptr, xst2, w.k, wst2, e.scratch.ptr + Wq2 * 2, ost2, rows, Wq2, e.c.hidden);
+                try e.g.mmStrided(e.stream, e.normed.ptr, xst2, w.v, wst2, e.scratch.ptr + 2 * Wq2 * 2, ost2, rows, Wq2, e.c.hidden);
+                try e.stream.synchronize();
+                const ns = rows * @as(usize, ps2) * 2;
+                const sb = try e.gpa.alloc(u8, ns);
+                defer e.gpa.free(sb);
+                try e.scratch.download(0, sb);
+                var nm8: [32]u8 = undefined;
+                e.dump_serial += 1;
+                const f8 = std.fmt.bufPrint(&nm8, "krep{s}S{d}.bin", .{ @as([]const u8, if (e.cont) "b" else "a"), e.dump_serial }) catch unreachable;
+                var dir8 = std.Io.Dir.cwd();
+                dir8.writeFile(e.io, .{ .sub_path = f8, .data = sb }) catch {};
+            }
+            const nq = rows * 3 * @as(usize, e.c.kdaWidth()) * 2;
             if (e.qkv.len >= nq) {
                 const qb = try e.gpa.alloc(u8, nq);
                 defer e.gpa.free(qb);
