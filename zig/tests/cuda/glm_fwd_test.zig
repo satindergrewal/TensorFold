@@ -617,9 +617,11 @@ fn runSplit(gpu: Gpu, dir: []const u8, split_at: usize, nm: usize) !void {
             const ame = try check.download(gpu, ea.mtp_emb);
             var two: [2]u32 = .{ ta, tb };
             ea.dump_on = true;
+            const ser_before_A = ea.dump_serial;
             try ea.forward(two[0..2], 2, rows);
             try ea.stream.synchronize();
             ea.dump_on = false;
+            std.debug.print("  SERIAL laneA: {d}..{d}\n", .{ ser_before_A + 1, ea.dump_serial });
             const bx0 = try check.download(gpu, ea.x[0]);
             const bx1 = try check.download(gpu, ea.x[1]);
             const bbr = try check.download(gpu, ea.branch);
@@ -663,9 +665,11 @@ fn runSplit(gpu: Gpu, dir: []const u8, split_at: usize, nm: usize) !void {
             const dme = try check.download(gpu, ea.mtp_emb);
             var one_b: [1]u32 = .{tb};
             ea.dump_on = true;
+            const ser_before_B = ea.dump_serial;
             try ea.forward(one_b[0..1], 1, rows + 1);
             try ea.stream.synchronize();
             ea.dump_on = false;
+            std.debug.print("  SERIAL laneB: {d}..{d}\n", .{ ser_before_B + 1, ea.dump_serial });
             const eA2 = ea.dump_epoch;
             try ctx1.makeCurrent();
             try eb.resetState();

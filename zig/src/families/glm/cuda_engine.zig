@@ -111,6 +111,7 @@ pub const Engine = struct {
     quiet: bool = false, // serving: no probe dumps or debug prints
     dump_on: bool = false, // test: dump this window's probes regardless of fwd_count
     hc_calls: usize = 0, // probe: counts hcGates calls within a forward
+    dump_serial: usize = 0, // probe: monotonic per-write serial; filenames carry it (no pairing ambiguity)
     f32_streams: bool = true, // set by the test: stream means at their L-points
     d: *const cuda.Driver,
     stream: cuda.Stream,
@@ -496,7 +497,8 @@ pub const Engine = struct {
             defer e.gpa.free(xb);
             try e.x[e.xi].download(0, xb);
             var nm7: [32]u8 = undefined;
-            const f7 = std.fmt.bufPrint(&nm7, "kxo{d}.bin", .{e.dump_epoch}) catch unreachable;
+            e.dump_serial += 1;
+            const f7 = std.fmt.bufPrint(&nm7, "kxoS{s}S{d}.bin", .{ @as([]const u8, if (e.cont) "b" else "a"), e.dump_serial }) catch unreachable;
             var dir7 = std.Io.Dir.cwd();
             dir7.writeFile(e.io, .{ .sub_path = f7, .data = xb }) catch {};
         }
@@ -538,7 +540,8 @@ pub const Engine = struct {
                     defer e.gpa.free(pb2);
                     try e.part.download(0, pb2);
                     var nm6: [32]u8 = undefined;
-                    const f6 = std.fmt.bufPrint(&nm6, "kpart{d}.bin", .{e.dump_epoch}) catch unreachable;
+                    e.dump_serial += 1;
+                    const f6 = std.fmt.bufPrint(&nm6, "kpartS{s}S{d}.bin", .{ @as([]const u8, if (e.cont) "b" else "a"), e.dump_serial }) catch unreachable;
                     var dir6 = std.Io.Dir.cwd();
                     dir6.writeFile(e.io, .{ .sub_path = f6, .data = pb2 }) catch {};
                 }
@@ -547,7 +550,8 @@ pub const Engine = struct {
                 defer e.gpa.free(nb);
                 try e.normed.download(0, nb);
                 var nm5: [32]u8 = undefined;
-                const f5 = std.fmt.bufPrint(&nm5, "kna{d}.bin", .{e.dump_epoch}) catch unreachable;
+                e.dump_serial += 1;
+                const f5 = std.fmt.bufPrint(&nm5, "knaS{s}S{d}.bin", .{ @as([]const u8, if (e.cont) "b" else "a"), e.dump_serial }) catch unreachable;
                 var dir5 = std.Io.Dir.cwd();
                 dir5.writeFile(e.io, .{ .sub_path = f5, .data = nb }) catch {};
             }
@@ -558,7 +562,7 @@ pub const Engine = struct {
                     defer e.gpa.free(pb);
                     try e.proj.download(0, pb);
                     var nm3: [32]u8 = undefined;
-                    const f3 = std.fmt.bufPrint(&nm3, "kproj{d}.bin", .{e.dump_epoch}) catch unreachable;
+                    const f3 = std.fmt.bufPrint(&nm3, "kproj{s}S{d}.bin", .{ @as([]const u8, if (e.cont) "b" else "a"), e.dump_serial + 1 }) catch unreachable;
                     var dir = std.Io.Dir.cwd();
                     dir.writeFile(e.io, .{ .sub_path = f3, .data = pb }) catch {};
                 }
@@ -567,7 +571,7 @@ pub const Engine = struct {
                 defer e.gpa.free(cb);
                 try (cuda.DeviceBuffer{ .d = e.d, .ptr = e.kda_cs.ptr, .len = nc, .borrowed = true }).download(0, cb);
                 var nm4: [32]u8 = undefined;
-                const f4 = std.fmt.bufPrint(&nm4, "kcs{d}.bin", .{e.dump_epoch}) catch unreachable;
+                const f4 = std.fmt.bufPrint(&nm4, "kcs{s}S{d}.bin", .{ @as([]const u8, if (e.cont) "b" else "a"), e.dump_serial + 2 }) catch unreachable;
                 var dir2 = std.Io.Dir.cwd();
                 dir2.writeFile(e.io, .{ .sub_path = f4, .data = cb }) catch {};
             }
@@ -577,7 +581,7 @@ pub const Engine = struct {
                 defer e.gpa.free(qb);
                 try e.qkv.download(0, qb);
                 var nm1: [32]u8 = undefined;
-                const f1 = std.fmt.bufPrint(&nm1, "kqkv{d}.bin", .{e.dump_epoch}) catch unreachable;
+                const f1 = std.fmt.bufPrint(&nm1, "kqkv{s}S{d}.bin", .{ @as([]const u8, if (e.cont) "b" else "a"), e.dump_serial + 3 }) catch unreachable;
                 var dir = std.Io.Dir.cwd();
                 dir.writeFile(e.io, .{ .sub_path = f1, .data = qb }) catch {};
             }
@@ -763,7 +767,7 @@ pub const Engine = struct {
             defer e.gpa.free(yb);
             try e.y.download(0, yb);
             var nm2: [32]u8 = undefined;
-            const f2 = std.fmt.bufPrint(&nm2, "ky{d}.bin", .{e.dump_epoch}) catch unreachable;
+            const f2 = std.fmt.bufPrint(&nm2, "ky{s}S{d}.bin", .{ @as([]const u8, if (e.cont) "b" else "a"), e.dump_serial + 4 }) catch unreachable;
             var dir = std.Io.Dir.cwd();
             dir.writeFile(e.io, .{ .sub_path = f2, .data = yb }) catch {};
         }
@@ -967,7 +971,8 @@ pub const Engine = struct {
                 defer e.gpa.free(hb2);
                 try e.x[0].download(0, hb2);
                 var fn2: [32]u8 = undefined;
-                const fname = std.fmt.bufPrint(&fn2, "xemb{d}.bin", .{e.dump_epoch}) catch unreachable;
+                e.dump_serial += 1;
+                const fname = std.fmt.bufPrint(&fn2, "xembS{s}S{d}.bin", .{ @as([]const u8, if (e.cont) "b" else "a"), e.dump_serial }) catch unreachable;
                 var dir = std.Io.Dir.cwd();
                 dir.writeFile(e.io, .{ .sub_path = fname, .data = hb2 }) catch {};
             }
