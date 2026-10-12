@@ -100,7 +100,8 @@ pub const Engine = struct {
     block_sums: ?[]f64 = null, // set by the test: per-block x-stream fingerprints
     cur_bi: usize = 0,
     attn_sums: ?[]f64 = null,
-    fwd_count: usize = 0, // set by the test: stream means at their L-points
+    fwd_count: usize = 0,
+    f32_streams: bool = true, // set by the test: stream means at their L-points
     d: *const cuda.Driver,
     stream: cuda.Stream,
     c: Config,
@@ -437,38 +438,33 @@ pub const Engine = struct {
         return c;
     }
 
-    fn boundary(e: *Engine, rows: usize, h: ?weights.Hc, norm_w: u64, pending: bool) !void {
-        const hidden = e.c.hidden;
+    fn hcGates(e: *Engine, rows: usize, hc_w: weights.Hc, norm_w: u64) !void {
         const x_old = e.x[e.xi].ptr;
         const x_new = e.x[1 - e.xi].ptr;
-        if (h == null) {
-            // the final boundary: the expand alone, the streams become the
-            // mean's source
-            try e.hck.expandMixF32(e.stream, x_old, e.branch.ptr, e.post.ptr, e.comb.ptr, e.fn_zero.ptr, x_new, e.part.ptr, rows, true);
-            e.xi = 1 - e.xi;
-            return;
+        const layer_h = hc_w;
+        // glue's hc_pre: this boundary's gates + normed from the x entering it;
+        // the mixer's branch folds LATER, in hcFold, with THESE gates
+        if (e.f32_streams) {
+            try e.hck.expandMixF32(e.stream, x_old, e.branch.ptr, e.post.ptr, e.comb.ptr, layer_h.fnp, x_new, e.part.ptr, rows, false);
+            try e.hck.splitF32(e.stream, x_old, e.part.ptr, layer_h.scale, layer_h.base, norm_w, e.eps_buf.ptr, e.normed.ptr, e.post.ptr, e.comb.ptr, rows);
+        } else {
+            try e.hck.expandMix(e.stream, x_old, e.branch.ptr, e.post.ptr, e.comb.ptr, layer_h.fnp, x_new, e.part.ptr, rows, false);
+            try e.hck.split(e.stream, x_old, e.part.ptr, layer_h.scale, layer_h.base, norm_w, e.eps_buf.ptr, e.normed.ptr, e.post.ptr, e.comb.ptr, rows);
         }
-        const layer_h = h.?;
-        _ = hidden;
-        // glue's order: the partials and post/comb of THIS boundary (from the x
-        // entering it, with this boundary's fn) come first; the fold then mixes
-        // the branch with those fresh gates. The old order folded with the
-        // previous boundary's post/comb - one boundary stale.
-        try e.hck.expandMixF32(e.stream, x_old, e.branch.ptr, e.post.ptr, e.comb.ptr, layer_h.fnp, x_new, e.part.ptr, rows, false);
-        try e.hck.splitF32(e.stream, x_old, e.part.ptr, layer_h.scale, layer_h.base, norm_w, e.eps_buf.ptr, e.normed.ptr, e.post.ptr, e.comb.ptr, rows);
-        if (pending) {
-            if (rows == 4 and e.cur_bi == 4) {
-                try e.stream.synchronize();
-                try e.dumpBin("tl4_postpre.bin", e.post.ptr, 16 * 4);
-                try e.dumpBin("tl4_branch.bin", e.branch.ptr, rows * e.c.hidden * 2);
-            }
-            try e.hck.expandMixF32(e.stream, x_old, e.branch.ptr, e.post.ptr, e.comb.ptr, layer_h.fnp, x_new, e.part.ptr, rows, true);
-            if (rows == 4 and e.cur_bi == 4) {
-                try e.stream.synchronize();
-                try e.dumpBin("tl4_postpost.bin", e.post.ptr, 16 * 4);
-            }
-            e.xi = 1 - e.xi;
+    }
+
+    /// glue's hc_post: fold the mixer's branch with the gates the last hcGates
+    /// computed (each branch folds with its OWN boundary's gates, right after
+    /// its mixer - not one boundary later).
+    fn hcFold(e: *Engine, fn_packed: u64, rows: usize) !void {
+        const x_old = e.x[e.xi].ptr;
+        const x_new = e.x[1 - e.xi].ptr;
+        if (e.f32_streams) {
+            try e.hck.expandMixF32(e.stream, x_old, e.branch.ptr, e.post.ptr, e.comb.ptr, fn_packed, x_new, e.part.ptr, rows, true);
+        } else {
+            try e.hck.expandMix(e.stream, x_old, e.branch.ptr, e.post.ptr, e.comb.ptr, fn_packed, x_new, e.part.ptr, rows, true);
         }
+        e.xi = 1 - e.xi;
     }
 
     /// KDA attention block `li` (its dense kind index) on normed -> branch.
@@ -791,11 +787,12 @@ pub const Engine = struct {
     /// One window of `rows` tokens: ids -> picks (argmax) + logits on device.
     pub fn forward(e: *Engine, ids: []const u32, rows: usize) !void {
         e.fwd_count += 1;
+        if (std.c.getenv("TF_STREAMS_F16") != null) e.f32_streams = false;
         const hidden = e.c.hidden;
         if (!e.cont) {
             // embed into the four streams
             try e.ids.upload(0, std.mem.sliceAsBytes(ids)[0 .. rows * 4]);
-            for (0..4) |s_i| try e.ops.embedF32(e.stream, e.ids.ptr, e.w.embed, e.x[e.xi].ptr + s_i * hidden * 4, rows, hidden);
+            for (0..4) |s_i| { if (e.f32_streams) try e.ops.embedF32(e.stream, e.ids.ptr, e.w.embed, e.x[e.xi].ptr + s_i * hidden * 4, rows, hidden) else try e.ops.embed(e.stream, e.ids.ptr, e.w.embed, e.x[e.xi].ptr + s_i * hidden * 2, rows, hidden); }
             e.xi = 0;
         }
         var ki: usize = 0;
@@ -810,7 +807,7 @@ pub const Engine = struct {
                 try e.dumpBin("at4_branch.bin", e.branch.ptr, rows * e.c.hidden * 2);
                 try e.dumpBin("at4_afn.bin", hc_a.fnp, 24 * 4 * e.c.hidden * 2);
             }
-            try e.boundary(rows, hc_a, L.in_norm, ki > 0 or e.w.blocks_lo > 0);
+            try e.hcGates(rows, hc_a, L.in_norm);
             if (e.fwd_count == 1 and bi == 4) {
                 try e.stream.synchronize();
                 try e.dumpBin("at4_post.bin", e.post.ptr, 16 * 4);
@@ -827,11 +824,20 @@ pub const Engine = struct {
                 defer e.gpa.free(xb);
                 try e.x[e.xi].download(0, xb);
                 var acc: f64 = 0;
-                const fv = std.mem.bytesAsSlice(f32, @as([]align(1) u8, xb));
-                for (0..hd) |d| {
-                    var m: f64 = 0;
-                    for (0..4) |st| m += fv[st * hd + d];
-                    acc += m / 4.0;
+                if (e.f32_streams) {
+                    const fv = std.mem.bytesAsSlice(f32, @as([]align(1) u8, xb));
+                    for (0..hd) |d| {
+                        var m: f64 = 0;
+                        for (0..4) |st| m += fv[st * hd + d];
+                        acc += m / 4.0;
+                    }
+                } else {
+                    const hv = std.mem.bytesAsSlice(u16, @as([]align(1) u8, xb));
+                    for (0..hd) |d| {
+                        var m: f64 = 0;
+                        for (0..4) |st| m += @as(f32, @bitCast(@as(u32, hv[st * hd + d]) << 16));
+                        acc += m / 4.0;
+                    }
                 }
                 asums[bi - 1] = acc;
                 }
@@ -870,7 +876,8 @@ pub const Engine = struct {
                 try e.dumpBin("hc_fbase.bin", (L.hc_ffn orelse unreachable).base, 24 * 4);
                 try e.dumpBin("hc_fscale.bin", (L.hc_ffn orelse unreachable).scale, 3 * 4);
             }
-            try e.boundary(rows, L.hc_ffn, L.post_norm, true);
+            try e.hcFold(hc_a.fnp, rows);
+            try e.hcGates(rows, L.hc_ffn orelse return error.UnexpectedMtp, L.post_norm);
             if (e.fwd_count == 1 and bi <= 45) try e.dumpPb(bi, "nf", e.normed.ptr, rows);
             if (e.fwd_count == 1 and bi <= 45) {
                 var n3: [24]u8 = undefined;
@@ -886,6 +893,7 @@ pub const Engine = struct {
                 .dense => |*w| try e.denseMlp(w, rows),
                 .moe => |*w| try e.moeBlock(w, rows),
             }
+            try e.hcFold((L.hc_ffn orelse return error.UnexpectedMtp).fnp, rows);
             if (e.fwd_count == 1 and bi <= 45) try e.dumpPb(bi, "bf", e.branch.ptr, rows);
             if (e.block_sums) |sums| {
                 // their tap metric: row 0's mean of the 4 streams, summed over D
@@ -895,11 +903,20 @@ pub const Engine = struct {
                 e.stream.synchronize() catch {};
                 e.x[e.xi].download(0, b) catch {};
                 var acc: f64 = 0;
-                const fv = std.mem.bytesAsSlice(f32, @as([]align(1) u8, b));
-                for (0..hd) |d| {
-                    var m: f64 = 0;
-                    for (0..4) |st| m += fv[st * hd + d];
-                    acc += m / 4.0;
+                if (e.f32_streams) {
+                    const fv = std.mem.bytesAsSlice(f32, @as([]align(1) u8, b));
+                    for (0..hd) |d| {
+                        var m: f64 = 0;
+                        for (0..4) |st| m += fv[st * hd + d];
+                        acc += m / 4.0;
+                    }
+                } else {
+                    const hv = std.mem.bytesAsSlice(u16, @as([]align(1) u8, b));
+                    for (0..hd) |d| {
+                        var m: f64 = 0;
+                        for (0..4) |st| m += @as(f32, @bitCast(@as(u32, hv[st * hd + d]) << 16));
+                        acc += m / 4.0;
+                    }
                 }
                 sums[bi] = acc;
                 if (bi == 0) {
@@ -926,8 +943,8 @@ pub const Engine = struct {
         }
         if (e.stop_after_blocks) return; // the handoff: x, branch, post, comb in place
         // the final boundary folds the last branch, then the tail
-        try e.boundary(rows, null, 0, true);
-        try e.ops.streamMeanF32(e.stream, e.x[e.xi].ptr, e.y.ptr, rows, hidden);
+        try e.hcFold(e.fn_zero.ptr, rows);
+        if (e.f32_streams) try e.ops.streamMeanF32(e.stream, e.x[e.xi].ptr, e.y.ptr, rows, hidden) else try e.ops.streamMean(e.stream, e.x[e.xi].ptr, e.y.ptr, rows, hidden);
         try e.ops.rms(e.stream, e.y.ptr, e.w.final_norm, e.normed.ptr, rows, hidden, hidden, hidden, e.c.eps);
         if (rows == 4) {
             try e.stream.synchronize();
