@@ -11,6 +11,7 @@ const Gpu = check.Gpu;
 pub fn run(gpu: Gpu, dir: []const u8, rest: []const [:0]const u8) !void {
     const nm: usize = if (rest.len > 1) std.fmt.parseInt(usize, rest[1], 10) catch 3 else 3;
     const split = rest.len > 2 and std.mem.eql(u8, rest[2], "split");
+    const wantF16 = (rest.len > 2 and std.mem.eql(u8, rest[2], "f16")) or (rest.len > 3 and std.mem.eql(u8, rest[3], "f16"));
     if (split) return runSplit(gpu, dir, nm / 2, nm);
     const skip_mla = rest.len > 2 and std.mem.eql(u8, rest[2], "skip-mla");
     const a = gpu.gpa;
@@ -26,6 +27,7 @@ pub fn run(gpu: Gpu, dir: []const u8, rest: []const [:0]const u8) !void {
     defer a.free(asumsv);
     @memset(asumsv, 0);
     e.attn_sums = asumsv;
+    if (wantF16) e.f32_streams = false;
     if (rest.len > 2 and std.mem.eql(u8, rest[2], "oneshot")) {
         // one 16-row window, full picks: the token-1 parity probe
         var ids16: [16]u32 = .{ 785, 6722, 315, 9621, 374, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };

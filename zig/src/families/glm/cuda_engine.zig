@@ -787,7 +787,7 @@ pub const Engine = struct {
     /// One window of `rows` tokens: ids -> picks (argmax) + logits on device.
     pub fn forward(e: *Engine, ids: []const u32, rows: usize) !void {
         e.fwd_count += 1;
-        if (std.c.getenv("TF_STREAMS_F16") != null) e.f32_streams = false;
+        
         const hidden = e.c.hidden;
         if (!e.cont) {
             // embed into the four streams
