@@ -595,6 +595,45 @@ pub const Engine = struct {
                 const f8 = std.fmt.bufPrint(&nm8, "krep{s}S{d}.bin", .{ @as([]const u8, if (e.cont) "b" else "a"), e.dump_serial }) catch unreachable;
                 var dir8 = std.Io.Dir.cwd();
                 dir8.writeFile(e.io, .{ .sub_path = f8, .data = sb }) catch {};
+                // POISON TEST: overwrite normed row 1, re-run, compare row 0 stability
+                {
+                    const rb2 = e.c.hidden * 2; // one row, bytes
+                    const save = try e.gpa.alloc(u8, rb2);
+                    defer e.gpa.free(save);
+                    try e.stream.synchronize();
+                    try e.normed.download(rb2, save);
+                    const poison = try e.gpa.alloc(u8, rb2);
+                    defer e.gpa.free(poison);
+                    @memset(poison, 0x49);
+                    try e.normed.upload(rb2, poison);
+                    try e.g.mmStrided(e.stream, e.normed.ptr, xst2, w.q, wst2, e.scratch.ptr, ost2, rows, Wq2, e.c.hidden);
+                    try e.g.mmStrided(e.stream, e.normed.ptr, xst2, w.k, wst2, e.scratch.ptr + Wq2 * 2, ost2, rows, Wq2, e.c.hidden);
+                    try e.g.mmStrided(e.stream, e.normed.ptr, xst2, w.v, wst2, e.scratch.ptr + 2 * Wq2 * 2, ost2, rows, Wq2, e.c.hidden);
+                    try e.stream.synchronize();
+                    const sb2 = try e.gpa.alloc(u8, ns);
+                    defer e.gpa.free(sb2);
+                    try e.scratch.download(0, sb2);
+                    var changed: usize = 0;
+                    const half = @min(sb.len, sb2.len) / 2;
+                    var q: usize = 0;
+                    while (q * 2 < half * 2) : (q += 1) {
+                        const v1 = std.mem.readInt(u16, sb[q * 2 ..][0..2], .little);
+                        const v2 = std.mem.readInt(u16, sb2[q * 2 ..][0..2], .little);
+                        if (v1 != v2) changed += 1;
+                    }
+                    var tot: usize = 0;
+                    const r0 = @min(ns / 2, @as(usize, e.c.kdaProj()) * 2); // row 0 span in bytes
+                    q = 0;
+                    var ch0: usize = 0;
+                    while (q * 2 + 2 <= r0) : (q += 1) {
+                        const v1 = std.mem.readInt(u16, sb[q * 2 ..][0..2], .little);
+                        const v2 = std.mem.readInt(u16, sb2[q * 2 ..][0..2], .little);
+                        if (v1 != v2) ch0 += 1;
+                        tot += 1;
+                    }
+                    std.debug.print("  POISON rows={d}: whole {d}/{d} changed, ROW0 {d}/{d} changed\n", .{ rows, changed, half, ch0, tot });
+                    try e.normed.upload(rb2, save); // restore
+                }
             }
             const nq = rows * 3 * @as(usize, e.c.kdaWidth()) * 2;
             if (e.qkv.len >= nq) {
