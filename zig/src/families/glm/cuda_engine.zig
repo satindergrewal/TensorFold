@@ -957,8 +957,9 @@ pub const Engine = struct {
             }
         }
         if (e.stop_after_blocks) return; // the handoff: x, branch, post, comb in place
-        // the final boundary folds the last branch, then the tail
-        try e.hcFold(e.fn_zero.ptr, rows);
+        // glue's tail: every branch already folded at its own boundary; the
+        // mean reads the streams directly (the old extra fn_zero fold re-folded
+        // the stale last branch - corruption at every window end)
         if (e.f32_streams) try e.ops.streamMeanF32(e.stream, e.x[e.xi].ptr, e.y.ptr, rows, hidden) else try e.ops.streamMean(e.stream, e.x[e.xi].ptr, e.y.ptr, rows, hidden);
         try e.ops.rms(e.stream, e.y.ptr, e.w.final_norm, e.normed.ptr, rows, hidden, hidden, hidden, e.c.eps);
         if (rows == 4) {
