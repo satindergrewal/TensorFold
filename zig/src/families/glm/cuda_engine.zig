@@ -791,6 +791,23 @@ pub const Engine = struct {
         }
         // o_proj -> branch
         try e.g.mm(e.stream, e.y.ptr, w.o, e.branch.ptr, rows, c.hidden, Wq, false);
+        if (e.dump_on and li == 0) {
+            try e.stream.synchronize();
+            const ep = @as([]const u8, if (e.cont) "b" else "a");
+            const W3 = @as(usize, c.kdaWidth());
+            inline for (.{ "kqkvT", "kfgT", "kbvT", "kyT", "kprojT", "kcsT" }, .{ 3 * W3, 2 * W3, c.kda_heads, W3, @as(usize, c.kdaProj()), 3 * W3 }) |tag, wid| {
+                const n = rows * wid * 2;
+                const buf = try e.gpa.alloc(u8, n);
+                defer e.gpa.free(buf);
+                const src = if (comptime std.mem.eql(u8, tag, "kqkvT")) e.qkv.ptr else if (comptime std.mem.eql(u8, tag, "kfgT")) e.fg.ptr else if (comptime std.mem.eql(u8, tag, "kbvT")) e.bv.ptr else if (comptime std.mem.eql(u8, tag, "kprojT")) e.proj.ptr else if (comptime std.mem.eql(u8, tag, "kcsT")) (e.kda_cs.ptr + li * 3 * W3 * 2) else e.y.ptr;
+                try (cuda.DeviceBuffer{ .d = e.d, .ptr = src, .len = n, .borrowed = true }).download(0, buf);
+                var nm: [40]u8 = undefined;
+                e.dump_serial += 1;
+                const fname = std.fmt.bufPrint(&nm, "{s}{s}S{d}.bin", .{ tag, ep, e.dump_serial }) catch unreachable;
+                var dir = std.Io.Dir.cwd();
+                dir.writeFile(e.io, .{ .sub_path = fname, .data = buf }) catch {};
+            }
+        }
         if (li <= 4 and (e.fwd_count == 1 and !e.quiet)) {
             try e.stream.synchronize();
             std.debug.print("  ptrs st_in {x} st_out {x} st0 {x} st1 {x} sb {d}\n", .{ st_in, st_out, e.kda_st0.ptr, e.kda_st1.ptr, st_bytes });
