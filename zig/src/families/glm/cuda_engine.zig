@@ -516,6 +516,19 @@ pub const Engine = struct {
 
     /// KDA attention block `li` (its dense kind index) on normed -> branch.
     fn kdaLayer(e: *Engine, li: usize, w: *const weights.Kda, rows: usize) !void {
+        if (e.dump_on and li == 0) {
+            try e.stream.synchronize();
+            const nq = rows * 3 * 12288 * 2;
+            if (e.qkv.len >= nq) {
+                const qb = try e.gpa.alloc(u8, nq);
+                defer e.gpa.free(qb);
+                try e.qkv.download(0, qb);
+                var nm1: [32]u8 = undefined;
+                const f1 = std.fmt.bufPrint(&nm1, "kqkv{d}.bin", .{e.dump_epoch}) catch unreachable;
+                var dir = std.Io.Dir.cwd();
+                dir.writeFile(e.io, .{ .sub_path = f1, .data = qb }) catch {};
+            }
+        }
         const c = &e.c;
         const Wq: usize = c.kdaWidth();
         const D: usize = c.kda_dim;
@@ -686,6 +699,17 @@ pub const Engine = struct {
             try e.dumpBin("sd_y2.bin", e.y.ptr, rows * Wq * 2);
             std.debug.print("  y r0 h0 sum {d:.5}\n", .{acc});
 
+        }
+        if (e.dump_on and li == 0) {
+            try e.stream.synchronize();
+            const ny = rows * e.c.hidden * 2;
+            const yb = try e.gpa.alloc(u8, ny);
+            defer e.gpa.free(yb);
+            try e.y.download(0, yb);
+            var nm2: [32]u8 = undefined;
+            const f2 = std.fmt.bufPrint(&nm2, "ky{d}.bin", .{e.dump_epoch}) catch unreachable;
+            var dir = std.Io.Dir.cwd();
+            dir.writeFile(e.io, .{ .sub_path = f2, .data = yb }) catch {};
         }
         if (li == 0 and !e.quiet) try e.b0Print("attn-post-o", e.branch);
     }
