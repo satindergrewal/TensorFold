@@ -1042,6 +1042,18 @@ pub const Engine = struct {
         var mi_mla: usize = 0;
         for (e.w.layers, e.w.blocks_lo..) |*L, bi| {
             e.cur_bi = @intCast(bi);
+            if (e.dump_on and bi <= e.w.blocks_lo + 2) {
+                try e.stream.synchronize();
+                const n = rows * 4 * e.c.hidden * 4;
+                const xb = try e.gpa.alloc(u8, n);
+                defer e.gpa.free(xb);
+                try e.x[e.xi].download(0, xb);
+                var nm9: [40]u8 = undefined;
+                e.dump_serial += 1;
+                const f9 = std.fmt.bufPrint(&nm9, "kx{d}{s}S{d}.bin", .{ bi, @as([]const u8, if (e.cont) "b" else "a"), e.dump_serial }) catch unreachable;
+                var dir9 = std.Io.Dir.cwd();
+                dir9.writeFile(e.io, .{ .sub_path = f9, .data = xb }) catch {};
+            }
             const hc_a = L.hc_attn orelse break; // the MTP block runs after the tail
             if ((e.fwd_count == 1 and !e.quiet) and bi == 4) {
                 try e.stream.synchronize();
