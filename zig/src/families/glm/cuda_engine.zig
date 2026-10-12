@@ -788,6 +788,18 @@ pub const Engine = struct {
                 try e.ops.copy2d(e.stream, cs_at2 + rows * 3 * Wq * 2, cs_at2, keep, 3 * Wq, 3 * Wq);
                 try e.ops.copy2d(e.stream, e.proj.ptr, cs_at2 + keep * 3 * Wq * 2, rows, 3 * Wq, ps);
             }
+            if (e.dump_on and li == 0) {
+                try e.stream.synchronize();
+                const nc = 3 * Wq * 2;
+                const cb = try e.gpa.alloc(u8, nc);
+                defer e.gpa.free(cb);
+                try (cuda.DeviceBuffer{ .d = e.d, .ptr = cs_at2, .len = nc, .borrowed = true }).download(0, cb);
+                var nmR: [40]u8 = undefined;
+                e.dump_serial += 1;
+                const fR = std.fmt.bufPrint(&nmR, "krot{s}S{d}r{d}.bin", .{ @as([]const u8, if (e.cont) "b" else "a"), e.dump_serial, rows }) catch unreachable;
+                var dirR = std.Io.Dir.cwd();
+                dirR.writeFile(e.io, .{ .sub_path = fR, .data = cb }) catch {};
+            }
         }
         // o_proj -> branch
         try e.g.mm(e.stream, e.y.ptr, w.o, e.branch.ptr, rows, c.hidden, Wq, false);
