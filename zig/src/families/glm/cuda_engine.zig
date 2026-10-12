@@ -786,7 +786,21 @@ pub const Engine = struct {
                 // src (a downward shift) and copy2d blocks run CONCURRENTLY - an
                 // in-place copy races (block y+1 clobbers block y's source row).
                 // Stage through scratch: two disjoint copies are always safe.
+                if (e.dump_on and li == 0) {
+                    std.debug.print("  ROT args rows={d} keep={d} cols={d} cs={x} src={x} scratch={x}\n", .{ rows, keep, 3 * Wq, cs_at2, cs_at2 + rows * 3 * Wq * 2, e.scratch.ptr });
+                }
                 try e.ops.copy2d(e.stream, cs_at2 + rows * 3 * Wq * 2, e.scratch.ptr, keep, 3 * Wq, 3 * Wq);
+                if (e.dump_on and li == 0) {
+                    try e.stream.synchronize();
+                    const nb = try e.gpa.alloc(u8, keep * 3 * Wq * 2);
+                    defer e.gpa.free(nb);
+                    try (cuda.DeviceBuffer{ .d = e.d, .ptr = e.scratch.ptr, .len = nb.len, .borrowed = true }).download(0, nb);
+                    var nmS: [40]u8 = undefined;
+                    e.dump_serial += 1;
+                    const fS = std.fmt.bufPrint(&nmS, "ksc1{s}S{d}.bin", .{ @as([]const u8, if (e.cont) "b" else "a"), e.dump_serial }) catch unreachable;
+                    var dirS = std.Io.Dir.cwd();
+                    dirS.writeFile(e.io, .{ .sub_path = fS, .data = nb }) catch {};
+                }
                 try e.ops.copy2d(e.stream, e.scratch.ptr, cs_at2, keep, 3 * Wq, 3 * Wq);
                 try e.ops.copy2d(e.stream, e.proj.ptr, cs_at2 + keep * 3 * Wq * 2, rows, 3 * Wq, ps);
             }
