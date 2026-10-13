@@ -42,6 +42,7 @@ pub const symbols = struct {
     pub const post_rot = "_ZN14tf_exl3_kernel13exl3_post_rotEP13__nv_bfloat16PKtii";
     pub const matmul = "_ZN14tf_exl3_kernel18exl3_decode_matmulEPK13__nv_bfloat16PKsPS0_iiiiii";
     pub const verify = "_ZN14tf_exl3_kernel18exl3_verify_decodeEPKsiP13__nv_bfloat16";
+    pub const grouped_project = "exl3_grouped_project";
 };
 
 fn i(x: usize) c_int {
@@ -59,6 +60,9 @@ pub const Kernels = struct {
     post_fn: module.Function,
     mm_fn: module.Function,
     verify_fn: module.Function,
+    grouped_fn: module.Function,
+    desc_table: u64 = 0, // [experts] Exl3Desc; 288 x 48B = ~14KB
+    desc_tbl_own: memory.DeviceBuffer = undefined,
     scratch: memory.DeviceBuffer, // x_tilde [chunk_rows, k_max] bf16
 
     pub const chunk_rows = 16; // the GEMM's staged rows; grid.y tiles more
@@ -76,6 +80,7 @@ pub const Kernels = struct {
             .post_fn = undefined,
             .mm_fn = undefined,
             .verify_fn = undefined,
+            .grouped_fn = undefined,
             .scratch = undefined,
         };
         errdefer k.scratch.free();
@@ -83,11 +88,16 @@ pub const Kernels = struct {
         k.post_fn = try mod.function(symbols.post_rot);
         k.mm_fn = try mod.function(symbols.matmul);
         k.verify_fn = try mod.function(symbols.verify);
+        k.grouped_fn = try mod.function(symbols.grouped_project);
         k.scratch = try memory.DeviceBuffer.alloc(d, chunk_rows * k_max * 2);
+        const tbl = try memory.DeviceBuffer.alloc(d, 512 * @sizeOf(Desc));
+        k.desc_table = tbl.ptr;
+        k.desc_tbl_own = tbl;
         return k;
     }
 
     pub fn deinit(k: *Kernels) void {
+        if (k.desc_table != 0) k.desc_tbl_own.free();
         k.scratch.free();
         k.mod.unload();
     }
@@ -131,6 +141,54 @@ pub const Kernels = struct {
 
     /// One call: pre, GEMM (x_tilde in the shared scratch) and post. Single stream -
     /// the scratch is the instance's.
+    pub const Desc = extern struct {
+        trellis: u64,
+        suh: u64,
+        svh: u64,
+        k: i32,
+        n: i32,
+        tiles_k: i32,
+        tiles_n: i32,
+        halves: i32,
+    };
+
+    /// Upload the per-expert descriptor table once (weights are static post-load).
+    pub fn tableFrom(k: *const Kernels, s: Stream, ws: []const Weight) !u64 {
+        const n = ws.len;
+        if (k.desc_table == 0) return error.NoTable;
+        const host = std.heap.page_allocator.alloc(u8, n * @sizeOf(Desc)) catch return error.OutOfMemory;
+        defer std.heap.page_allocator.free(host);
+        const ds: [*]Desc = @ptrCast(@alignCast(host.ptr));
+        for (ws, 0..) |w, di| {
+            ds[di] = .{
+                .trellis = w.trellis,
+                .suh = w.suh,
+                .svh = w.svh,
+                .k = @intCast(w.k),
+                .n = @intCast(w.n),
+                .tiles_k = @intCast(w.tilesK()),
+                .tiles_n = @intCast(w.tilesN()),
+                .halves = @intCast(w.halves),
+            };
+        }
+        const db = memory.DeviceBuffer{ .d = k.d, .ptr = k.desc_table, .len = n * @sizeOf(Desc), .borrowed = true };
+        try db.upload(0, host);
+        _ = s;
+        return k.desc_table;
+    }
+
+    /// All slots in ONE launch family: grid (tiles_n_max, topk) - the row is
+    /// picked on DEVICE. rows must be 1 (serving decode). y: [topk, n_max].
+    pub fn projectGrouped(k: *const Kernels, s: Stream, x: u64, table: u64, picks: u64, y: u64, topk: usize, tiles_n_max: usize) !void {
+        var a: launch_.Args = .{};
+        a.add(x);
+        a.add(table);
+        a.add(picks);
+        a.add(y);
+        a.add(i(topk));
+        try launch_.launch(k.grouped_fn, .{ .grid = .{ .x = u(tiles_n_max), .y = u(topk) }, .block = .{ .x = 128 } }, s, &a);
+    }
+
     pub fn project(k: *const Kernels, s: Stream, x: u64, w: Weight, y: u64, rows: usize) !void {
         if (rows > chunk_rows or w.k > k_max) return error.WindowTooWide;
         try k.preRot(s, x, w.suh, k.scratch.ptr, rows, w.k);

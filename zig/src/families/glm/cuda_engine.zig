@@ -1090,8 +1090,7 @@ pub const Engine = struct {
                 const ye_at = e.moe_ye.ptr + (r * e.c.topk + k) * hidden * 2;
                 try e.ex.project(e.stream, e.moe_act.ptr, w.down[eu], ye_at, 1);
             }
-        }
-        try e.ops.combine(e.stream, e.moe_ys.ptr, e.moe_ye.ptr, e.moe_wts.ptr, e.branch.ptr, rows, e.c.topk, hidden);
+        }        try e.ops.combine(e.stream, e.moe_ys.ptr, e.moe_ye.ptr, e.moe_wts.ptr, e.branch.ptr, rows, e.c.topk, hidden);
         if ((e.fwd_count == 1 and !e.quiet) and (e.cur_bi == 3 or e.cur_bi == 11)) {
             try e.stream.synchronize();
             {

@@ -220,4 +220,55 @@ __global__ void exl3_verify_decode(
     decoded[p] = __float2bfloat16(codebook_value_mcg(tile_state(w, trellis, p)));
 }
 
+// --- Grouped expert dispatch: one launch per (slot, tiles_n-chunk) ---
+// The per-expert weights sit in a device descriptor table (ptr, suh, svh, dims);
+// picks stay on device. grid.x = tiles_n, grid.y = slot (rows==1 serving).
+
+struct Exl3Desc {
+    const int16_t* trellis;
+    const uint16_t* suh;
+    const uint16_t* svh;
+    int k, n, tiles_k, tiles_n, halves;
+};
+
+extern "C" __global__ void exl3_grouped_project(
+    const __nv_bfloat16* __restrict__ x,   // [1, k] one row
+    const Exl3Desc* __restrict__ descs,    // [experts]
+    const int* __restrict__ picks,         // [topk]
+    __nv_bfloat16* __restrict__ y,         // [topk, n] slot outputs
+    int topk
+) {
+    const int slot = blockIdx.y;
+    const int ex = picks[slot];
+    if (ex < 0) return;
+    const Exl3Desc d = descs[ex];
+    const int tn = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int words = d.halves * 8;
+    const Exl3Width w = { d.halves };
+
+    __shared__ float s_w[TILE][TILE];
+    __shared__ float s_x[1][TILE];
+
+    float acc = 0.0f;
+    const int my = (int)tid < TILE ? (int)tid : -1;
+
+    for (int tk = 0; tk < d.tiles_k; ++tk) {
+        const int16_t* tile = d.trellis + ((size_t)tk * d.tiles_n + tn) * words;
+        for (int p = tid; p < 256; p += blockDim.x) {
+            Placement pl = tile_placement(p);
+            s_w[pl.row][pl.col] = codebook_value_mcg(tile_state(w, tile, p));
+        }
+        if (tid < TILE) s_x[0][tid] = __bfloat162float(x[tk * TILE + tid]);
+        __syncthreads();
+        if (my >= 0) {
+            #pragma unroll
+            for (int i = 0; i < TILE; ++i) acc += s_x[0][i] * s_w[i][my];
+        }
+        __syncthreads();
+    }
+    if (my >= 0)
+        y[(size_t)slot * d.n + (size_t)tn * TILE + my] = __float2bfloat16(acc);
+}
+
 } // namespace tf_exl3_kernel
