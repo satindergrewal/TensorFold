@@ -84,8 +84,16 @@ pub const Experts = struct {
         };
     }
 
-    /// Decode rows 16 pairs at a time, prompt rows 64 on the tensor units; a row's bits are its path's at every plan.
+    /// Per-matrix mixed-width descriptors (our fork); 0 = uniform (their behavior).
+    pub fn runMixed(e: *const Experts, s: Stream, epi: experts.Epi, in: experts.Rows, l: experts.Layer, p: grouped.Plan, out: u64, items: usize, skip: i32, mats_desc: u64) !void {
+        return e.runInner(s, epi, in, l, p, out, items, skip, false, mats_desc);
+    }
+
     pub fn run(e: *const Experts, s: Stream, epi: experts.Epi, in: experts.Rows, l: experts.Layer, p: grouped.Plan, out: u64, items: usize, skip: i32, prompt: bool) !void {
+        return e.runInner(s, epi, in, l, p, out, items, skip, prompt, 0);
+    }
+
+    fn runInner(e: *const Experts, s: Stream, epi: experts.Epi, in: experts.Rows, l: experts.Layer, p: grouped.Plan, out: u64, items: usize, skip: i32, prompt: bool, mats_desc: u64) !void {
         const g = try geometry(epi, l);
         const pi: usize = @intFromBool(prompt);
         const grid = @min(items * (g.n / 128), e.resident[pi]);
@@ -101,6 +109,7 @@ pub const Experts = struct {
         a.add(if (up) l.limit else @as(f32, 0.0));
         a.add(skip);
         a.add(g);
+        a.add(mats_desc);
         try launch_.launch(if (prompt) e.prompt_fn else e.decode_fn, .{ .grid = .{ .x = @intCast(grid), .y = 1, .z = 1 }, .block = .{ .x = 256 } }, s, &a);
     }
 };

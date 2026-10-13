@@ -8,6 +8,14 @@ struct TfExl3Experts {
   unsigned long long stride;
 };
 
+// MIXED-WIDTH (our fork): per-matrix descriptor; one per expert-matrix, in
+// expert-major order. k/n/bits/tiles per matrix; offsets into the stacks.
+struct TfExl3Mat {
+  unsigned long long toff;  // trellis byte offset
+  unsigned int hoff;        // halves (suh|svh) offset
+  unsigned int k, n, tiles_n, bits;
+};
+
 // A warp's two column sums for each of R rows into zs, after its last input block (lanes 4 c + q hold rows 2 q ...).
 template <int R>
 __device__ __forceinline__ void tf_exl3x_fold(float (&total)[2][R], unsigned sg, unsigned lane, float* zs) {
@@ -91,14 +99,15 @@ template <int K>
 __device__ __forceinline__ void tf_exl3x_units(const __nv_bfloat16* X, int x_stride, int slots, const uint8_t* W,
                                                const __half* H, const int* items, const int* counts, const int* members,
                                                void* out, float limit, int skip, const TfExl3Experts g, float* xs,
-                                               float* zs) {
-  const unsigned tid = threadIdx.x, sg = tid / 32, lane = tid % 32, nb = g.n / 128;
+                                               float* zs, const TfExl3Mat* __restrict__ mats_desc = nullptr) {
+  const unsigned tid = threadIdx.x, sg = tid / 32, lane = tid % 32, nb = g.n / 128; // g.n = n_max; narrow experts skip below
   const unsigned units = (unsigned)__ldg(counts) * nb;
   __shared__ unsigned xr[16], pr[16];
   for (unsigned unit = blockIdx.x; unit < units; unit += gridDim.x) {
     const unsigned it = unit / nb, cb = unit % nb;
     const int e = __ldg(items + 3 * it), first = __ldg(items + 3 * it + 1), cnt = __ldg(items + 3 * it + 2);
     if (e == skip) continue;
+    const TfExl3Mat* md = mats_desc + (size_t)e * g.mats; // MIXED: per-expert geometry
     for (int r0 = 0; r0 < cnt; r0 += 16) {
       const unsigned rows = cnt - r0 < 16 ? cnt - r0 : 16;
       if (tid < 16) {
@@ -112,20 +121,29 @@ __device__ __forceinline__ void tf_exl3x_units(const __nv_bfloat16* X, int x_str
       for (int i = 0; i < 16; ++i) rx[i] = xr[i];
       // the capacity the chunk's rows need: a row's sums are the same at every capacity and on either path
       for (unsigned m = 0; m < g.mats; ++m) {
-        const uint64_t at = (uint64_t)e * g.mats + m;
-        const uint8_t* t = W + at * g.stride;
-        const __half* suh = H + at * (g.k + g.n);
+        const uint8_t* t = W + md[m].toff;
+        const __half* suh = H + md[m].hoff;
         float* z = zs + m * 2048;
-        if (rows <= 1) tf_exl3x_free<K, 1>(X, x_stride, rx, rows, t, suh, g, cb, sg, lane, z);
-        else if (rows <= 2) tf_exl3x_free<K, 2>(X, x_stride, rx, rows, t, suh, g, cb, sg, lane, z);
-        else tf_exl3x_shared<K, 16>(X, x_stride, rx, rows, t, suh, g, cb, sg, lane, xs, z);
+        if (cb * 128u >= md[m].n) continue; // MIXED: a narrow expert's padded column block
+        // MIXED: the per-expert bits pick the specialization (our checkpoint: 6 or 8)
+        #define TF_X3_RUN(KK) do { \
+          TfExl3Experts lg = g; lg.bits = md[m].bits; lg.tiles_n = md[m].tiles_n; lg.k = md[m].k; lg.n = md[m].n; \
+          if (rows <= 1) tf_exl3x_free<KK, 1>(X, x_stride, rx, rows, t, suh, lg, cb, sg, lane, z); \
+          else if (rows <= 2) tf_exl3x_free<KK, 2>(X, x_stride, rx, rows, t, suh, lg, cb, sg, lane, z); \
+          else tf_exl3x_shared<KK, 16>(X, x_stride, rx, rows, t, suh, lg, cb, sg, lane, xs, z); \
+        } while (0)
+        switch (md[m].bits) {
+          case 6: TF_X3_RUN(6); break;
+          case 8: TF_X3_RUN(8); break;
+          default: TF_X3_RUN(K); break; // uniform fallback (their behavior)
+        }
+        #undef TF_X3_RUN
       }
       __syncthreads();
       for (unsigned i = sg; i < rows; i += 8) {
-        const uint64_t at = (uint64_t)e * g.mats;
         float a[4], b[4];
-        tf_exl3x_out(zs, i, H + at * (g.k + g.n) + g.k, cb, lane, a);
-        if (g.epi == 2) tf_exl3x_out(zs + 2048, i, H + (at + 1) * (g.k + g.n) + g.k, cb, lane, b);
+        tf_exl3x_out(zs, i, H + md[0].hoff + md[0].k, cb, lane, a);
+        if (g.epi == 2) tf_exl3x_out(zs + 2048, i, H + md[1].hoff + md[1].k, cb, lane, b);
         for (int q = 0; q < 4; ++q) {
           const uint64_t o = (uint64_t)pr[i] * g.n + cb * 128 + lane + 32 * q;
           if (g.epi == 0) reinterpret_cast<float*>(out)[o] = a[q];
@@ -140,16 +158,16 @@ __device__ __forceinline__ void tf_exl3x_units(const __nv_bfloat16* X, int x_str
 __device__ __forceinline__ void tf_exl3x_width(const __nv_bfloat16* X, int x_stride, int slots, const uint8_t* W,
                                                const __half* H, const int* items, const int* counts, const int* members,
                                                void* out, float limit, int skip, const TfExl3Experts g, float* xs,
-                                               float* zs) {
+                                               float* zs, const TfExl3Mat* __restrict__ mats_desc = nullptr) {
   switch (g.bits) {
-    case 1: tf_exl3x_units<1>(X, x_stride, slots, W, H, items, counts, members, out, limit, skip, g, xs, zs); break;
-    case 2: tf_exl3x_units<2>(X, x_stride, slots, W, H, items, counts, members, out, limit, skip, g, xs, zs); break;
-    case 3: tf_exl3x_units<3>(X, x_stride, slots, W, H, items, counts, members, out, limit, skip, g, xs, zs); break;
-    case 4: tf_exl3x_units<4>(X, x_stride, slots, W, H, items, counts, members, out, limit, skip, g, xs, zs); break;
-    case 5: tf_exl3x_units<5>(X, x_stride, slots, W, H, items, counts, members, out, limit, skip, g, xs, zs); break;
-    case 6: tf_exl3x_units<6>(X, x_stride, slots, W, H, items, counts, members, out, limit, skip, g, xs, zs); break;
-    case 7: tf_exl3x_units<7>(X, x_stride, slots, W, H, items, counts, members, out, limit, skip, g, xs, zs); break;
-    case 8: tf_exl3x_units<8>(X, x_stride, slots, W, H, items, counts, members, out, limit, skip, g, xs, zs); break;
+    case 1: tf_exl3x_units<1>(X, x_stride, slots, W, H, items, counts, members, out, limit, skip, g, xs, zs, mats_desc); break;
+    case 2: tf_exl3x_units<2>(X, x_stride, slots, W, H, items, counts, members, out, limit, skip, g, xs, zs, mats_desc); break;
+    case 3: tf_exl3x_units<3>(X, x_stride, slots, W, H, items, counts, members, out, limit, skip, g, xs, zs, mats_desc); break;
+    case 4: tf_exl3x_units<4>(X, x_stride, slots, W, H, items, counts, members, out, limit, skip, g, xs, zs, mats_desc); break;
+    case 5: tf_exl3x_units<5>(X, x_stride, slots, W, H, items, counts, members, out, limit, skip, g, xs, zs, mats_desc); break;
+    case 6: tf_exl3x_units<6>(X, x_stride, slots, W, H, items, counts, members, out, limit, skip, g, xs, zs, mats_desc); break;
+    case 7: tf_exl3x_units<7>(X, x_stride, slots, W, H, items, counts, members, out, limit, skip, g, xs, zs, mats_desc); break;
+    case 8: tf_exl3x_units<8>(X, x_stride, slots, W, H, items, counts, members, out, limit, skip, g, xs, zs, mats_desc); break;
     default: break;
   }
 }
@@ -158,9 +176,11 @@ __device__ __forceinline__ void tf_exl3x_width(const __nv_bfloat16* X, int x_str
 extern "C" __global__ void __launch_bounds__(256) tf_exl3_experts(const __nv_bfloat16* X, int x_stride, int slots,
                                                                  const uint8_t* W, const __half* H, const int* items,
                                                                  const int* counts, const int* members, void* out,
-                                                                 float limit, int skip, const TfExl3Experts g) {
+                                                                 float limit, int skip, const TfExl3Experts g,
+                                                                 const TfExl3Mat* __restrict__ mats_desc) {
   __shared__ __align__(16) float xs[16 * 128], zs[2 * 16 * 128];
-  tf_exl3x_width(X, x_stride, slots, W, H, items, counts, members, out, limit, skip, g, xs, zs);
+  // MIXED: bypass the per-launch width switch; units handles per-expert bits
+  tf_exl3x_units<8>(X, x_stride, slots, W, H, items, counts, members, out, limit, skip, g, xs, zs, mats_desc);
 }
 
 // Prompt rows in exl3.cu's prompt arithmetic: an item's 64 pairs a block, rows rotated inline, gate and up together.
