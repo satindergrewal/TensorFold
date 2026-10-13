@@ -433,27 +433,33 @@ fn serveSplit(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engin
     const o3 = o2 + lbr;
     const o4 = o3 + lpo;
     const ot = o4 + lco + lme;
-    try eng.forward(ids_buf[0..n_ids], n_ids, 0);
-    try eng.stream.synchronize();
     const hb = try gpa.alloc(u8, 32 * 1024 * 1024);
     defer gpa.free(hb);
-    try eng.x[0].download(0, hb[0..o1]);
-    try eng.x[1].download(0, hb[o1..o2]);
-    try eng.branch.download(0, hb[o2..o3]);
-    try eng.post.download(0, hb[o3..o4]);
-    try eng.comb.download(0, hb[o4 .. o4 + lco]);
-    if (lme != 0) try eng.mtp_emb.download(0, hb[o4 + lco .. ot]);
-    const xi_hand = eng.xi;
-    try ctx1.makeCurrent();
-    try eng_b.resetState();
-    try eng_b.x[0].upload(0, hb[0..o1]);
-    try eng_b.x[1].upload(0, hb[o1..o2]);
-    try eng_b.branch.upload(0, hb[o2..o3]);
-    try eng_b.post.upload(0, hb[o3..o4]);
-    try eng_b.comb.upload(0, hb[o4 .. o4 + lco]);
-    if (lme != 0) try eng_b.mtp_emb.upload(0, hb[o4 + lco .. ot]);
-    eng_b.xi = xi_hand;
-    eng_b.fwd_count = 0;
+    if (!cache_hit) {
+        // the whole cold prompt pass + handoff: on a cache hit the restore
+        // already brought BOTH engines to the post-prompt state - re-running
+        // the prompt double-advances A's KDA state and resetState() zeroes
+        // B's restore (the cur=0/fwd=1 signature)
+        try eng.forward(ids_buf[0..n_ids], n_ids, 0);
+        try eng.stream.synchronize();
+        try eng.x[0].download(0, hb[0..o1]);
+        try eng.x[1].download(0, hb[o1..o2]);
+        try eng.branch.download(0, hb[o2..o3]);
+        try eng.post.download(0, hb[o3..o4]);
+        try eng.comb.download(0, hb[o4 .. o4 + lco]);
+        if (lme != 0) try eng.mtp_emb.download(0, hb[o4 + lco .. ot]);
+        const xi_hand = eng.xi;
+        try ctx1.makeCurrent();
+        try eng_b.resetState();
+        try eng_b.x[0].upload(0, hb[0..o1]);
+        try eng_b.x[1].upload(0, hb[o1..o2]);
+        try eng_b.branch.upload(0, hb[o2..o3]);
+        try eng_b.post.upload(0, hb[o3..o4]);
+        try eng_b.comb.upload(0, hb[o4 .. o4 + lco]);
+        if (lme != 0) try eng_b.mtp_emb.upload(0, hb[o4 + lco .. ot]);
+        eng_b.xi = xi_hand;
+        eng_b.fwd_count = 0;
+    }
     if (!cache_hit) {
         try eng_b.forward(ids_buf[0..n_ids], n_ids, 0);
         try eng_b.stream.synchronize();
@@ -513,6 +519,12 @@ fn serveSplit(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engin
             // verify round: [last_pick, draft] - accept banks 2 tokens
             two[0] = out_ids[n_out - 1];
             two[1] = cur_draft;
+            if (pf_dump and n_out == 1) {
+                eng.dump_on = true;
+                eng.quiet = false;
+                eng_b.dump_on = true;
+                eng_b.quiet = false;
+            }
             try ctx.makeCurrent();
             try eng.backupCs();
             try eng.forward(two[0..2], 2, pos);
@@ -534,11 +546,34 @@ fn serveSplit(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engin
             try eng_b.comb.uploadAsync(0, hb[o4 .. o4 + lco], eng_b.stream.handle);
             if (lme != 0) try eng_b.mtp_emb.uploadAsync(0, hb[o4 + lco .. ot], eng_b.stream.handle);
             eng_b.xi = xi_v;
+            if (pf_dump and n_out == 1) {
+                try eng_b.stream.synchronize();
+                const bb = try gpa.alloc(u8, 2 * 4 * 4096 * 4);
+                defer gpa.free(bb);
+                try eng_b.x[0].download(0, bb);
+                var nmB: [48]u8 = undefined;
+                const fB = std.fmt.bufPrint(&nmB, "/tmp/m1_{d}_bx.bin", .{req_counter}) catch unreachable;
+                var dirB = std.Io.Dir.cwd();
+                dirB.writeFile(eng_b.io, .{ .sub_path = fB, .data = bb }) catch {};
+                const ab = try gpa.alloc(u8, 2 * 4 * 4096 * 4);
+                defer gpa.free(ab);
+                try eng.x[0].download(0, ab);
+                var nmA: [48]u8 = undefined;
+                const fA = std.fmt.bufPrint(&nmA, "/tmp/m1_{d}_ax.bin", .{req_counter}) catch unreachable;
+                var dirA = std.Io.Dir.cwd();
+                dirA.writeFile(eng.io, .{ .sub_path = fA, .data = ab }) catch {};
+            }
             try eng_b.forward(two[0..2], 2, pos);
             try eng_b.stream.synchronize();
             try eng_b.picks.downloadAsync(0, pick[0..8], eng_b.stream.handle);
             if (eng_b.mtp_li != null) try eng_b.mtp_pick.downloadAsync(0, pick[8..12], eng_b.stream.handle);
             try eng_b.stream.synchronize();
+            if (pf_dump and n_out == 1) {
+                eng.dump_on = false;
+                eng.quiet = true;
+                eng_b.dump_on = false;
+                eng_b.quiet = true;
+            }
             if (pv[0] == cur_draft) {
                 accepts += 1;
                 if (n_out < out_ids.len) {

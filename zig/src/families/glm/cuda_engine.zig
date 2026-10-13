@@ -781,6 +781,22 @@ pub const Engine = struct {
         // the step: this layer's own parity so windows chain (layer li's next
         // read is always the buffer it last wrote)
         const cur = e.kda_st_cur[li];
+        if (e.dump_on and li == 0) {
+            std.debug.print("  STEP cur[0]={d} fwd={d}\n", .{ cur, e.fwd_count });
+            const sb = try e.gpa.alloc(u8, 8192);
+            defer e.gpa.free(sb);
+            try e.stream.synchronize();
+            try (cuda.DeviceBuffer{ .d = e.d, .ptr = e.kda_st0.ptr, .len = 8192, .borrowed = true }).download(0, sb);
+            var nmS0: [40]u8 = undefined;
+            e.dump_serial += 1;
+            const fS0 = std.fmt.bufPrint(&nmS0, "kst0aS{d}.bin", .{e.dump_serial}) catch unreachable;
+            var dirS = std.Io.Dir.cwd();
+            dirS.writeFile(e.io, .{ .sub_path = fS0, .data = sb }) catch {};
+            try (cuda.DeviceBuffer{ .d = e.d, .ptr = e.kda_st1.ptr, .len = 8192, .borrowed = true }).download(0, sb);
+            var nmS1: [40]u8 = undefined;
+            const fS1 = std.fmt.bufPrint(&nmS1, "kst1aS{d}.bin", .{e.dump_serial}) catch unreachable;
+            dirS.writeFile(e.io, .{ .sub_path = fS1, .data = sb }) catch {};
+        }
         const st_in = if (cur == 0) e.kda_st0.ptr else e.kda_st1.ptr;
         if (li <= 4 and (e.fwd_count == 1 and !e.quiet)) {
             try e.stream.synchronize();
