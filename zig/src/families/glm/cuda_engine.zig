@@ -1196,6 +1196,7 @@ pub const Engine = struct {
                 .dims = e.c.hidden,
                 .experts = w.gate.len,
                 .limit = e.c.swiglu_limit,
+                .exl3 = .{ .codebook = .mcg }, // our checkpoint is MCG; widths stay 0 (desc-driven)
             };
             // their .up epi writes swiglu(gate,up) inline: one row per pair at
             // [0..topk) - the down family reads those rows directly
