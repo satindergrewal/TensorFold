@@ -229,6 +229,8 @@ pub const Engine = struct {
     mtp_pick: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
     mtp_emb: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true }, // bf16 [1, D]: the last token's embedding
     kda_cs_bak: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true }, // spec-decode rollback
+    // #741 mixed path: per-layer pointer desc tables (no stacks, no repack)
+    m41_layer_descs: ?std.AutoHashMapUnmanaged(usize, u64) = null,
     // prefill cache: snapshots of everything a decode continuation needs
     pf_on: bool = false,
     pf_st0: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
@@ -1113,131 +1115,34 @@ pub const Engine = struct {
         dir.writeFile(e.io, .{ .sub_path = f, .data = txt }) catch {};
     }
 
-    fn m41Setup(e: *Engine, w: *const weights.Moe) !void {
-        e.m41SetupInner(w) catch |err| {
-            e.m41Err("inner", err);
-            return err;
-        };
-    }
-
-    fn m41SetupInner(e: *Engine, w: *const weights.Moe) !void {
-        e.m41Stage("start ");
+    fn m41DescFor(e: *Engine, bi: usize, w: *const weights.Moe) !u64 {
+        if (e.m41_layer_descs) |*m| {
+            if (m.get(bi * 2)) |ptr| return ptr;
+        }
         const E = w.gate.len;
-        var inter_max: usize = 0;
-        for (w.gate) |gw| inter_max = @max(inter_max, gw.n);
-        e.m41_inter_max = inter_max;
-        var up_t: usize = 0;
-        var up_h: usize = 0;
-        var dn_t: usize = 0;
-        var dn_h: usize = 0;
-        for (w.gate) |gw| {
-            const tb = @as(usize, gw.tilesK()) * gw.tilesN() * gw.tileWords() * 2;
-            up_t += 2 * tb;
-            up_h += 2 * (gw.k + gw.n);
-        }
-        for (w.down) |dw2| {
-            dn_t += @as(usize, dw2.tilesK()) * dw2.tilesN() * dw2.tileWords() * 2;
-            dn_h += dw2.k + dw2.n;
-        }
-        e.m41Sizes(E, inter_max, up_t, up_h, dn_t, dn_h);
-        e.m41_up = try cuda.DeviceBuffer.alloc(e.d, up_t);
-        e.m41_up_h = try cuda.DeviceBuffer.alloc(e.d, up_h * 2);
-        e.m41_down = try cuda.DeviceBuffer.alloc(e.d, dn_t);
-        e.m41_down_h = try cuda.DeviceBuffer.alloc(e.d, dn_h * 2);
-        e.m41_desc_up = try cuda.DeviceBuffer.alloc(e.d, E * 2 * @sizeOf(MatDesc));
-        e.m41_desc_down = try cuda.DeviceBuffer.alloc(e.d, E * @sizeOf(MatDesc));
-        e.m41_members = try cuda.DeviceBuffer.alloc(e.d, 8 * 4);
-        e.m41_items = try cuda.DeviceBuffer.alloc(e.d, 16 * 3 * 4);
-        e.m41_counts = try cuda.DeviceBuffer.alloc(e.d, 4);
-        e.m41_rank = try cuda.DeviceBuffer.alloc(e.d, 8 * 4);
-        e.m41_hist = try cuda.DeviceBuffer.alloc(e.d, 16 * 4);
-        e.m41_out = try cuda.DeviceBuffer.alloc(e.d, 2 * e.c.topk * inter_max * 2);
-        e.m41_act = try cuda.DeviceBuffer.alloc(e.d, e.c.topk * inter_max * 2);
-        e.m41Stage("allocs-done ");
-        e.m41_xe = @import("cuda").exl3_experts.Experts.load(e.d, 148) catch |err| {
-            e.m41Err("experts-load", err);
-            return err;
-        };
-        e.m41Stage("experts-loaded ");
-        e.m41Stage("allocs ");
-        // router from the experts module: grouped.Router.resolve needs the experts
-        // fatbin module - Experts doesn't expose it; load a second module instance
-        {
-            // the Router's Functions live in this module - it must outlive the
-            // router; unload only at engine teardown (leak-until-deinit is fine)
-            const mod = cuda.Module.load(e.d, @import("cuda").kernels.experts) catch |err| {
-                e.m41Err("router-mod", err);
-                return err;
-            };
-            e.m41_router_mod = mod;
-            e.m41_router = try @import("cuda").grouped.Router.resolve(mod);
-        }
-        e.m41Stage("repack-begin ");
-        e.m41Stage("router-ok ");
-        // host staging: copy each expert's trellis + halves into the stacks, fill descs
-        const du = try e.gpa.alloc(u8, E * 2 * @sizeOf(MatDesc));
-        defer e.gpa.free(du);
-        const dd = try e.gpa.alloc(u8, E * @sizeOf(MatDesc));
-        defer e.gpa.free(dd);
-        const dus = std.mem.bytesAsSlice(MatDesc, du);
-        const dds = std.mem.bytesAsSlice(MatDesc, dd);
-        // staging through a scratch device buffer (chunked D2D via host)
-        var scratch = try cuda.DeviceBuffer.alloc(e.d, 64 * 1024 * 1024);
-        defer scratch.free();
-        const hchunk = try e.gpa.alloc(u8, 64 * 1024 * 1024);
-        defer e.gpa.free(hchunk);
-        // up family: expert-major, gate then up
-        var up_off: u64 = 0;
-        var uph_off: u32 = 0;
+        const MD = @import("cuda").exl3_experts.MatDesc;
+        const ub = try e.gpa.alloc(u8, E * 2 * @sizeOf(MD));
+        const db = try e.gpa.alloc(u8, E * @sizeOf(MD));
+        const du2: [*]MD = @ptrCast(@alignCast(ub.ptr));
+        const dd2: [*]MD = @ptrCast(@alignCast(db.ptr));
         for (w.gate, 0..) |gw, ei| {
-            const fams = [2]exl3.Weight{ gw, w.up[ei] };
-            for (fams, 0..) |mw, mi| {
-                const tb = @as(usize, mw.tilesK()) * mw.tilesN() * mw.tileWords() * 2;
-                // trellis: device -> host -> stack
-                try (cuda.DeviceBuffer{ .d = e.d, .ptr = mw.trellis, .len = tb, .borrowed = true }).download(0, hchunk[0..tb]);
-                try scratch.upload(0, hchunk[0..tb]);
-                try e.m41_up.copyFrom(up_off, scratch.ptr, tb, e.stream.handle);
-                // halves: suh then svh
-                try (cuda.DeviceBuffer{ .d = e.d, .ptr = mw.suh, .len = @as(usize, mw.k) * 2, .borrowed = true }).download(0, hchunk[0 .. mw.k * 2]);
-                try scratch.upload(0, hchunk[0 .. mw.k * 2]);
-                try e.m41_up_h.copyFrom(uph_off * 2, scratch.ptr, @as(usize, mw.k) * 2, e.stream.handle);
-                try (cuda.DeviceBuffer{ .d = e.d, .ptr = mw.svh, .len = @as(usize, mw.n) * 2, .borrowed = true }).download(0, hchunk[0 .. mw.n * 2]);
-                try scratch.upload(0, hchunk[0 .. mw.n * 2]);
-                try e.m41_up_h.copyFrom((uph_off + mw.k) * 2, scratch.ptr, @as(usize, mw.n) * 2, e.stream.handle);
-                dus[ei * 2 + mi] = .{ .toff = up_off, .hoff = uph_off, .k = mw.k, .n = mw.n, .tiles_n = mw.tilesN(), .bits = mw.halves / 2 };
-                up_off += tb;
-                uph_off += mw.k + mw.n;
-            }
+            du2[ei * 2 + 0] = .{ .trellis = gw.trellis, .suh = gw.suh, .svh = gw.svh, .k = gw.k, .n = gw.n, .tiles_n = gw.tilesN(), .bits = gw.halves / 2 };
+            const uw = w.up[ei];
+            du2[ei * 2 + 1] = .{ .trellis = uw.trellis, .suh = uw.suh, .svh = uw.svh, .k = uw.k, .n = uw.n, .tiles_n = uw.tilesN(), .bits = uw.halves / 2 };
+            const dw4 = w.down[ei];
+            dd2[ei] = .{ .trellis = dw4.trellis, .suh = dw4.suh, .svh = dw4.svh, .k = dw4.k, .n = dw4.n, .tiles_n = dw4.tilesN(), .bits = dw4.halves / 2 };
         }
-        var dn_off: u64 = 0;
-        var dnh_off: u32 = 0;
-        for (w.down, 0..) |dw3, ei| {
-            const tb = @as(usize, dw3.tilesK()) * dw3.tilesN() * dw3.tileWords() * 2;
-            try (cuda.DeviceBuffer{ .d = e.d, .ptr = dw3.trellis, .len = tb, .borrowed = true }).download(0, hchunk[0..tb]);
-            try scratch.upload(0, hchunk[0..tb]);
-            try e.m41_down.copyFrom(dn_off, scratch.ptr, tb, e.stream.handle);
-            try (cuda.DeviceBuffer{ .d = e.d, .ptr = dw3.suh, .len = @as(usize, dw3.k) * 2, .borrowed = true }).download(0, hchunk[0 .. dw3.k * 2]);
-            try scratch.upload(0, hchunk[0 .. dw3.k * 2]);
-            try e.m41_down_h.copyFrom(dnh_off * 2, scratch.ptr, @as(usize, dw3.k) * 2, e.stream.handle);
-            try (cuda.DeviceBuffer{ .d = e.d, .ptr = dw3.svh, .len = @as(usize, dw3.n) * 2, .borrowed = true }).download(0, hchunk[0 .. dw3.n * 2]);
-            try scratch.upload(0, hchunk[0 .. dw3.n * 2]);
-            try e.m41_down_h.copyFrom((dnh_off + dw3.k) * 2, scratch.ptr, @as(usize, dw3.n) * 2, e.stream.handle);
-            dds[ei] = .{ .toff = dn_off, .hoff = dnh_off, .k = dw3.k, .n = dw3.n, .tiles_n = dw3.tilesN(), .bits = dw3.halves / 2 };
-            dn_off += tb;
-            dnh_off += dw3.k + dw3.n;
-        }
-        e.m41Stage("repack ");
-        try e.stream.synchronize();
-        try e.m41_desc_up.upload(0, du);
-        try e.m41_desc_down.upload(0, dd);
-        try e.stream.synchronize();
-        e.m41_on = true;
-        e.m41Stage("on\n");
-        std.debug.print("m41: setup done E={d} inter_max={d}\n", .{ E, inter_max });
+        const up_dev = try cuda.DeviceBuffer.alloc(e.d, ub.len);
+        try up_dev.upload(0, ub);
+        const dn_dev = try cuda.DeviceBuffer.alloc(e.d, db.len);
+        try dn_dev.upload(0, db);
+        e.gpa.free(ub);
+        e.gpa.free(db);
+        if (e.m41_layer_descs == null) e.m41_layer_descs = .{};
+        try e.m41_layer_descs.?.put(e.gpa, bi * 2, up_dev.ptr);
+        try e.m41_layer_descs.?.put(e.gpa, bi * 2 + 1, dn_dev.ptr);
+        return up_dev.ptr;
     }
-
-    /// The MoE block: router, top-8 route, shared expert, the routed experts
-    /// through exl3 per (row, slot) - correctness first, batching later.
     fn moeBlock(e: *Engine, w: *const weights.Moe, rows: usize) !void {
         const om0 = if (op_timing) tns() else 0;
         defer if (op_timing) {
@@ -1253,11 +1158,26 @@ pub const Engine = struct {
         try e.g.mm(e.stream, e.normed.ptr, w.shared_up, e.mlp_tmp.ptr + rows * inter * 2, rows, inter, hidden, false);
         try e.ops.act(e.stream, e.mlp_tmp.ptr, e.mlp_tmp.ptr + rows * inter * 2, e.mlp_act.ptr, rows, 1, inter, e.c.swiglu_limit);
         try e.g.mm(e.stream, e.mlp_act.ptr, w.shared_down, e.moe_ys.ptr, rows, hidden, inter, false);
-        if (rows == 1 and w.gate.len > 0 and !e.m41_on) {
-            try e.m41Setup(w);
-        }
-        if (rows == 1 and e.m41_on) {
+        if (rows == 1 and w.gate.len > 0) {
             const pairs = e.c.topk;
+            if (e.m41_xe == null) {
+                e.m41_xe = try @import("cuda").exl3_experts.Experts.load(e.d, 148);
+                const mod = try cuda.Module.load(e.d, @import("cuda").kernels.experts);
+                e.m41_router_mod = mod;
+                e.m41_router = try @import("cuda").grouped.Router.resolve(mod);
+                e.m41_members = try cuda.DeviceBuffer.alloc(e.d, 8 * 4);
+                e.m41_items = try cuda.DeviceBuffer.alloc(e.d, 16 * 3 * 4);
+                e.m41_counts = try cuda.DeviceBuffer.alloc(e.d, 4);
+                e.m41_rank = try cuda.DeviceBuffer.alloc(e.d, 8 * 4);
+                e.m41_hist = try cuda.DeviceBuffer.alloc(e.d, 16 * 4);
+                var imax2: usize = 0;
+                for (w.gate) |gw| imax2 = @max(imax2, gw.n);
+                e.m41_inter_max = imax2;
+                e.m41_out = try cuda.DeviceBuffer.alloc(e.d, 2 * e.c.topk * imax2 * 2);
+                e.m41_act = try cuda.DeviceBuffer.alloc(e.d, e.c.topk * imax2 * 2);
+            }
+            const desc_up = try e.m41DescFor(e.cur_bi, w);
+            const desc_dn = e.m41_layer_descs.?.get(e.cur_bi * 2 + 1).?;
             const p = @import("cuda").grouped.Plan{
                 .members = e.m41_members.ptr,
                 .items = e.m41_items.ptr,
@@ -1279,11 +1199,11 @@ pub const Engine = struct {
             };
             // their .up epi writes swiglu(gate,up) inline: one row per pair at
             // [0..topk) - the down family reads those rows directly
-            try e.m41_xe.?.runMixed(e.stream, .up, .{ .x = e.normed.ptr, .stride = e.c.hidden, .slots = e.c.topk }, l_up, p, e.m41_out.ptr, pairs, -1, e.m41_desc_up.ptr);
+            try e.m41_xe.?.runMixed(e.stream, .up, .{ .x = e.normed.ptr, .stride = e.c.hidden, .slots = e.c.topk }, l_up, p, e.m41_out.ptr, pairs, -1, desc_up);
             var l_dn = l_up;
             l_dn.up = e.m41_down.ptr;
             l_dn.up_scale = e.m41_down_h.ptr;
-            try e.m41_xe.?.runMixed(e.stream, .down_bf16, .{ .x = e.m41_out.ptr, .stride = e.m41_inter_max, .slots = 0 }, l_dn, p, e.moe_ye.ptr, pairs, -1, e.m41_desc_down.ptr);
+            try e.m41_xe.?.runMixed(e.stream, .down_bf16, .{ .x = e.m41_out.ptr, .stride = e.m41_inter_max, .slots = 0 }, l_dn, p, e.moe_ye.ptr, pairs, -1, desc_dn);
             try e.ops.combine(e.stream, e.moe_ys.ptr, e.moe_ye.ptr, e.moe_wts.ptr, e.branch.ptr, rows, e.c.topk, hidden);
             return;
         }

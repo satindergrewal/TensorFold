@@ -17,6 +17,9 @@ const Stream = stream_.Stream;
 /// exl3_experts.cu's TfExl3Experts, passed by value.
 pub const Geometry = extern struct { k: u32, n: u32, bits: u32, tiles_n: u32, mats: u32, epi: u32, book: u32, pad: u32 = 0, stride: u64 };
 
+/// Per-matrix mixed-width descriptor (our fork): full device pointers.
+pub const MatDesc = extern struct { trellis: u64, suh: u64, svh: u64, k: u32, n: u32, tiles_n: u32, bits: u32 };
+
 /// A layer's EXL3 widths and codebook; every expert of a layer shares them (a family stacks its shared ones apart).
 pub const Widths = struct { up: u32 = 0, down: u32 = 0, codebook: exl3.Codebook = .mul1 };
 
@@ -62,12 +65,15 @@ pub const Experts = struct {
     }
 
     /// The geometry of one call: up takes D inputs to NI outputs (gate and up), down NI to D.
+    /// The uniform Matrix.check is SKIPPED for mixed-width layers (our fork): the
+    /// per-expert desc drives k/n/bits/tiles inside the kernel; g here only sets
+    /// the grid bound (n_max) and the epilogue.
     pub fn geometry(epi: experts.Epi, l: experts.Layer) !Geometry {
         const up = epi == .up;
         const k = if (up) l.dims else l.width;
         const n = if (up) l.width else l.dims;
         const bits = if (up) l.exl3.up else l.exl3.down;
-        try (exl3.Matrix{ .trellis = 0, .suh = 0, .svh = 0, .k = k, .n = n, .bits = bits, .codebook = l.exl3.codebook }).check();
+        if (l.exl3.up != 0) try (exl3.Matrix{ .trellis = 0, .suh = 0, .svh = 0, .k = k, .n = n, .bits = bits, .codebook = l.exl3.codebook }).check();
         return .{
             .k = @intCast(k),
             .n = @intCast(n),

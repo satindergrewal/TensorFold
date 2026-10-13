@@ -9,10 +9,12 @@ struct TfExl3Experts {
 };
 
 // MIXED-WIDTH (our fork): per-matrix descriptor; one per expert-matrix, in
-// expert-major order. k/n/bits/tiles per matrix; offsets into the stacks.
+// expert-major order. Full device pointers - no stacks, no repack: each
+// expert's trellis and halves live where the loader put them.
 struct TfExl3Mat {
-  unsigned long long toff;  // trellis byte offset
-  unsigned int hoff;        // halves (suh|svh) offset
+  const unsigned char* trellis;
+  const __half* suh;
+  const __half* svh;
   unsigned int k, n, tiles_n, bits;
 };
 
@@ -121,8 +123,8 @@ __device__ __forceinline__ void tf_exl3x_units(const __nv_bfloat16* X, int x_str
       for (int i = 0; i < 16; ++i) rx[i] = xr[i];
       // the capacity the chunk's rows need: a row's sums are the same at every capacity and on either path
       for (unsigned m = 0; m < g.mats; ++m) {
-        const uint8_t* t = W + md[m].toff;
-        const __half* suh = H + md[m].hoff;
+        const uint8_t* t = reinterpret_cast<const uint8_t*>(md[m].trellis);
+        const __half* suh = md[m].suh;
         float* z = zs + m * 2048;
         if (cb * 128u >= md[m].n) continue; // MIXED: a narrow expert's padded column block
         // MIXED: the per-expert bits pick the specialization (our checkpoint: 6 or 8)
@@ -142,8 +144,8 @@ __device__ __forceinline__ void tf_exl3x_units(const __nv_bfloat16* X, int x_str
       __syncthreads();
       for (unsigned i = sg; i < rows; i += 8) {
         float a[4], b[4];
-        tf_exl3x_out(zs, i, H + md[0].hoff + md[0].k, cb, lane, a);
-        if (g.epi == 2) tf_exl3x_out(zs + 2048, i, H + md[1].hoff + md[1].k, cb, lane, b);
+        tf_exl3x_out(zs, i, md[0].svh, cb, lane, a);
+        if (g.epi == 2) tf_exl3x_out(zs + 2048, i, md[1].svh, cb, lane, b);
         for (int q = 0; q < 4; ++q) {
           const uint64_t o = (uint64_t)pr[i] * g.n + cb * 128 + lane + 32 * q;
           if (g.epi == 0) reinterpret_cast<float*>(out)[o] = a[q];
