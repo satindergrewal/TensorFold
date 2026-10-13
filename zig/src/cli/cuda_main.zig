@@ -279,6 +279,20 @@ fn glmServe(gpa: std.mem.Allocator, init: std.process.Init, rest: []const [:0]co
 
 var engine_mutex: std.Io.Mutex = .init;
 
+// per-request phase timers (ns)
+var t_pa: i128 = 0;
+var t_h: i128 = 0;
+var t_pb: i128 = 0;
+var t_ra: i128 = 0;
+var t_rh: i128 = 0;
+var t_rb: i128 = 0;
+var t_rp: i128 = 0;
+inline fn tnow() i128 {
+    var ts: std.posix.timespec = undefined;
+    _ = std.posix.system.clock_gettime(std.posix.CLOCK.MONOTONIC, &ts);
+    return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
+}
+
 fn handleConn(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engine.Engine, ctx: cuda.Context, ctx1: cuda.Context, fd: posix.socket_t) void {
     defer _ = posix.system.close(fd);
     engine_mutex.lockUncancelable(eng.io);
@@ -445,8 +459,11 @@ fn serveSplit(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engin
         // already brought BOTH engines to the post-prompt state - re-running
         // the prompt double-advances A's KDA state and resetState() zeroes
         // B's restore (the cur=0/fwd=1 signature)
+        const ta0 = tnow();
         try eng.forward(ids_buf[0..n_ids], n_ids, 0);
         try eng.stream.synchronize();
+        const ta1 = tnow();
+        t_pa += ta1 - ta0;
         try eng.x[0].download(0, hb[0..o1]);
         try eng.x[1].download(0, hb[o1..o2]);
         try eng.branch.download(0, hb[o2..o3]);
@@ -464,10 +481,13 @@ fn serveSplit(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engin
         if (lme != 0) try eng_b.mtp_emb.upload(0, hb[o4 + lco .. ot]);
         eng_b.xi = xi_hand;
         eng_b.fwd_count = 0;
+        t_h += tnow() - ta1;
     }
     if (!cache_hit) {
+        const tb0 = tnow();
         try eng_b.forward(ids_buf[0..n_ids], n_ids, 0);
         try eng_b.stream.synchronize();
+        t_pb += tnow() - tb0;
         // snapshot the post-prompt state for the next identical prompt
         try eng_b.snapshotPrefill();
         @memset(pf_cur_b[0..eng_b.kda_st_cur.len], 0);
@@ -530,10 +550,12 @@ fn serveSplit(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engin
                 eng_b.dump_on = true;
                 eng_b.quiet = false;
             }
+            const va0 = tnow();
             try ctx.makeCurrent();
             try eng.backupCs();
             try eng.forward(two[0..2], 2, pos);
             try eng.stream.synchronize();
+            t_ra += tnow() - va0;
             try eng.x[0].downloadAsync(0, hb[0..o1], eng.stream.handle);
             try eng.x[1].downloadAsync(0, hb[o1..o2], eng.stream.handle);
             try eng.branch.downloadAsync(0, hb[o2..o3], eng.stream.handle);
@@ -568,8 +590,10 @@ fn serveSplit(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engin
                 var dirA = std.Io.Dir.cwd();
                 dirA.writeFile(eng.io, .{ .sub_path = fA, .data = ab }) catch {};
             }
+            const vb0 = tnow();
             try eng_b.forward(two[0..2], 2, pos);
             try eng_b.stream.synchronize();
+            t_rb += tnow() - vb0;
             try eng_b.picks.downloadAsync(0, pick[0..8], eng_b.stream.handle);
             if (eng_b.mtp_li != null) try eng_b.mtp_pick.downloadAsync(0, pick[8..12], eng_b.stream.handle);
             try eng_b.stream.synchronize();
@@ -601,9 +625,11 @@ fn serveSplit(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engin
             cur_draft = 0; // the 1-row round regenerates a draft
         }
         one[0] = out_ids[n_out - 1];
+        const oa0 = tnow();
         try ctx.makeCurrent();
         try eng.forward(one[0..1], 1, pos);
         try eng.stream.synchronize();
+        t_ra += tnow() - oa0;
         try eng.x[0].downloadAsync(0, hb[0..o1], eng.stream.handle);
         try eng.x[1].downloadAsync(0, hb[o1..o2], eng.stream.handle);
         try eng.branch.downloadAsync(0, hb[o2..o3], eng.stream.handle);
@@ -611,6 +637,7 @@ fn serveSplit(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engin
         try eng.comb.downloadAsync(0, hb[o4 .. o4 + lco], eng.stream.handle);
         if (lme != 0) try eng.mtp_emb.downloadAsync(0, hb[o4 + lco .. ot], eng.stream.handle);
         try eng.stream.synchronize();
+        const oh0 = tnow();
         const xi2 = eng.xi;
         try ctx1.makeCurrent();
         try eng_b.x[0].uploadAsync(0, hb[0..o1], eng_b.stream.handle);
@@ -619,9 +646,13 @@ fn serveSplit(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engin
         try eng_b.post.uploadAsync(0, hb[o3..o4], eng_b.stream.handle);
         try eng_b.comb.uploadAsync(0, hb[o4 .. o4 + lco], eng_b.stream.handle);
         if (lme != 0) try eng_b.mtp_emb.uploadAsync(0, hb[o4 + lco .. ot], eng_b.stream.handle);
+        t_rh += tnow() - oh0;
         eng_b.xi = xi2;
+        const ob0 = tnow();
         try eng_b.forward(one[0..1], 1, pos);
         try eng_b.stream.synchronize();
+        t_rb += tnow() - ob0;
+        const op0 = tnow();
         try eng_b.picks.downloadAsync(0, pick[0..8], eng_b.stream.handle);
         if (eng_b.mtp_li != null and n_out < draft_ids.len) {
             try eng_b.mtp_pick.downloadAsync(0, pick[8..12], eng_b.stream.handle);
@@ -630,11 +661,12 @@ fn serveSplit(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engin
             cur_draft = pv[2];
         }
         try eng_b.stream.synchronize();
+        t_rp += tnow() - op0;
         out_ids[n_out] = pv[0];
         n_out += 1;
         pos += 1;
     }
-    std.debug.print("glm-serve: accepts {d} rejects {d}\n", .{ accepts, rejects });
+    std.debug.print("glm-serve: accepts {d} rejects {d} | ms: promptA {d:.1} hoff {d:.1} promptB {d:.1} | rounds: A {d:.1} hoff {d:.1} B {d:.1} pick {d:.1}\n", .{ accepts, rejects, @as(f64, @floatFromInt(t_pa)) / 1e6, @as(f64, @floatFromInt(t_h)) / 1e6, @as(f64, @floatFromInt(t_pb)) / 1e6, @as(f64, @floatFromInt(t_ra)) / 1e6, @as(f64, @floatFromInt(t_rh)) / 1e6, @as(f64, @floatFromInt(t_rb)) / 1e6, @as(f64, @floatFromInt(t_rp)) / 1e6 });
     var jbuf: [8192]u8 = undefined;
     var w: usize = 0;
     w += (std.fmt.bufPrint(jbuf[w..], "{{\"tokens\":[", .{}) catch unreachable).len;
