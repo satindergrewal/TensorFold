@@ -164,6 +164,7 @@ pub const Engine = struct {
 
     // #741 mixed path
     m41_on: bool = false,
+    m41_stage_n: u8 = 0,
     m41_rounds: usize = 0,
     m41_up: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
     m41_up_h: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
@@ -1089,8 +1090,18 @@ pub const Engine = struct {
     /// One-time #741 setup: repack the per-expert weights into contiguous
     /// stacks + TfExl3Mat descriptors, load the experts module + plan router.
     fn m41Stage(e: *Engine, tag: []const u8) void {
+        e.m41_stage_n += 1;
+        var nm: [40]u8 = undefined;
+        const f = std.fmt.bufPrint(&nm, "m41s{d}.log", .{e.m41_stage_n}) catch return;
         var dir = std.Io.Dir.cwd();
-        dir.writeFile(e.io, .{ .sub_path = "m41setup.log", .data = tag }) catch {};
+        dir.writeFile(e.io, .{ .sub_path = f, .data = tag }) catch {};
+    }
+
+    fn m41Sizes(e: *Engine, ee: usize, im: usize, ut: usize, uh: usize, dt: usize, dh: usize) void {
+        var line: [160]u8 = undefined;
+        const txt = std.fmt.bufPrint(&line, "E={d} imax={d} up_t={d} up_h={d} dn_t={d} dn_h={d}\n", .{ ee, im, ut, uh, dt, dh }) catch return;
+        var dir = std.Io.Dir.cwd();
+        dir.writeFile(e.io, .{ .sub_path = "m41sizes.log", .data = txt }) catch {};
     }
 
     fn m41Err(e: *Engine, stage: []const u8, err: anyerror) void {
@@ -1128,6 +1139,7 @@ pub const Engine = struct {
             dn_t += @as(usize, dw2.tilesK()) * dw2.tilesN() * dw2.tileWords() * 2;
             dn_h += dw2.k + dw2.n;
         }
+        e.m41Sizes(E, inter_max, up_t, up_h, dn_t, dn_h);
         e.m41_up = try cuda.DeviceBuffer.alloc(e.d, up_t);
         e.m41_up_h = try cuda.DeviceBuffer.alloc(e.d, up_h * 2);
         e.m41_down = try cuda.DeviceBuffer.alloc(e.d, dn_t);
