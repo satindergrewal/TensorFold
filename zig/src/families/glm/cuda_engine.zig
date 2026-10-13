@@ -189,6 +189,20 @@ pub const Engine = struct {
     mtp_pick: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
     mtp_emb: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true }, // bf16 [1, D]: the last token's embedding
     kda_cs_bak: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true }, // spec-decode rollback
+    // prefill cache: snapshots of everything a decode continuation needs
+    pf_on: bool = false,
+    pf_st0: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
+    pf_st1: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
+    pf_cs: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
+    pf_x0: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
+    pf_x1: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
+    pf_branch: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
+    pf_post: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
+    pf_comb: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
+    pf_mla_keys: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
+    pf_mla_ik: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
+    pf_mla_ig: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
+    pf_mla_pool: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, dir: []const u8, opts: Options) !*Engine {
         const e = try gpa.create(Engine);
@@ -1068,6 +1082,77 @@ pub const Engine = struct {
         for (e.kda_st_cur) |*c| c.* = 1 - c.*;
         try e.kda_cs.copyFrom(0, e.kda_cs_bak.ptr, e.kda_cs.len, e.stream.handle);
         try e.stream.synchronize();
+    }
+
+    /// Allocate the prefill snapshot buffers (call once, under this engine's context).
+    pub fn wantPrefillCache(e: *Engine) !void {
+        if (e.pf_on) return;
+        const d = e.d;
+        e.pf_st0 = try cuda.DeviceBuffer.alloc(d, e.kda_st0.len);
+        e.pf_st1 = try cuda.DeviceBuffer.alloc(d, e.kda_st1.len);
+        e.pf_cs = try cuda.DeviceBuffer.alloc(d, e.kda_cs.len);
+        e.pf_x0 = try cuda.DeviceBuffer.alloc(d, e.x[0].len);
+        e.pf_x1 = try cuda.DeviceBuffer.alloc(d, e.x[1].len);
+        e.pf_branch = try cuda.DeviceBuffer.alloc(d, e.branch.len);
+        e.pf_post = try cuda.DeviceBuffer.alloc(d, e.post.len);
+        e.pf_comb = try cuda.DeviceBuffer.alloc(d, e.comb.len);
+        if (e.mla_keys.len != 0) {
+            e.pf_mla_keys = try cuda.DeviceBuffer.alloc(d, e.mla_keys.len);
+            e.pf_mla_ik = try cuda.DeviceBuffer.alloc(d, e.mla_ik.len);
+            e.pf_mla_ig = try cuda.DeviceBuffer.alloc(d, e.mla_ig.len);
+            e.pf_mla_pool = try cuda.DeviceBuffer.alloc(d, e.mla_pool.len);
+        }
+        e.pf_on = true;
+    }
+
+    fn snapCopy(e: *Engine, dst: cuda.DeviceBuffer, src: cuda.DeviceBuffer) !void {
+        if (dst.len == 0 or src.len == 0) return;
+        try dst.copyFrom(0, src.ptr, src.len, e.stream.handle);
+    }
+
+    /// Snapshot the post-prompt state (call after the prompt forward + tail).
+    pub fn snapshotPrefill(e: *Engine) !void {
+        if (!e.pf_on) return;
+        try e.snapCopy(e.pf_st0, e.kda_st0);
+        try e.snapCopy(e.pf_st1, e.kda_st1);
+        try e.snapCopy(e.pf_cs, e.kda_cs);
+        try e.snapCopy(e.pf_x0, e.x[0]);
+        try e.snapCopy(e.pf_x1, e.x[1]);
+        try e.snapCopy(e.pf_branch, e.branch);
+        try e.snapCopy(e.pf_post, e.post);
+        try e.snapCopy(e.pf_comb, e.comb);
+        if (e.mla_keys.len != 0) {
+            try e.snapCopy(e.pf_mla_keys, e.mla_keys);
+            try e.snapCopy(e.pf_mla_ik, e.mla_ik);
+            try e.snapCopy(e.pf_mla_ig, e.mla_ig);
+            try e.snapCopy(e.pf_mla_pool, e.mla_pool);
+        }
+        try e.stream.synchronize();
+    }
+
+    /// Restore the snapshotted post-prompt state (kda parity/xi/fwd_count come
+    /// from the HOST copies the caller saved alongside).
+    pub fn restorePrefill(e: *Engine) !void {
+        if (!e.pf_on) return;
+        try e.snapCopy(e.kda_st0, e.pf_st0);
+        try e.snapCopy(e.kda_st1, e.pf_st1);
+        try e.snapCopy(e.kda_cs, e.pf_cs);
+        try e.snapCopy(e.x[0], e.pf_x0);
+        try e.snapCopy(e.x[1], e.pf_x1);
+        try e.snapCopy(e.branch, e.pf_branch);
+        try e.snapCopy(e.post, e.pf_post);
+        try e.snapCopy(e.comb, e.pf_comb);
+        if (e.mla_keys.len != 0) {
+            try e.snapCopy(e.mla_keys, e.pf_mla_keys);
+            try e.snapCopy(e.mla_ik, e.pf_ik_dst());
+            try e.snapCopy(e.mla_ig, e.pf_mla_ig);
+            try e.snapCopy(e.mla_pool, e.pf_mla_pool);
+        }
+        try e.stream.synchronize();
+    }
+
+    fn pf_ik_dst(e: *Engine) cuda.DeviceBuffer {
+        return .{ .d = e.d, .ptr = e.mla_ik.ptr, .len = e.mla_ik.len, .borrowed = true };
     }
 
     /// One window of `rows` tokens: ids -> picks (argmax) + logits on device.
