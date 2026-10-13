@@ -133,8 +133,8 @@ __device__ __forceinline__ void tf_exl3x_units(const __nv_bfloat16* X, int x_str
           else tf_exl3x_shared<KK, 16>(X, x_stride, rx, rows, t, suh, lg, cb, sg, lane, xs, z); \
         } while (0)
         switch (md[m].bits) {
-          case 6: TF_X3_RUN(6); break;
-          case 8: TF_X3_RUN(8); break;
+          case 3: TF_X3_RUN(3); break; // halves 6 (our K3)
+          case 4: TF_X3_RUN(4); break; // halves 8 (our K4)
           default: TF_X3_RUN(K); break; // uniform fallback (their behavior)
         }
         #undef TF_X3_RUN
