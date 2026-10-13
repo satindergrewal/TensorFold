@@ -1309,11 +1309,9 @@ pub const Engine = struct {
             while (ks < e.c.topk) : (ks += 1) {
                 try e.ops.act(e.stream, e.m41_out.ptr + ks * e.m41_inter_max * 2, e.m41_out.ptr + (e.c.topk + ks) * e.m41_inter_max * 2, e.m41_act.ptr + ks * e.m41_inter_max * 2, 1, 1, e.m41_inter_max, e.c.swiglu_limit);
             }
-            // down: x = act rows [topk, inter_max stride], out = moe_ye rows
+            // down: x = the fused swiglu rows [topk, inter_max stride]
             var l_dn = l_up;
             l_dn.up = e.m41_down.ptr;
-            l_dn.width = e.m41_inter_max;
-            l_dn.down = 0;
             l_dn.up_scale = e.m41_down_h.ptr;
             try e.m41_xe.?.runMixed(e.stream, .down_bf16, .{ .x = e.m41_act.ptr, .stride = e.m41_inter_max, .slots = 0 }, l_dn, p, e.moe_ye.ptr, pairs, -1, e.m41_desc_down.ptr);
             try e.ops.combine(e.stream, e.moe_ys.ptr, e.moe_ye.ptr, e.moe_wts.ptr, e.branch.ptr, rows, e.c.topk, hidden);
