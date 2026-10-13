@@ -122,6 +122,8 @@ pub const Experts = struct {
 
 comptime {
     std.debug.assert(@sizeOf(Geometry) == 40);
+    // CUDA TfExl3Mat: 3 pointers (8B each) then 4 u32 = 32B; field order must match
+    std.debug.assert(@sizeOf(MatDesc) == 40); // 3 ptrs + 4 u32, 8-align
 }
 
 test "an EXL3 layer's geometry follows the epilogue, and a shape exl3.cu cannot take is refused" {

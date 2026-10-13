@@ -127,6 +127,7 @@ __device__ __forceinline__ void tf_exl3x_units(const __nv_bfloat16* X, int x_str
         const __half* suh = md[m].suh;
         float* z = zs + m * 2048;
         if (cb * 128u >= md[m].n) continue; // MIXED: a narrow expert's padded column block
+        if (md[m].bits != 3 && md[m].bits != 4) return; // trap: bad desc
         // MIXED: the per-expert bits pick the specialization (our checkpoint: 6 or 8)
         #define TF_X3_RUN(KK) do { \
           TfExl3Experts lg = g; lg.bits = md[m].bits; lg.tiles_n = md[m].tiles_n; lg.k = md[m].k; lg.n = md[m].n; \
