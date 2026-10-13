@@ -392,37 +392,100 @@ fn serveSplit(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engin
     out_ids[0] = pv[n_ids - 1];
     n_out = 1;
     var one: [1]u32 = .{0};
+    var two: [2]u32 = .{ 0, 0 };
+    const have_draft = eng_b.mtp_li != null;
+    var cur_draft: u32 = if (have_draft) draft_ids[0] else 0;
+    var accepts: usize = 0;
+    var rejects: usize = 0;
+    // the handoff rides the ENGINE streams: null-stream copies are unordered
+    // against the engines' non-blocking streams (the ids-race bug class)
     while (n_out < max_tokens and n_out < out_ids.len and pos < 4000) {
+        if (have_draft and cur_draft != 0) {
+            // verify round: [last_pick, draft] - accept banks 2 tokens
+            two[0] = out_ids[n_out - 1];
+            two[1] = cur_draft;
+            try ctx.makeCurrent();
+            try eng.backupCs();
+            try eng.forward(two[0..2], 2, pos);
+            try eng.stream.synchronize();
+            try eng.x[0].downloadAsync(0, hb[0..o1], eng.stream.handle);
+            try eng.x[1].downloadAsync(0, hb[o1..o2], eng.stream.handle);
+            try eng.branch.downloadAsync(0, hb[o2..o3], eng.stream.handle);
+            try eng.post.downloadAsync(0, hb[o3..o4], eng.stream.handle);
+            try eng.comb.downloadAsync(0, hb[o4 .. o4 + lco], eng.stream.handle);
+            if (lme != 0) try eng.mtp_emb.downloadAsync(0, hb[o4 + lco .. ot], eng.stream.handle);
+            try eng.stream.synchronize();
+            const xi_v = eng.xi;
+            try ctx1.makeCurrent();
+            try eng_b.backupCs();
+            try eng_b.x[0].uploadAsync(0, hb[0..o1], eng_b.stream.handle);
+            try eng_b.x[1].uploadAsync(0, hb[o1..o2], eng_b.stream.handle);
+            try eng_b.branch.uploadAsync(0, hb[o2..o3], eng_b.stream.handle);
+            try eng_b.post.uploadAsync(0, hb[o3..o4], eng_b.stream.handle);
+            try eng_b.comb.uploadAsync(0, hb[o4 .. o4 + lco], eng_b.stream.handle);
+            if (lme != 0) try eng_b.mtp_emb.uploadAsync(0, hb[o4 + lco .. ot], eng_b.stream.handle);
+            eng_b.xi = xi_v;
+            try eng_b.forward(two[0..2], 2, pos);
+            try eng_b.stream.synchronize();
+            try eng_b.picks.downloadAsync(0, pick[0..8], eng_b.stream.handle);
+            if (eng_b.mtp_li != null) try eng_b.mtp_pick.downloadAsync(0, pick[8..12], eng_b.stream.handle);
+            try eng_b.stream.synchronize();
+            if (pv[0] == cur_draft) {
+                accepts += 1;
+                if (n_out < out_ids.len) {
+                    out_ids[n_out] = cur_draft;
+                    n_out += 1;
+                }
+                if (n_out < max_tokens and n_out < out_ids.len) {
+                    out_ids[n_out] = pv[1];
+                    n_out += 1;
+                }
+                cur_draft = pv[2];
+                pos += 2;
+                continue;
+            }
+            rejects += 1;
+            try ctx.makeCurrent();
+            try eng.rollbackRound();
+            try ctx1.makeCurrent();
+            try eng_b.rollbackRound();
+            cur_draft = 0; // the 1-row round regenerates a draft
+        }
         one[0] = out_ids[n_out - 1];
         try ctx.makeCurrent();
         try eng.forward(one[0..1], 1, pos);
         try eng.stream.synchronize();
-        try eng.x[0].download(0, hb[0..o1]);
-        try eng.x[1].download(0, hb[o1..o2]);
-        try eng.branch.download(0, hb[o2..o3]);
-        try eng.post.download(0, hb[o3..o4]);
-        try eng.comb.download(0, hb[o4 .. o4 + lco]);
-        if (lme != 0) try eng.mtp_emb.download(0, hb[o4 + lco .. ot]);
+        try eng.x[0].downloadAsync(0, hb[0..o1], eng.stream.handle);
+        try eng.x[1].downloadAsync(0, hb[o1..o2], eng.stream.handle);
+        try eng.branch.downloadAsync(0, hb[o2..o3], eng.stream.handle);
+        try eng.post.downloadAsync(0, hb[o3..o4], eng.stream.handle);
+        try eng.comb.downloadAsync(0, hb[o4 .. o4 + lco], eng.stream.handle);
+        if (lme != 0) try eng.mtp_emb.downloadAsync(0, hb[o4 + lco .. ot], eng.stream.handle);
+        try eng.stream.synchronize();
         const xi2 = eng.xi;
         try ctx1.makeCurrent();
-        try eng_b.x[0].upload(0, hb[0..o1]);
-        try eng_b.x[1].upload(0, hb[o1..o2]);
-        try eng_b.branch.upload(0, hb[o2..o3]);
-        try eng_b.post.upload(0, hb[o3..o4]);
-        try eng_b.comb.upload(0, hb[o4 .. o4 + lco]);
-        if (lme != 0) try eng_b.mtp_emb.upload(0, hb[o4 + lco .. ot]);
+        try eng_b.x[0].uploadAsync(0, hb[0..o1], eng_b.stream.handle);
+        try eng_b.x[1].uploadAsync(0, hb[o1..o2], eng_b.stream.handle);
+        try eng_b.branch.uploadAsync(0, hb[o2..o3], eng_b.stream.handle);
+        try eng_b.post.uploadAsync(0, hb[o3..o4], eng_b.stream.handle);
+        try eng_b.comb.uploadAsync(0, hb[o4 .. o4 + lco], eng_b.stream.handle);
+        if (lme != 0) try eng_b.mtp_emb.uploadAsync(0, hb[o4 + lco .. ot], eng_b.stream.handle);
         eng_b.xi = xi2;
         try eng_b.forward(one[0..1], 1, pos);
         try eng_b.stream.synchronize();
-        try eng_b.picks.download(0, pick[0..8]);
+        try eng_b.picks.downloadAsync(0, pick[0..8], eng_b.stream.handle);
         if (eng_b.mtp_li != null and n_out < draft_ids.len) {
-            try eng_b.mtp_pick.download(0, pick[8..12]);
+            try eng_b.mtp_pick.downloadAsync(0, pick[8..12], eng_b.stream.handle);
+            try eng_b.stream.synchronize();
             draft_ids[n_out - 1] = pv[2];
+            cur_draft = pv[2];
         }
+        try eng_b.stream.synchronize();
         out_ids[n_out] = pv[0];
         n_out += 1;
         pos += 1;
     }
+    std.debug.print("glm-serve: accepts {d} rejects {d}\n", .{ accepts, rejects });
     var jbuf: [8192]u8 = undefined;
     var w: usize = 0;
     w += (std.fmt.bufPrint(jbuf[w..], "{{\"tokens\":[", .{}) catch unreachable).len;
