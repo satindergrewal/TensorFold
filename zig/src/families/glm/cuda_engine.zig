@@ -1151,15 +1151,11 @@ pub const Engine = struct {
         try e.snapCopy(e.y, e.pf_y);
         if (e.mla_keys.len != 0) {
             try e.snapCopy(e.mla_keys, e.pf_mla_keys);
-            try e.snapCopy(e.mla_ik, e.pf_ik_dst());
+            try e.snapCopy(e.mla_ik, e.pf_mla_ik);
             try e.snapCopy(e.mla_ig, e.pf_mla_ig);
             try e.snapCopy(e.mla_pool, e.pf_mla_pool);
         }
         try e.stream.synchronize();
-    }
-
-    fn pf_ik_dst(e: *Engine) cuda.DeviceBuffer {
-        return .{ .d = e.d, .ptr = e.mla_ik.ptr, .len = e.mla_ik.len, .borrowed = true };
     }
 
     /// One window of `rows` tokens: ids -> picks (argmax) + logits on device.

@@ -291,10 +291,12 @@ var req_counter: u32 = 0;
 
 fn dumpPfState(tag: []const u8, eng: *glm.engine.Engine, gpa: std.mem.Allocator) void {
     const pairs = .{
-        .{ "x0", eng.x[0] },     .{ "x1", eng.x[1] },
-        .{ "br", eng.branch },   .{ "post", eng.post },
-        .{ "comb", eng.comb },   .{ "st0", eng.pf_st0 },
-        .{ "st1", eng.pf_st1 },  .{ "cs", eng.pf_cs },
+        .{ "x0", eng.x[0] },      .{ "x1", eng.x[1] },
+        .{ "br", eng.branch },    .{ "post", eng.post },
+        .{ "comb", eng.comb },    .{ "st0", eng.kda_st0 },
+        .{ "st1", eng.kda_st1 },  .{ "cs", eng.kda_cs },
+        .{ "mk", eng.mla_keys },  .{ "mik", eng.mla_ik },
+        .{ "mig", eng.mla_ig },   .{ "mpool", eng.mla_pool },
     };
     inline for (pairs) |pr| {
         const buf = pr[1];
