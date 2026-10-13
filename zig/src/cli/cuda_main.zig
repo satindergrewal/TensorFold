@@ -287,6 +287,7 @@ fn glmServe(gpa: std.mem.Allocator, init: std.process.Init, rest: []const [:0]co
 /// decode rows alternate A -> handoff -> B -> handoff... (the split-decode
 /// test's pattern, folded into the server).
 var pf_dump = false; // --dump-pf: dump state at cold-snapshot and warm-restore
+var req_counter: u32 = 0;
 
 fn dumpPfState(tag: []const u8, eng: *glm.engine.Engine, gpa: std.mem.Allocator) void {
     const pairs = .{
@@ -330,6 +331,9 @@ fn hashIds(ids: []const u32) u64 {
 }
 
 fn serveSplit(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engine.Engine, ctx: cuda.Context, ctx1: cuda.Context, fd: posix.socket_t) !void {
+    req_counter += 1;
+    eng_b.mtp_tag = req_counter;
+    eng_b.mtp_calls = 0;
     var buf: [1 << 16]u8 = undefined;
     var n: usize = 0;
     while (n < buf.len) {
@@ -487,6 +491,7 @@ fn serveSplit(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engin
     } else {
         draft_ids[0] = pf_draft0;
     }
+    eng_b.mtp_dump_nth = if (cache_hit) 1 else 2; // the round-1 draft (cold: prompt draft is call 1)
     var pos: usize = n_ids;
     var out_ids: [512]u32 = @splat(0);
 

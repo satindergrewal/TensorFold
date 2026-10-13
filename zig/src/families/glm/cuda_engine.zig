@@ -204,6 +204,9 @@ pub const Engine = struct {
     pf_mla_ig: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
     pf_mla_pool: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
     pf_y: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true }, // the tail stream-mean: the MTP draft's h input
+    mtp_dump_nth: usize = 0, // probe: dump the Nth mtpDraft call (0 = off)
+    mtp_calls: usize = 0, // probe: mtpDraft call counter within the request
+    mtp_tag: u32 = 0, // probe: filename tag (request counter)
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, dir: []const u8, opts: Options) !*Engine {
         const e = try gpa.create(Engine);
@@ -1385,9 +1388,25 @@ pub const Engine = struct {
     /// The MTP draft head over the window's LAST row: enorm(embed(next)) | hnorm(h),
     /// eh_proj, a plain MLA + MoE block (own cache plane), shared_head norm, the
     /// shared lm_head. Leaves the draft pick in mtp_pick.
+    fn mtpDump1(e: *Engine, what: []const u8, ptr: u64, n: usize) void {
+        if (e.mtp_dump_nth == 0 or e.mtp_calls != e.mtp_dump_nth) return;
+        const b = e.gpa.alloc(u8, n) catch return;
+        defer e.gpa.free(b);
+        (cuda.DeviceBuffer{ .d = e.d, .ptr = ptr, .len = n, .borrowed = true }).download(0, b) catch return;
+        var nm: [48]u8 = undefined;
+        const f = std.fmt.bufPrint(&nm, "/tmp/m1_{d}_{s}.bin", .{ e.mtp_tag, what }) catch return;
+        var dir = std.Io.Dir.cwd();
+        dir.writeFile(e.io, .{ .sub_path = f, .data = b }) catch {};
+    }
+
     fn mtpDraft(e: *Engine, rows: usize, pos: usize) !void {
         const D = e.c.hidden;
         const L = &e.w.layers[e.mtp_li.?];
+        e.mtp_calls += 1;
+        e.mtpDump1("emb", e.mtp_emb.ptr, D * 2);
+        e.mtpDump1("yin", e.y.ptr + (rows - 1) * D * 2, D * 2);
+        const plane_rows = 20;
+        e.mtpDump1("plane", e.mla_keys.ptr + @as(usize, e.mtp_mi) * e.context * e.c.kv_lora * 2, plane_rows * e.c.kv_lora * 2);
         try e.ops.rms(e.stream, e.mtp_emb.ptr, L.enorm, e.mtp_eh.ptr, 1, D, D, 2 * D, e.c.eps);
         try e.ops.rms(e.stream, e.y.ptr + (rows - 1) * D * 2, L.hnorm, e.mtp_eh.ptr + D * 2, 1, D, D, 2 * D, e.c.eps);
         try e.g.mm(e.stream, e.mtp_eh.ptr, L.eh_proj, e.mtp_x.ptr, 1, D, 2 * D, false);
@@ -1400,6 +1419,13 @@ pub const Engine = struct {
         try e.ops.rms(e.stream, e.mtp_x.ptr, L.shared_head_norm, e.normed.ptr, 1, D, D, D, e.c.eps);
         try e.g.mm(e.stream, e.normed.ptr, e.w.head, e.logits.ptr, e.rows_max, e.c.vocab, D, false);
         try e.ops.argmax(e.stream, e.logits.ptr, e.mtp_pick.ptr, 1, e.c.vocab);
+        if (e.mtp_dump_nth != 0 and e.mtp_calls == e.mtp_dump_nth) {
+            try e.stream.synchronize();
+            e.mtpDump1("eh", e.mtp_eh.ptr, 2 * D * 2);
+            e.mtpDump1("mx", e.mtp_x.ptr, D * 2);
+            e.mtpDump1("normed", e.normed.ptr, D * 2);
+            e.mtpDump1("pick", e.mtp_pick.ptr, 4);
+        }
     }
 
     pub fn deinit(e: *Engine) void {
