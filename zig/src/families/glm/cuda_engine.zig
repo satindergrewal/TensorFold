@@ -1304,7 +1304,7 @@ pub const Engine = struct {
                 }
                 var dir = std.Io.Dir.cwd();
                 var fn2: [48]u8 = undefined;
-                const fname = std.fmt.bufPrint(&fn2, "/tmp/m41r{d}.log", .{e.m41_rounds}) catch return;
+                const fname = std.fmt.bufPrint(&fn2, "m41r{d}.log", .{e.m41_rounds}) catch return; // RELATIVE: the pb-dump pattern
                 var line2: [420]u8 = undefined;
                 // probe 2: the plan state (counts + first item) and probe 3: which engine
                 var extra: [128]u8 = undefined;
