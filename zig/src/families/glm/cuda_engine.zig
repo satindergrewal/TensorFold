@@ -150,6 +150,8 @@ pub const Engine = struct {
     eps_buf: cuda.DeviceBuffer,
     fn_zero: cuda.DeviceBuffer,
     moe_pick: cuda.DeviceBuffer,
+    moe_pick_hb: cuda.HostBuffer = undefined,
+    moe_pick_h: []u8 = &.{},
     moe_wts: cuda.DeviceBuffer,
     moe_logits: cuda.DeviceBuffer,
     moe_ys: cuda.DeviceBuffer,
@@ -1064,11 +1066,13 @@ pub const Engine = struct {
         try e.g.mm(e.stream, e.normed.ptr, w.shared_up, e.mlp_tmp.ptr + rows * inter * 2, rows, inter, hidden, false);
         try e.ops.act(e.stream, e.mlp_tmp.ptr, e.mlp_tmp.ptr + rows * inter * 2, e.mlp_act.ptr, rows, 1, inter, e.c.swiglu_limit);
         try e.g.mm(e.stream, e.mlp_act.ptr, w.shared_down, e.moe_ys.ptr, rows, hidden, inter, false);
-        // the picks on host drive the per-slot expert calls
-        var pick_bytes = try cuda.HostBuffer.alloc(e.d, rows * e.c.topk * 4);
-        defer pick_bytes.free();
-        const pick_host = try e.gpa.alloc(u8, rows * e.c.topk * 4);
-        defer e.gpa.free(pick_host);
+        // the picks on host drive the per-slot expert calls (staging allocated
+        // once at init: a pinned alloc+free per block costs ~ms each)
+        if (e.moe_pick_h.len == 0) {
+            e.moe_pick_hb = try cuda.HostBuffer.alloc(e.d, e.rows_max * e.c.topk * 4);
+            e.moe_pick_h = try e.gpa.alloc(u8, e.rows_max * e.c.topk * 4);
+        }
+        const pick_host = e.moe_pick_h[0 .. rows * e.c.topk * 4];
         try e.moe_pick.downloadAsync(0, pick_host, e.stream.handle);
         try e.stream.synchronize();
         const picks = std.mem.bytesAsSlice(i32, @as([]align(1) u8, pick_host));
