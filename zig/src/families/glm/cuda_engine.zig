@@ -1088,7 +1088,13 @@ pub const Engine = struct {
 
     /// One-time #741 setup: repack the per-expert weights into contiguous
     /// stacks + TfExl3Mat descriptors, load the experts module + plan router.
+    fn m41Stage(e: *Engine, tag: []const u8) void {
+        var dir = std.Io.Dir.cwd();
+        dir.writeFile(e.io, .{ .sub_path = "m41setup.log", .data = tag }) catch {};
+    }
+
     fn m41Setup(e: *Engine, w: *const weights.Moe) !void {
+        e.m41Stage("start ");
         const E = w.gate.len;
         var inter_max: usize = 0;
         for (w.gate) |gw| inter_max = @max(inter_max, gw.n);
@@ -1120,6 +1126,7 @@ pub const Engine = struct {
         e.m41_out = try cuda.DeviceBuffer.alloc(e.d, 2 * e.c.topk * inter_max * 2);
         e.m41_act = try cuda.DeviceBuffer.alloc(e.d, e.c.topk * inter_max * 2);
         e.m41_xe = try @import("cuda").exl3_experts.Experts.load(e.d, 148);
+        e.m41Stage("allocs ");
         // router from the experts module: grouped.Router.resolve needs the experts
         // fatbin module - Experts doesn't expose it; load a second module instance
         {
@@ -1181,11 +1188,13 @@ pub const Engine = struct {
             dn_off += tb;
             dnh_off += dw3.k + dw3.n;
         }
+        e.m41Stage("repack ");
         try e.stream.synchronize();
         try e.m41_desc_up.upload(0, du);
         try e.m41_desc_down.upload(0, dd);
         try e.stream.synchronize();
         e.m41_on = true;
+        e.m41Stage("on\n");
         std.debug.print("m41: setup done E={d} inter_max={d}\n", .{ E, inter_max });
     }
 
@@ -1309,7 +1318,7 @@ pub const Engine = struct {
                 // probe 2: the plan state (counts + first item) and probe 3: which engine
                 var extra: [128]u8 = undefined;
                 var ew: usize = 0;
-                {
+                if (e.m41_counts.len != 0) {
                     var cb4: [16]u8 = undefined;
                     try (c2.DeviceBuffer{ .d = e.d, .ptr = e.m41_counts.ptr, .len = 4, .borrowed = true }).download(0, cb4[0..4]);
                     var ib4: [12]u8 = undefined;
