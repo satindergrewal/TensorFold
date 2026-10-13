@@ -164,7 +164,6 @@ pub const Engine = struct {
     moe_grouped: bool = false,
     // #741 mixed path
     m41_on: bool = false,
-    m41_rounds: usize = 0,
     m41_up: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
     m41_up_h: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
     m41_down: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
@@ -1084,37 +1083,6 @@ pub const Engine = struct {
         try e.ops.scaleBy(e.stream, e.mla_iw.ptr, e.mla_iw.ptr, rows * e.c.i_heads, 1.0 / @sqrt(@as(f32, @floatFromInt(e.c.i_heads)))); // sparse.py wscale
     }
 
-    fn m41_dbg(e: *Engine, buf: u64, width: usize, stage: u32) void {
-        e.m41_rounds += 1;
-        if (e.m41_rounds > 24) return; // instrument the first rounds only
-        var b: [16]u8 = undefined;
-        var sums: [8]f32 = @splat(0);
-        var any_zero: usize = 0;
-        const c2 = @import("cuda");
-        var ok = true;
-        for (0..8) |r| {
-            (c2.DeviceBuffer{ .d = e.d, .ptr = buf + r * width * 2, .len = 16, .borrowed = true }).download(0, b[0..16]) catch {
-                ok = false;
-                break;
-            };
-            const fv = std.mem.bytesAsSlice(f32, @as([]align(1) u8, b[0..16]));
-            _ = fv;
-            // bf16 sums from the first 16 elements
-            const hv = std.mem.bytesAsSlice(u16, @as([]align(1) u8, b[0..16]));
-            var acc: f32 = 0;
-            for (hv) |h| acc += @as(f32, @bitCast(@as(u32, h) << 16));
-            sums[r] = acc;
-            if (acc == 0) any_zero += 1;
-        }
-        if (ok) {
-            // file-based: engine debug.print is swallowed in the server
-            var line: [256]u8 = undefined;
-            const txt = std.fmt.bufPrint(&line, "r{d} s{d}: {d:.3} {d:.3} {d:.3} {d:.3} {d:.3} {d:.3} {d:.3} {d:.3} z={d}\n", .{ e.m41_rounds, stage, sums[0], sums[1], sums[2], sums[3], sums[4], sums[5], sums[6], sums[7], any_zero }) catch return;
-            var dir = std.Io.Dir.cwd();
-            dir.writeFile(e.io, .{ .sub_path = "/tmp/m41dbg.log", .data = txt }) catch {};
-        }
-    }
-
     const MatDesc = extern struct { toff: u64, hoff: u32, k: u32, n: u32, tiles_n: u32, bits: u32 };
 
     /// One-time #741 setup: repack the per-expert weights into contiguous
@@ -1338,12 +1306,10 @@ pub const Engine = struct {
             // their .up epi writes swiglu(gate,up) inline: one row per pair at
             // [0..topk) - the down family reads those rows directly
             try e.m41_xe.?.runMixed(e.stream, .up, .{ .x = e.normed.ptr, .stride = e.c.hidden, .slots = e.c.topk }, l_up, p, e.m41_out.ptr, pairs, -1, e.m41_desc_up.ptr);
-            e.m41_dbg(e.m41_out.ptr, e.m41_inter_max, 0);
             var l_dn = l_up;
             l_dn.up = e.m41_down.ptr;
             l_dn.up_scale = e.m41_down_h.ptr;
             try e.m41_xe.?.runMixed(e.stream, .down_bf16, .{ .x = e.m41_out.ptr, .stride = e.m41_inter_max, .slots = 0 }, l_dn, p, e.moe_ye.ptr, pairs, -1, e.m41_desc_down.ptr);
-            e.m41_dbg(e.moe_ye.ptr, hidden, 1);
             try e.ops.combine(e.stream, e.moe_ys.ptr, e.moe_ye.ptr, e.moe_wts.ptr, e.branch.ptr, rows, e.c.topk, hidden);
             return;
         }

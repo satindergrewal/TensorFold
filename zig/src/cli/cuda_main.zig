@@ -237,6 +237,7 @@ fn glmServe(gpa: std.mem.Allocator, init: std.process.Init, rest: []const [:0]co
         if (std.mem.eql(u8, a, "--no-mpad")) glm.engine.mpad_on = false;
         if (std.mem.eql(u8, a, "--op-time")) glm.engine.Engine.op_timing = true;
         if (std.mem.eql(u8, a, "--group-stage-1")) glm.engine.group_stage = 1;
+        if (std.mem.eql(u8, a, "--group-stage-2")) glm.engine.group_stage = 2;
     }
     try ctx.makeCurrent();
     try eng.wantPrefillCache();
