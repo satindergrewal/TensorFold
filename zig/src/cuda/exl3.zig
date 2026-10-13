@@ -43,6 +43,8 @@ pub const symbols = struct {
     pub const matmul = "_ZN14tf_exl3_kernel18exl3_decode_matmulEPK13__nv_bfloat16PKsPS0_iiiiii";
     pub const verify = "_ZN14tf_exl3_kernel18exl3_verify_decodeEPKsiP13__nv_bfloat16";
     pub const grouped_project = "exl3_grouped_project";
+    pub const grouped_pre = "exl3_grouped_pre_rot";
+    pub const grouped_post = "exl3_grouped_post_rot";
 };
 
 fn i(x: usize) c_int {
@@ -61,6 +63,8 @@ pub const Kernels = struct {
     mm_fn: module.Function,
     verify_fn: module.Function,
     grouped_fn: module.Function,
+    grouped_pre_fn: module.Function,
+    grouped_post_fn: module.Function,
     desc_table: u64 = 0, // [experts] Exl3Desc; 288 x 48B = ~14KB
     desc_tbl_own: memory.DeviceBuffer = undefined,
     scratch: memory.DeviceBuffer, // x_tilde [chunk_rows, k_max] bf16
@@ -81,6 +85,8 @@ pub const Kernels = struct {
             .mm_fn = undefined,
             .verify_fn = undefined,
             .grouped_fn = undefined,
+            .grouped_pre_fn = undefined,
+            .grouped_post_fn = undefined,
             .scratch = undefined,
         };
         errdefer k.scratch.free();
@@ -89,6 +95,8 @@ pub const Kernels = struct {
         k.mm_fn = try mod.function(symbols.matmul);
         k.verify_fn = try mod.function(symbols.verify);
         k.grouped_fn = try mod.function(symbols.grouped_project);
+        k.grouped_pre_fn = try mod.function(symbols.grouped_pre);
+        k.grouped_post_fn = try mod.function(symbols.grouped_post);
         k.scratch = try memory.DeviceBuffer.alloc(d, chunk_rows * k_max * 2);
         const tbl = try memory.DeviceBuffer.alloc(d, 512 * @sizeOf(Desc));
         k.desc_table = tbl.ptr;
@@ -154,9 +162,10 @@ pub const Kernels = struct {
 
     /// Upload the per-expert descriptor table once (weights are static post-load).
     pub fn tableFrom(k: *const Kernels, s: Stream, ws: []const Weight) !u64 {
+        _ = s;
         const n = ws.len;
         if (k.desc_table == 0) return error.NoTable;
-        const host = std.heap.page_allocator.alloc(u8, n * @sizeOf(Desc)) catch return error.OutOfMemory;
+        const host = try std.heap.page_allocator.alloc(u8, n * @sizeOf(Desc));
         defer std.heap.page_allocator.free(host);
         const ds: [*]Desc = @ptrCast(@alignCast(host.ptr));
         for (ws, 0..) |w, di| {
@@ -171,9 +180,7 @@ pub const Kernels = struct {
                 .halves = @intCast(w.halves),
             };
         }
-        const db = memory.DeviceBuffer{ .d = k.d, .ptr = k.desc_table, .len = n * @sizeOf(Desc), .borrowed = true };
-        try db.upload(0, host);
-        _ = s;
+        try k.desc_tbl_own.upload(0, host[0 .. n * @sizeOf(Desc)]);
         return k.desc_table;
     }
 
@@ -187,6 +194,29 @@ pub const Kernels = struct {
         a.add(y);
         a.add(i(topk));
         try launch_.launch(k.grouped_fn, .{ .grid = .{ .x = u(tiles_n_max), .y = u(topk) }, .block = .{ .x = 128 } }, s, &a);
+    }
+
+    /// pre-rot + grouped matmul + post-rot for one weight family; x is the
+    /// [1, k] row, y lands at [topk, n]. xt = per-slot scratch [topk, k_max].
+    pub fn projectGroupedFull(k: *const Kernels, s: Stream, x: u64, table: u64, picks: u64, xt: u64, y: u64, topk: usize, k_blocks: usize, tiles_n_max: usize) !void {
+        {
+            var a: launch_.Args = .{};
+            a.add(x);
+            a.add(table);
+            a.add(picks);
+            a.add(xt);
+            a.add(i(topk));
+            try launch_.launch(k.grouped_pre_fn, .{ .grid = .{ .x = u(k_blocks), .y = u(topk) }, .block = .{ .x = 128 } }, s, &a);
+        }
+        try k.projectGrouped(s, xt, table, picks, y, topk, tiles_n_max);
+        {
+            var a: launch_.Args = .{};
+            a.add(y);
+            a.add(table);
+            a.add(picks);
+            a.add(i(topk));
+            try launch_.launch(k.grouped_post_fn, .{ .grid = .{ .x = u(tiles_n_max), .y = u(topk) }, .block = .{ .x = 128 } }, s, &a);
+        }
     }
 
     pub fn project(k: *const Kernels, s: Stream, x: u64, w: Weight, y: u64, rows: usize) !void {

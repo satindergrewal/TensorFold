@@ -152,6 +152,18 @@ pub const Engine = struct {
     moe_pick: cuda.DeviceBuffer,
     moe_pick_hb: cuda.HostBuffer = undefined,
     moe_pick_h: []u8 = &.{},
+    // grouped-expert path (rows==1): per-slot outputs + tables per family
+    moe_xt: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true }, // [topk, k_max]
+    moe_yg: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true }, // [topk, inter_max]
+    moe_yu: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
+    moe_tbl_gate: u64 = 0,
+    moe_tbl_up: u64 = 0,
+    moe_tbl_down: u64 = 0,
+    moe_grouped: bool = false,
+    moe_k_blocks: usize = 0,
+    moe_tn_i: usize = 0,
+    moe_tn_h: usize = 0,
+    moe_inter_max: usize = 0,
     moe_wts: cuda.DeviceBuffer,
     moe_logits: cuda.DeviceBuffer,
     moe_ys: cuda.DeviceBuffer,

@@ -231,6 +231,53 @@ struct Exl3Desc {
     int k, n, tiles_k, tiles_n, halves;
 };
 
+extern "C" __global__ void exl3_grouped_pre_rot(
+    const __nv_bfloat16* __restrict__ x,  // [1, k] the row
+    const Exl3Desc* __restrict__ descs,   // [experts]
+    const int* __restrict__ picks,        // [topk]
+    __nv_bfloat16* __restrict__ xt,       // [topk, k] per-slot x-tilde
+    int topk
+) {
+    const int slot = blockIdx.y;
+    if (picks[slot] < 0) return;
+    const Exl3Desc d = descs[picks[slot]];
+    const int base = blockIdx.x * 128;
+    const int t = threadIdx.x;
+    const int k = d.k;
+    __shared__ float s_v[128];
+    float v = __bfloat162float(x[base + t]);
+    v *= __half2float(__ushort_as_half(__ldg((const uint16_t*)d.suh + base + t)));
+    s_v[t] = v;
+    __syncthreads();
+    float sum = 0.0f;
+    #pragma unroll 8
+    for (int i = 0; i < 128; ++i) sum += had_entry(t, i) * s_v[i];
+    xt[(size_t)slot * k + base + t] = __float2bfloat16(sum);
+}
+
+extern "C" __global__ void exl3_grouped_post_rot(
+    __nv_bfloat16* __restrict__ y,        // [topk, n] in/out
+    const Exl3Desc* __restrict__ descs,
+    const int* __restrict__ picks,
+    int topk
+) {
+    const int slot = blockIdx.y;
+    if (picks[slot] < 0) return;
+    const Exl3Desc d = descs[picks[slot]];
+    const int base = blockIdx.x * 128;
+    const int t = threadIdx.x;
+    const int n = d.n;
+    __shared__ float s_v[128];
+    float v = __bfloat162float(__ldg(y + (size_t)slot * n + base + t));
+    v *= __half2float(__ushort_as_half(__ldg((const uint16_t*)d.svh + base + t)));
+    s_v[t] = v;
+    __syncthreads();
+    float sum = 0.0f;
+    #pragma unroll 8
+    for (int i = 0; i < 128; ++i) sum += had_entry(t, i) * s_v[i];
+    y[(size_t)slot * n + base + t] = __float2bfloat16(sum);
+}
+
 extern "C" __global__ void exl3_grouped_project(
     const __nv_bfloat16* __restrict__ x,   // [1, k] one row
     const Exl3Desc* __restrict__ descs,    // [experts]
@@ -259,7 +306,7 @@ extern "C" __global__ void exl3_grouped_project(
             Placement pl = tile_placement(p);
             s_w[pl.row][pl.col] = codebook_value_mcg(tile_state(w, tile, p));
         }
-        if (tid < TILE) s_x[0][tid] = __bfloat162float(x[tk * TILE + tid]);
+        if (tid < TILE) s_x[0][tid] = __bfloat162float(x[(size_t)slot * d.k + tk * TILE + tid]);
         __syncthreads();
         if (my >= 0) {
             #pragma unroll
