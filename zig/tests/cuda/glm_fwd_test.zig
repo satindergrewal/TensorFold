@@ -354,6 +354,15 @@ fn runSplit(gpu: Gpu, dir: []const u8, split_at: usize, nm: usize) !void {
     try eb.stream.synchronize();
     const snapA1 = try a.alloc(f64, 46);
     const snapB1 = try a.alloc(f64, 46);
+    {
+        var lbuf: [512]u8 = undefined;
+        var lw: usize = 0;
+        for (0..@min(nm, 46)) |bi| {
+            const pr = std.fmt.bufPrint(lbuf[lw..], "{d}|{d}={d:.4} ", .{ bi, bi + 22, sumsW[bi] }) catch break;
+            lw += pr.len;
+        }
+        std.debug.print("  OURSUMS post-fix: {s}\n", .{lbuf[0..lw]});
+    }
     @memcpy(snapA1, sumsW);
     @memcpy(snapB1, sumsWb);
     const lg = try check.download(gpu, eb.logits);
