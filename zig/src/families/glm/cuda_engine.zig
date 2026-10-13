@@ -1303,17 +1303,13 @@ pub const Engine = struct {
                 .experts = w.gate.len,
                 .limit = e.c.swiglu_limit,
             };
+            // their .up epi writes swiglu(gate,up) inline: one row per pair at
+            // [0..topk) - the down family reads those rows directly
             try e.m41_xe.?.runMixed(e.stream, .up, .{ .x = e.normed.ptr, .stride = e.c.hidden, .slots = e.c.topk }, l_up, p, e.m41_out.ptr, pairs, -1, e.m41_desc_up.ptr);
-            // act per slot
-            var ks: usize = 0;
-            while (ks < e.c.topk) : (ks += 1) {
-                try e.ops.act(e.stream, e.m41_out.ptr + ks * e.m41_inter_max * 2, e.m41_out.ptr + (e.c.topk + ks) * e.m41_inter_max * 2, e.m41_act.ptr + ks * e.m41_inter_max * 2, 1, 1, e.m41_inter_max, e.c.swiglu_limit);
-            }
-            // down: x = the fused swiglu rows [topk, inter_max stride]
             var l_dn = l_up;
             l_dn.up = e.m41_down.ptr;
             l_dn.up_scale = e.m41_down_h.ptr;
-            try e.m41_xe.?.runMixed(e.stream, .down_bf16, .{ .x = e.m41_act.ptr, .stride = e.m41_inter_max, .slots = 0 }, l_dn, p, e.moe_ye.ptr, pairs, -1, e.m41_desc_down.ptr);
+            try e.m41_xe.?.runMixed(e.stream, .down_bf16, .{ .x = e.m41_out.ptr, .stride = e.m41_inter_max, .slots = 0 }, l_dn, p, e.moe_ye.ptr, pairs, -1, e.m41_desc_down.ptr);
             try e.ops.combine(e.stream, e.moe_ys.ptr, e.moe_ye.ptr, e.moe_wts.ptr, e.branch.ptr, rows, e.c.topk, hidden);
             return;
         }
