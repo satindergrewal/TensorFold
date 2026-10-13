@@ -1106,7 +1106,13 @@ pub const Engine = struct {
             sums[r] = acc;
             if (acc == 0) any_zero += 1;
         }
-        if (ok) std.debug.print("m41dbg r{d} s{d}: rows {d:.3} {d:.3} {d:.3} {d:.3} {d:.3} {d:.3} {d:.3} {d:.3} zeros={d}\n", .{ e.m41_rounds, stage, sums[0], sums[1], sums[2], sums[3], sums[4], sums[5], sums[6], sums[7], any_zero });
+        if (ok) {
+            // file-based: engine debug.print is swallowed in the server
+            var line: [256]u8 = undefined;
+            const txt = std.fmt.bufPrint(&line, "r{d} s{d}: {d:.3} {d:.3} {d:.3} {d:.3} {d:.3} {d:.3} {d:.3} {d:.3} z={d}\n", .{ e.m41_rounds, stage, sums[0], sums[1], sums[2], sums[3], sums[4], sums[5], sums[6], sums[7], any_zero }) catch return;
+            var dir = std.Io.Dir.cwd();
+            dir.writeFile(e.io, .{ .sub_path = "/tmp/m41dbg.log", .data = txt }) catch {};
+        }
     }
 
     const MatDesc = extern struct { toff: u64, hoff: u32, k: u32, n: u32, tiles_n: u32, bits: u32 };
