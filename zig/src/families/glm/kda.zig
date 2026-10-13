@@ -12,15 +12,15 @@ pub const Kernels = struct {
     mod: cuda.Module,
     conv_fn: cuda.Function,
     step_fn: cuda.Function,
+    chain_fn: cuda.Function,
 
     pub fn load(d: *const cuda.Driver) !Kernels {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
         var mod = try cuda.Module.load(d, cuda.kernels.glm_kda);
         errdefer mod.unload();
-        var k: Kernels = .{ .mod = mod, .conv_fn = undefined, .step_fn = undefined };
+        var k: Kernels = .{ .mod = mod, .conv_fn = undefined, .step_fn = undefined, .chain_fn = undefined };
         errdefer k.deinit();
-        k.conv_fn = try mod.function("kda_conv");
-        k.step_fn = try mod.function("kda_step");
+        k.chain_fn = try mod.function("tf_glm_kda_chain");
         return k;
     }
 
@@ -55,5 +55,36 @@ pub const Kernels = struct {
         g.add(st_out);
         g.add(y);
         try cuda.launch.launch(k.step_fn, .{ .grid = .{ .x = H }, .block = .{ .x = D } }, s, &g);
+    }
+
+    /// Their verified chain: conv + delta-rule step + gated RMSNorm in one launch.
+    /// P = fused projections [rows, ps] elements; A/G = the f_b/g_b outputs (f32-strided halves);
+    /// cw = f32 channel-major [3W][TAPS]; cs = [TAPS-1, 3W] bf16 history.
+    pub fn chain(k: *const Kernels, s: cuda.Stream, p: u64, ps: usize, b_off: usize, a_fg: u64, g_fg: u64, fg_stride: usize, cs: u64, cw: u64, st_in: u64, a_log: u64, dtb: u64, onw: u64, eps: f32, lower: f32, rows: usize, out: u64, st_out: u64) !void {
+        var g: cuda.Args = .{};
+        g.add(@as(i32, @intCast(H)));
+        g.add(p);
+        g.add(@as(i32, @intCast(ps)));
+        g.add(@as(i32, @intCast(b_off)));
+        g.add(a_fg);
+        g.add(@as(i32, @intCast(fg_stride)));
+        g.add(g_fg);
+        g.add(@as(i32, @intCast(fg_stride)));
+        g.add(cs);
+        g.add(cw);
+        g.add(st_in);
+        g.add(a_log);
+        g.add(dtb);
+        g.add(onw);
+        g.add(eps);
+        g.add(lower);
+        g.add(@as(i32, @intCast(rows)));
+        g.add(out);
+        g.add(st_out);
+        g.add(@as(u64, 0));
+        g.add(@as(u64, 0));
+        g.add(@as(u64, 0));
+        g.add(@as(u64, 0));
+        try cuda.launch.launch(k.chain_fn, .{ .grid = .{ .x = H }, .block = .{ .x = 1024 } }, s, &g);
     }
 };

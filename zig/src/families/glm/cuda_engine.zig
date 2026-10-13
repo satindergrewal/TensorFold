@@ -30,6 +30,7 @@ pub const Options = struct {
 const Gemms = struct {
     lt: glue.Library,
     map: std.AutoHashMap(u64, cuda.cublaslt.Linear),
+    sig: std.AutoHashMap(u64, u64),
     ws: cuda.DeviceBuffer,
 
     fn key(m: u64, n: u64, k: u64, f32_out: bool) u64 {
@@ -40,6 +41,7 @@ const Gemms = struct {
         return .{
             .lt = try glue.Library.open(),
             .map = std.AutoHashMap(u64, cuda.cublaslt.Linear).init(gpa),
+            .sig = std.AutoHashMap(u64, u64).init(gpa),
             .ws = try cuda.DeviceBuffer.alloc(d, 64 << 20),
         };
     }
@@ -52,11 +54,22 @@ const Gemms = struct {
         g.lt.close();
     }
 
+    fn sigCheck(g: *Gemms, id: u64, m: usize, n: usize, k: usize, xs: usize, ws_: usize, os: usize) void {
+        const sg = (@as(u64, m) << 58) | (@as(u64, n >> 8) << 50) | (@as(u64, k >> 8) << 42) | (@as(u64, xs) << 26) | (@as(u64, ws_) << 13) | @as(u64, os >> 3);
+        const gop = g.sig.getOrPut(id) catch return;
+        if (!gop.found_existing) {
+            gop.value_ptr.* = sg;
+        } else if (gop.value_ptr.* != sg) {
+            std.debug.print("GEMM-COLLISION id={x} was={x} now={x} (m{d} n{d} k{d} xs{d} ws{d} os{d})\n", .{ id, gop.value_ptr.*, sg, m, n, k, xs, ws_, os });
+        }
+    }
+
     /// D . W^T with independent row strides (bytes) for x, W and out.
     fn mmStrided(g: *Gemms, s: cuda.Stream, x: u64, xs: usize, w: u64, ws_: usize, out: u64, os: usize, rows: usize, n: usize, k: usize) !void {
         // a dedicated Linear per stride combo
         const m: usize = if (rows == 1 and mpad_on) 2 else rows; // 1-row pads to the 2-row plan (spec-decode bit parity)
         const id = key(m | (xs << 8), n, k, false) ^ (ws_ << 20) ^ (os << 26);
+        g.sigCheck(id, m, n, k, xs, ws_, os);
         const gop = try g.map.getOrPut(id);
         if (!gop.found_existing) {
             // build with custom layouts (the shared init hardcodes ld=k)
@@ -74,6 +87,7 @@ const Gemms = struct {
     fn mmNT(g: *Gemms, s: cuda.Stream, x: u64, xs: usize, w: u64, ws_: usize, out: u64, os: usize, rows: usize, n: usize, k: usize) !void {
         const m: usize = if (rows == 1 and mpad_on) 2 else rows; // 1-row pads to the 2-row plan (spec-decode bit parity)
         const id = key(m | (xs << 8), n, k, false) ^ (ws_ << 20) ^ (os << 26) ^ 0x5A5A;
+        g.sigCheck(id, m, n, k, xs, ws_, os);
         const gop = try g.map.getOrPut(id);
         if (!gop.found_existing)
             gop.value_ptr.* = try cuda.cublaslt.Linear.initNT(&g.lt, m, n, k, .bf16, 64 << 20, xs / 2, ws_ / 2, os / 2);
@@ -353,6 +367,7 @@ pub const Engine = struct {
         e.qkv = try cuda.DeviceBuffer.alloc(d, rows * 3 * W * 2);
         e.fg = try cuda.DeviceBuffer.alloc(d, rows * 2 * W * 2);
         e.bv = try cuda.DeviceBuffer.alloc(d, rows * e.c.kda_heads * 2);
+        std.debug.print("BUFS normed={x} part={x} y={x} proj={x} qkv={x} fg={x} bv={x} normed_len={d} fg_len={d} proj_len={d} y_len={d}\\n", .{ e.normed.ptr, e.part.ptr, e.y.ptr, e.proj.ptr, e.qkv.ptr, e.fg.ptr, e.bv.ptr, e.normed.len, e.fg.len, e.proj.len, e.y.len });
         e.kda_st0 = try cuda.DeviceBuffer.alloc(d, n_kda * e.c.kda_heads * D * D * 4);
         e.kda_st1 = try cuda.DeviceBuffer.alloc(d, n_kda * e.c.kda_heads * D * D * 4);
         e.kda_cs = try cuda.DeviceBuffer.alloc(d, n_kda * (4 - 1) * 3 * W * 2);
@@ -375,22 +390,35 @@ pub const Engine = struct {
         // [W, 1, TAPS] uploads (element (c, j) at c*TAPS + j)
         {
             const Wq: usize = e.c.kdaWidth();
-            e.kda_cw = try cuda.DeviceBuffer.alloc(d, n_kda * 4 * 3 * Wq * 2);
-            var ki: usize = 0;
-            for (e.w.layers) |*L| {
-                const wk = switch (L.attn) {
-                    .kda => |*x| x,
-                    .mla => continue,
-                };
-                const srcs = [3]u64{ wk.q_conv, wk.k_conv, wk.v_conv };
-                const taps_g: usize = 4;
-                const cw_at = e.kda_cw.ptr + ki * 4 * 3 * Wq * 2;
-                for (0..taps_g) |j| for (0..3) |part| {
-                    try e.ops.gather(e.stream, srcs[part] + j * 2, cw_at + (j * 3 + part) * Wq * 2, Wq, 4);
-                };
-                ki += 1;
+            e.kda_cw = try cuda.DeviceBuffer.alloc(d, n_kda * 3 * Wq * 4 * 4); // f32 channel-major [3W][TAPS] (their chain layout)
+            {
+                var ki: usize = 0;
+                const cw_host = try e.gpa.alloc(u8, 3 * Wq * 4 * 4);
+                defer e.gpa.free(cw_host);
+                const part_src = try e.gpa.alloc(u8, Wq * 4 * 2);
+                defer e.gpa.free(part_src);
+                for (e.w.layers) |*L| {
+                    const wk = switch (L.attn) {
+                        .kda => |*x| x,
+                        .mla => continue,
+                    };
+                    const srcs = [3]u64{ wk.q_conv, wk.k_conv, wk.v_conv };
+                    for (0..3) |part| {
+                        try (cuda.DeviceBuffer{ .d = e.d, .ptr = srcs[part], .len = Wq * 4 * 2, .borrowed = true }).download(0, part_src);
+                        for (0..Wq) |w2| {
+                            for (0..4) |tap| {
+                                const h: u16 = std.mem.readInt(u16, part_src[(w2 * 4 + tap) * 2 ..][0..2], .little);
+                                const fv: f32 = @bitCast(@as(u32, h) << 16);
+                                const off: usize = ((part * Wq + w2) * 4 + tap) * 4;
+                                std.mem.writeInt(u32, cw_host[off..][0..4], @bitCast(fv), .little);
+                            }
+                        }
+                    }
+                    try (cuda.DeviceBuffer{ .d = e.d, .ptr = e.kda_cw.ptr + ki * 3 * Wq * 4 * 4, .len = 3 * Wq * 4 * 4, .borrowed = true }).upload(0, cw_host);
+                    ki += 1;
+                }
+                try e.stream.synchronize();
             }
-            try e.stream.synchronize();
         }
         e.moe_pick = try cuda.DeviceBuffer.alloc(d, e.rows_max * 8 * 4);
         e.moe_wts = try cuda.DeviceBuffer.alloc(d, e.rows_max * 8 * 4);
@@ -617,6 +645,19 @@ pub const Engine = struct {
         return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
     }
 
+    fn nfpPrint(e: *Engine, tag: []const u8) !void {
+        try e.stream.synchronize();
+        const nb = try e.gpa.alloc(u8, 8192);
+        defer e.gpa.free(nb);
+        (cuda.DeviceBuffer{ .d = e.d, .ptr = e.normed.ptr, .len = 8192, .borrowed = true }).download(0, nb) catch return;
+        var acc: f32 = 0;
+        for (0..32) |i| {
+            const h: u16 = std.mem.readInt(u16, nb[i * 2 ..][0..2], .little);
+            acc += @as(f32, @bitCast(@as(u32, h) << 16));
+        }
+        std.debug.print("  NFP {s} {d:.4}\n", .{ tag, acc });
+    }
+
     fn kdaLayer(e: *Engine, li: usize, w: *const weights.Kda, rows: usize) !void {
         if (e.dump_on and li == 0) {
             try e.stream.synchronize();
@@ -743,15 +784,24 @@ pub const Engine = struct {
         const xst = c.hidden * 2;
         const wst = c.hidden * 2;
         const ost = ps * 2;
+        if (li == 0 and !e.quiet) try e.nfpPrint("g0");
         try e.g.mmStrided(e.stream, e.normed.ptr, xst, w.q, wst, e.proj.ptr, ost, rows, Wq, c.hidden);
+        if (li == 0 and !e.quiet) try e.nfpPrint("g1-q");
         try e.g.mmStrided(e.stream, e.normed.ptr, xst, w.k, wst, e.proj.ptr + Wq * 2, ost, rows, Wq, c.hidden);
+        if (li == 0 and !e.quiet) try e.nfpPrint("g2-k");
         try e.g.mmStrided(e.stream, e.normed.ptr, xst, w.v, wst, e.proj.ptr + 2 * Wq * 2, ost, rows, Wq, c.hidden);
+        if (li == 0 and !e.quiet) try e.nfpPrint("g3-v");
         try e.g.mmStrided(e.stream, e.normed.ptr, xst, w.f_a, wst, e.proj.ptr + 3 * Wq * 2, ost, rows, D, c.hidden);
+        if (li == 0 and !e.quiet) try e.nfpPrint("g4-fa");
         try e.g.mmStrided(e.stream, e.normed.ptr, xst, w.g_a, wst, e.proj.ptr + (3 * Wq + D) * 2, ost, rows, D, c.hidden);
+        if (li == 0 and !e.quiet) try e.nfpPrint("g5-ga");
         try e.g.mmStrided(e.stream, e.normed.ptr, xst, w.b, wst, e.proj.ptr + (3 * Wq + 2 * D) * 2, ost, rows, H, c.hidden);
+        if (li == 0 and !e.quiet) try e.nfpPrint("g6-b");
         // f_b / g_b on the f_a/g_a slices; the step kernel reads fg interleaved [rows, 2Wq]
         try e.g.mmStrided(e.stream, e.proj.ptr + 3 * Wq * 2, ost, w.f_b, D * 2, e.fg.ptr, 2 * Wq * 2, rows, Wq, D);
+        if (li == 0 and !e.quiet) try e.nfpPrint("g7-fb");
         try e.g.mmStrided(e.stream, e.proj.ptr + (3 * Wq + D) * 2, ost, w.g_b, D * 2, e.fg.ptr + Wq * 2, 2 * Wq * 2, rows, Wq, D);
+        if (li == 0 and !e.quiet) try e.nfpPrint("g8-gb");
         if (li == 0 and !e.quiet) {
             try e.stream.synchronize();
             const fb2 = try e.gpa.alloc(u8, 2 * Wq * 2);
@@ -769,8 +819,7 @@ pub const Engine = struct {
             }
             std.debug.print("  [kda0] fb {d:.2} gb {d:.2}\n", .{ fb_s, gb_s });
         }
-        // b packed from the proj slice
-        try e.ops.copy2d(e.stream, e.proj.ptr + (3 * Wq + 2 * D) * 2, e.bv.ptr, rows, H, ps);
+        // (beta now read from P directly by the chain kernel)
         if (li == 0 and !e.quiet) {
             try e.stream.synchronize();
             const bb2 = try e.gpa.alloc(u8, ps * 2);
@@ -806,11 +855,28 @@ pub const Engine = struct {
                 const h: u16 = std.mem.readInt(u16, bb2[(3 * Wq + 2 * D + d) * 2 ..][0..2], .little);
                 b_s += @as(f32, @bitCast(@as(u32, h) << 16));
             }
-            std.debug.print("  [kda0] q {d:.2} k {d:.2} v {d:.2} fa {d:.2} ga {d:.2} b {d:.2}\n", .{ q_s, k_s, v_s, fa_s, ga_s, b_s });
+            std.debug.print("  [kda0{s}] q {d:.2} k {d:.2} v {d:.2} fa {d:.2} ga {d:.2} b {d:.2}\n", .{ @as([]const u8, if (e.cont) "b" else "a"), q_s, k_s, v_s, fa_s, ga_s, b_s });
+            if (li == 0 and !e.quiet) try e.nfpPrint("g9-predump");
+            if (e.fwd_count != 1) {
+                // debug dumps only on the first forward; the block itself continues
+            } else {
+            const tg: []const u8 = if (e.cont) "b" else "a";
+            var nm9: [24]u8 = undefined;
+            try e.dumpBin(std.fmt.bufPrint(&nm9, "nf{s}.bin", .{tg}) catch "nfx.bin", e.normed.ptr, 8192);
+            if (li == 0 and !e.quiet) try e.nfpPrint("gA-postnf");
+            try e.dumpBin(std.fmt.bufPrint(&nm9, "w_b{s}.bin", .{tg}) catch "w_bx.bin", w.b, 128);
+            if (li == 0 and !e.quiet) try e.nfpPrint("gB-postwb");
+            try e.dumpBin(std.fmt.bufPrint(&nm9, "pq{s}.bin", .{tg}) catch "pqx.bin", e.proj.ptr, 64);
+            try e.dumpBin(std.fmt.bufPrint(&nm9, "pb{s}.bin", .{tg}) catch "pbx.bin", e.proj.ptr + (3 * Wq + 2 * D) * 2, 128);
+            try e.dumpBin(std.fmt.bufPrint(&nm9, "na{s}.bin", .{tg}) catch "nax.bin", e.normed.ptr, 8192);
+            try e.dumpBin(std.fmt.bufPrint(&nm9, "fg{s}.bin", .{tg}) catch "fgx.bin", e.fg.ptr, 2 * Wq * 2);
+            try e.dumpBin(std.fmt.bufPrint(&nm9, "bv{s}.bin", .{tg}) catch "bvx.bin", e.bv.ptr, H * 2);
+            try e.dumpBin(std.fmt.bufPrint(&nm9, "qkv{s}.bin", .{tg}) catch "qkvx.bin", e.qkv.ptr, 3 * Wq * 2);
+            try e.dumpBin(std.fmt.bufPrint(&nm9, "yy{s}.bin", .{tg}) catch "yyx.bin", e.y.ptr, Wq * 2);
+            }
         }
-        // conv: history per layer, weights the engine built at load (kda_cw)
+        // conv history + weights (their chain layout)
         const cs_at = e.kda_cs.ptr + li * 3 * 3 * Wq * 2;
-        try e.kdk.conv(e.stream, e.proj.ptr, ps, cs_at, e.kda_cw.ptr + li * 4 * 3 * Wq * 2, e.qkv.ptr, rows);
         if (li == 0 and !e.quiet) {
             try e.stream.synchronize();
             const qb2 = try e.gpa.alloc(u8, 3 * Wq * 2);
@@ -867,7 +933,12 @@ pub const Engine = struct {
 
         }
         const st_out = if (cur == 0) e.kda_st1.ptr else e.kda_st0.ptr;
-        try e.kdk.step(e.stream, e.qkv.ptr, e.fg.ptr, e.bv.ptr, w.a, w.dt_bias, st_in + li * st_bytes, w.o_norm, c.lower_bound, c.hc_eps, rows, st_out + li * st_bytes, e.y.ptr);
+        try e.kdk.chain(e.stream, e.proj.ptr, ps, 3 * Wq + 2 * D, e.fg.ptr, e.fg.ptr + Wq * 2, 2 * Wq, cs_at, e.kda_cw.ptr + li * 3 * Wq * 4 * 4, st_in + li * st_bytes, w.a_log, w.dt_bias, w.o_norm, c.eps, c.lower_bound, rows, e.y.ptr, st_out + li * st_bytes);
+        if (li == 0 and !e.quiet and e.fwd_count == 1) {
+            var nmy: [24]u8 = undefined;
+            const tgy: []const u8 = if (e.cont) "b" else "a";
+            try e.dumpBin(std.fmt.bufPrint(&nmy, "yx{s}.bin", .{tgy}) catch "yxx.bin", e.y.ptr, Wq * 2);
+        }
         if (li <= 4 and (e.fwd_count == 1 and !e.quiet)) {
             try e.stream.synchronize();
             const c0 = try e.nzHead(e.kda_st0.ptr);
