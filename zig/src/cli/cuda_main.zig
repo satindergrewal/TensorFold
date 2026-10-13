@@ -235,6 +235,7 @@ fn glmServe(gpa: std.mem.Allocator, init: std.process.Init, rest: []const [:0]co
     for (rest) |a| {
         if (std.mem.eql(u8, a, "--dump-pf")) pf_dump = true;
         if (std.mem.eql(u8, a, "--no-mpad")) glm.engine.mpad_on = false;
+        if (std.mem.eql(u8, a, "--op-time")) glm.engine.Engine.op_timing = true;
     }
     try ctx.makeCurrent();
     try eng.wantPrefillCache();
@@ -666,6 +667,9 @@ fn serveSplit(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engin
         out_ids[n_out] = pv[0];
         n_out += 1;
         pos += 1;
+    }
+    if (glm.engine.Engine.op_timing) {
+        std.debug.print("opms: attn(gates+kda) {d:.2} moe {d:.2} per-BLOCK0\n", .{ @as(f64, @floatFromInt(glm.engine.Engine.opt_gates)) / 1e6, @as(f64, @floatFromInt(glm.engine.Engine.opt_moe)) / 1e6 });
     }
     std.debug.print("glm-serve: accepts {d} rejects {d} | ms: promptA {d:.1} hoff {d:.1} promptB {d:.1} | rounds: A {d:.1} hoff {d:.1} B {d:.1} pick {d:.1}\n", .{ accepts, rejects, @as(f64, @floatFromInt(t_pa)) / 1e6, @as(f64, @floatFromInt(t_h)) / 1e6, @as(f64, @floatFromInt(t_pb)) / 1e6, @as(f64, @floatFromInt(t_ra)) / 1e6, @as(f64, @floatFromInt(t_rh)) / 1e6, @as(f64, @floatFromInt(t_rb)) / 1e6, @as(f64, @floatFromInt(t_rp)) / 1e6 });
     var jbuf: [8192]u8 = undefined;

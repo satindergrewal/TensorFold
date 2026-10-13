@@ -564,6 +564,18 @@ pub const Engine = struct {
     }
 
     /// KDA attention block `li` (its dense kind index) on normed -> branch.
+    pub var opt_gates: i128 = 0;
+    pub var opt_conv: i128 = 0;
+    pub var opt_step: i128 = 0;
+    pub var opt_moe: i128 = 0;
+    pub var opt_gemms: i128 = 0;
+    pub var op_timing: bool = false;
+    fn tns() i128 {
+        var ts: std.posix.timespec = undefined;
+        _ = std.posix.system.clock_gettime(std.posix.CLOCK.MONOTONIC, &ts);
+        return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
+    }
+
     fn kdaLayer(e: *Engine, li: usize, w: *const weights.Kda, rows: usize) !void {
         if (e.dump_on and li == 0) {
             try e.stream.synchronize();
@@ -1038,6 +1050,10 @@ pub const Engine = struct {
     /// The MoE block: router, top-8 route, shared expert, the routed experts
     /// through exl3 per (row, slot) - correctness first, batching later.
     fn moeBlock(e: *Engine, w: *const weights.Moe, rows: usize) !void {
+        const om0 = if (op_timing) tns() else 0;
+        defer if (op_timing) {
+            opt_moe += tns() - om0;
+        };
         const hidden = e.c.hidden;
         const inter = e.c.moe_inter;
         // router logits fp32 then the route
@@ -1294,9 +1310,12 @@ pub const Engine = struct {
                 dir.writeFile(e.io, .{ .sub_path = "normed0.bin", .data = nb }) catch {};
                 std.debug.print("  normed row0 dumped 8192B\n", .{});
             }
+            const ot0 = if (op_timing and bi == 0) tns() else 0;
             switch (L.attn) {
                 .kda => |*w| {
+                    const oa0 = if (op_timing and bi == 0) tns() else 0;
                     try e.kdaLayer(ki, w, rows);
+                    if (op_timing and bi == 0) opt_gates += tns() - oa0;
                     ki += 1;
                     if (bi == 0 and !e.quiet) try e.b0Print("attn", e.y);
                 },
@@ -1335,6 +1354,7 @@ pub const Engine = struct {
                 .dense => |*w| try e.denseMlp(w, rows),
                 .moe => |*w| try e.moeBlock(w, rows),
             }
+            if (op_timing and bi == 0) opt_gates += tns() - ot0;
             try e.hcFold((L.hc_ffn orelse return error.UnexpectedMtp).fnp, rows);
             if (((e.fwd_count == 1 or e.dump_on) and !e.quiet) and bi <= 45) try e.dumpPb(bi, "bf", e.branch.ptr, rows);
             if (e.block_sums) |sums| {
