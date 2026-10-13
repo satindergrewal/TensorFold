@@ -1093,7 +1093,23 @@ pub const Engine = struct {
         dir.writeFile(e.io, .{ .sub_path = "m41setup.log", .data = tag }) catch {};
     }
 
+    fn m41Err(e: *Engine, stage: []const u8, err: anyerror) void {
+        var nm: [96]u8 = undefined;
+        const f = std.fmt.bufPrint(&nm, "m41setup.log", .{}) catch return;
+        var line: [128]u8 = undefined;
+        const txt = std.fmt.bufPrint(&line, "{s} ERR={s}\n", .{ stage, @errorName(err) }) catch return;
+        var dir = std.Io.Dir.cwd();
+        dir.writeFile(e.io, .{ .sub_path = f, .data = txt }) catch {};
+    }
+
     fn m41Setup(e: *Engine, w: *const weights.Moe) !void {
+        e.m41SetupInner(w) catch |err| {
+            e.m41Err("inner", err);
+            return err;
+        };
+    }
+
+    fn m41SetupInner(e: *Engine, w: *const weights.Moe) !void {
         e.m41Stage("start ");
         const E = w.gate.len;
         var inter_max: usize = 0;
@@ -1125,17 +1141,24 @@ pub const Engine = struct {
         e.m41_hist = try cuda.DeviceBuffer.alloc(e.d, 16 * 4);
         e.m41_out = try cuda.DeviceBuffer.alloc(e.d, 2 * e.c.topk * inter_max * 2);
         e.m41_act = try cuda.DeviceBuffer.alloc(e.d, e.c.topk * inter_max * 2);
-        e.m41_xe = try @import("cuda").exl3_experts.Experts.load(e.d, 148);
+        e.m41_xe = @import("cuda").exl3_experts.Experts.load(e.d, 148) catch |err| {
+            e.m41Err("experts-load", err);
+            return err;
+        };
         e.m41Stage("allocs ");
         // router from the experts module: grouped.Router.resolve needs the experts
         // fatbin module - Experts doesn't expose it; load a second module instance
         {
             // the Router's Functions live in this module - it must outlive the
             // router; unload only at engine teardown (leak-until-deinit is fine)
-            const mod = try cuda.Module.load(e.d, @import("cuda").kernels.experts);
+            const mod = cuda.Module.load(e.d, @import("cuda").kernels.experts) catch |err| {
+                e.m41Err("router-mod", err);
+                return err;
+            };
             e.m41_router_mod = mod;
             e.m41_router = try @import("cuda").grouped.Router.resolve(mod);
         }
+        e.m41Stage("repack-begin ");
         // host staging: copy each expert's trellis + halves into the stacks, fill descs
         const du = try e.gpa.alloc(u8, E * 2 * @sizeOf(MatDesc));
         defer e.gpa.free(du);
