@@ -261,26 +261,31 @@ fn glmServe(gpa: std.mem.Allocator, init: std.process.Init, rest: []const [:0]co
         return 1;
     }
     std.debug.print("glm-serve: {s} on 0.0.0.0:{d} (POST /generate with a JSON body)", .{ rest[0], port });
+    // thread-per-connection: connections are accepted concurrently and queue on
+    // the engine mutex (the GPU pair is a single serialized resource; streams
+    // interleave only via the request queue for now)
     while (true) {
         const rc2 = posix.system.accept(fd, null, null);
         if (posix.errno(rc2) != .SUCCESS) continue;
         const conn_fd: posix.socket_t = @intCast(rc2);
-        defer _ = posix.system.close(conn_fd);
-        try ctx.makeCurrent();
-        @memset(eng.kda_st_cur, 0);
-        try eng.kda_st0.fill32(0, null);
-        try eng.kda_st1.fill32(0, null);
-        try eng.kda_cs.fill8(0, null);
-        try ctx1.makeCurrent();
-        @memset(eng_b.kda_st_cur, 0);
-        try eng_b.kda_st0.fill32(0, null);
-        try eng_b.kda_st1.fill32(0, null);
-        try eng_b.kda_cs.fill8(0, null);
-        serveSplit(gpa, eng, eng_b, ctx, ctx1, conn_fd) catch |err| {
-            std.debug.print("request: {}", .{err});
+        const th = std.Thread.spawn(.{}, handleConn, .{ gpa, eng, eng_b, ctx, ctx1, conn_fd }) catch {
+            _ = posix.system.close(conn_fd);
+            continue;
         };
+        th.detach();
     }
     return 0;
+}
+
+var engine_mutex: std.Io.Mutex = .init;
+
+fn handleConn(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engine.Engine, ctx: cuda.Context, ctx1: cuda.Context, fd: posix.socket_t) void {
+    defer _ = posix.system.close(fd);
+    engine_mutex.lockUncancelable(eng.io);
+    defer engine_mutex.unlock(eng.io);
+    serveSplit(gpa, eng, eng_b, ctx, ctx1, fd) catch |err| {
+        std.debug.print("request: {}", .{err});
+    };
 }
 
 /// One request through the split: the prompt on A, handoff, tail on B; then
