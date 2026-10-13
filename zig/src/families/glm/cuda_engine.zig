@@ -100,6 +100,7 @@ const Gemms = struct {
 };
 
 pub var mpad_on: bool = true; // perf probe: the rows==1->m=2 spec-parity padding
+pub var group_stage: u8 = 3; // bisect: 1=gate grouped only, 3=all
 
 pub const Engine = struct {
     gpa: std.mem.Allocator,
@@ -156,6 +157,7 @@ pub const Engine = struct {
     moe_xt: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true }, // [topk, k_max]
     moe_yg: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true }, // [topk, inter_max]
     moe_yu: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
+    moe_act_g: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
     moe_tbl_gate: u64 = 0,
     moe_tbl_up: u64 = 0,
     moe_tbl_down: u64 = 0,
@@ -1078,6 +1080,62 @@ pub const Engine = struct {
         try e.g.mm(e.stream, e.normed.ptr, w.shared_up, e.mlp_tmp.ptr + rows * inter * 2, rows, inter, hidden, false);
         try e.ops.act(e.stream, e.mlp_tmp.ptr, e.mlp_tmp.ptr + rows * inter * 2, e.mlp_act.ptr, rows, 1, inter, e.c.swiglu_limit);
         try e.g.mm(e.stream, e.mlp_act.ptr, w.shared_down, e.moe_ys.ptr, rows, hidden, inter, false);
+        if (rows == 1 and w.gate.len > 0 and !e.moe_grouped) {
+            e.moe_tbl_gate = try e.ex.tableFrom(e.stream, w.gate);
+            e.moe_tbl_up = try e.ex.tableFrom(e.stream, w.up);
+            e.moe_tbl_down = try e.ex.tableFrom(e.stream, w.down);
+            var inter_max: usize = 0;
+            var tn_i: usize = 0;
+            var tn_h: usize = 0;
+            for (w.gate) |gw| {
+                inter_max = @max(inter_max, gw.n);
+                tn_i = @max(tn_i, gw.tilesN());
+            }
+            for (w.down) |dw2| tn_h = @max(tn_h, dw2.tilesN());
+            e.moe_inter_max = inter_max;
+            e.moe_tn_i = tn_i;
+            e.moe_tn_h = tn_h;
+            e.moe_k_blocks = (e.c.hidden + 127) / 128;
+            const k_max = e.c.hidden;
+            e.moe_xt = try cuda.DeviceBuffer.alloc(e.d, e.c.topk * k_max * 2);
+            e.moe_yg = try cuda.DeviceBuffer.alloc(e.d, e.c.topk * inter_max * 2);
+            e.moe_yu = try cuda.DeviceBuffer.alloc(e.d, e.c.topk * inter_max * 2);
+            e.moe_act_g = try cuda.DeviceBuffer.alloc(e.d, e.c.topk * inter_max * 2);
+            e.moe_grouped = true;
+        }
+        if (rows == 1 and e.moe_grouped) {
+            // GROUPED: 9 launches + 8 act, picks on device, no host sync.
+            // gate/up: x row0 (stride 0 rows), xt scratch [topk, inter_max stride]
+            try e.ex.projectGroupedFull(e.stream, e.normed.ptr, 0, e.moe_tbl_gate, e.moe_pick.ptr, e.moe_xt.ptr, e.moe_yg.ptr, e.moe_inter_max, e.c.topk, e.moe_k_blocks, e.moe_tn_i);
+            if (group_stage == 1) {
+                // bisect stage 1: gate grouped, up/act/down on the host loop
+                const ph1 = e.moe_pick_h[0 .. rows * e.c.topk * 4];
+                try e.moe_pick.downloadAsync(0, ph1, e.stream.handle);
+                try e.stream.synchronize();
+                const pk1 = std.mem.bytesAsSlice(i32, @as([]align(1) u8, ph1));
+                var k1: usize = 0;
+                while (k1 < e.c.topk) : (k1 += 1) {
+                    const ex1 = pk1[k1];
+                    if (ex1 < 0) continue;
+                    const eu1: usize = @intCast(ex1);
+                    try e.ex.project(e.stream, e.normed.ptr, w.up[eu1], e.moe_gu.ptr + inter * 2, 1);
+                    try e.ops.act(e.stream, e.moe_yg.ptr + k1 * e.moe_inter_max * 2, e.moe_gu.ptr + inter * 2, e.moe_act_g.ptr + k1 * e.moe_inter_max * 2, 1, 1, e.moe_inter_max, e.c.swiglu_limit);
+                    const ye_at1 = e.moe_ye.ptr + k1 * hidden * 2;
+                    try e.ex.project(e.stream, e.moe_act_g.ptr + k1 * e.moe_inter_max * 2, w.down[eu1], ye_at1, 1);
+                }
+                try e.ops.combine(e.stream, e.moe_ys.ptr, e.moe_ye.ptr, e.moe_wts.ptr, e.branch.ptr, rows, e.c.topk, hidden);
+                return;
+            }
+            try e.ex.projectGroupedFull(e.stream, e.normed.ptr, 0, e.moe_tbl_up, e.moe_pick.ptr, e.moe_xt.ptr, e.moe_yu.ptr, e.moe_inter_max, e.c.topk, e.moe_k_blocks, e.moe_tn_i);
+            var k2: usize = 0;
+            while (k2 < e.c.topk) : (k2 += 1) {
+                try e.ops.act(e.stream, e.moe_yg.ptr + k2 * e.moe_inter_max * 2, e.moe_yu.ptr + k2 * e.moe_inter_max * 2, e.moe_act_g.ptr + k2 * e.moe_inter_max * 2, 1, 1, e.moe_inter_max, e.c.swiglu_limit);
+            }
+            // down: x = act_g [topk, inter_max stride]; y = moe_ye rows [topk, hidden]
+            try e.ex.projectGroupedFull(e.stream, e.moe_act_g.ptr, e.moe_inter_max, e.moe_tbl_down, e.moe_pick.ptr, e.moe_xt.ptr, e.moe_ye.ptr, e.c.hidden, e.c.topk, (e.moe_inter_max + 127) / 128, e.moe_tn_h);
+            try e.ops.combine(e.stream, e.moe_ys.ptr, e.moe_ye.ptr, e.moe_wts.ptr, e.branch.ptr, rows, e.c.topk, hidden);
+            return;
+        }
         // the picks on host drive the per-slot expert calls (staging allocated
         // once at init: a pinned alloc+free per block costs ~ms each)
         if (e.moe_pick_h.len == 0) {

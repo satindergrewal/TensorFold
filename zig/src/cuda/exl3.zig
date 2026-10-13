@@ -186,19 +186,21 @@ pub const Kernels = struct {
 
     /// All slots in ONE launch family: grid (tiles_n_max, topk) - the row is
     /// picked on DEVICE. rows must be 1 (serving decode). y: [topk, n_max].
-    pub fn projectGrouped(k: *const Kernels, s: Stream, x: u64, table: u64, picks: u64, y: u64, topk: usize, tiles_n_max: usize) !void {
+    pub fn projectGrouped(k: *const Kernels, s: Stream, x: u64, x_stride: usize, table: u64, picks: u64, y: u64, y_stride: usize, topk: usize, tiles_n_max: usize) !void {
         var a: launch_.Args = .{};
         a.add(x);
         a.add(table);
         a.add(picks);
         a.add(y);
         a.add(i(topk));
+        a.add(i(x_stride));
+        a.add(i(y_stride));
         try launch_.launch(k.grouped_fn, .{ .grid = .{ .x = u(tiles_n_max), .y = u(topk) }, .block = .{ .x = 128 } }, s, &a);
     }
 
     /// pre-rot + grouped matmul + post-rot for one weight family; x is the
     /// [1, k] row, y lands at [topk, n]. xt = per-slot scratch [topk, k_max].
-    pub fn projectGroupedFull(k: *const Kernels, s: Stream, x: u64, table: u64, picks: u64, xt: u64, y: u64, topk: usize, k_blocks: usize, tiles_n_max: usize) !void {
+    pub fn projectGroupedFull(k: *const Kernels, s: Stream, x: u64, x_stride: usize, table: u64, picks: u64, xt: u64, y: u64, y_stride: usize, topk: usize, k_blocks: usize, tiles_n_max: usize) !void {
         {
             var a: launch_.Args = .{};
             a.add(x);
@@ -206,16 +208,20 @@ pub const Kernels = struct {
             a.add(picks);
             a.add(xt);
             a.add(i(topk));
+            a.add(i(x_stride));
             try launch_.launch(k.grouped_pre_fn, .{ .grid = .{ .x = u(k_blocks), .y = u(topk) }, .block = .{ .x = 128 } }, s, &a);
         }
-        try k.projectGrouped(s, xt, table, picks, y, topk, tiles_n_max);
+        // xt rows are x_stride apart (the caller's slot stride); the matmul
+        // must read the same layout the pre-rot wrote
+        try k.projectGrouped(s, xt, x_stride, table, picks, y, y_stride, topk, tiles_n_max);
         {
             var a: launch_.Args = .{};
             a.add(y);
             a.add(table);
             a.add(picks);
             a.add(i(topk));
-            try launch_.launch(k.grouped_post_fn, .{ .grid = .{ .x = u(tiles_n_max), .y = u(topk) }, .block = .{ .x = 128 } }, s, &a);
+            a.add(i(y_stride));
+            try launch_.launch(k.grouped_post_fn, .{ .grid = .{ .x = u(tiles_n_max * 16 / 128 + 1), .y = u(topk) }, .block = .{ .x = 128 } }, s, &a);
         }
     }
 

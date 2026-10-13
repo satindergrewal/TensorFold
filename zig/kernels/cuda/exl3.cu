@@ -236,7 +236,7 @@ extern "C" __global__ void exl3_grouped_pre_rot(
     const Exl3Desc* __restrict__ descs,   // [experts]
     const int* __restrict__ picks,        // [topk]
     __nv_bfloat16* __restrict__ xt,       // [topk, k] per-slot x-tilde
-    int topk
+    int topk, int x_stride                // slot stride of x (elements)
 ) {
     const int slot = blockIdx.y;
     if (picks[slot] < 0) return;
@@ -245,21 +245,21 @@ extern "C" __global__ void exl3_grouped_pre_rot(
     const int t = threadIdx.x;
     const int k = d.k;
     __shared__ float s_v[128];
-    float v = __bfloat162float(x[base + t]);
+    float v = __bfloat162float(x[(size_t)slot * x_stride + base + t]);
     v *= __half2float(__ushort_as_half(__ldg((const uint16_t*)d.suh + base + t)));
     s_v[t] = v;
     __syncthreads();
     float sum = 0.0f;
     #pragma unroll 8
     for (int i = 0; i < 128; ++i) sum += had_entry(t, i) * s_v[i];
-    xt[(size_t)slot * k + base + t] = __float2bfloat16(sum);
+    xt[(size_t)slot * x_stride + base + t] = __float2bfloat16(sum);
 }
 
 extern "C" __global__ void exl3_grouped_post_rot(
-    __nv_bfloat16* __restrict__ y,        // [topk, n] in/out
+    __nv_bfloat16* __restrict__ y,        // [topk, y_stride] in/out
     const Exl3Desc* __restrict__ descs,
     const int* __restrict__ picks,
-    int topk
+    int topk, int y_stride
 ) {
     const int slot = blockIdx.y;
     if (picks[slot] < 0) return;
@@ -268,22 +268,22 @@ extern "C" __global__ void exl3_grouped_post_rot(
     const int t = threadIdx.x;
     const int n = d.n;
     __shared__ float s_v[128];
-    float v = __bfloat162float(__ldg(y + (size_t)slot * n + base + t));
+    float v = __bfloat162float(__ldg(y + (size_t)slot * y_stride + base + t));
     v *= __half2float(__ushort_as_half(__ldg((const uint16_t*)d.svh + base + t)));
     s_v[t] = v;
     __syncthreads();
     float sum = 0.0f;
     #pragma unroll 8
     for (int i = 0; i < 128; ++i) sum += had_entry(t, i) * s_v[i];
-    y[(size_t)slot * n + base + t] = __float2bfloat16(sum);
+    y[(size_t)slot * y_stride + base + t] = __float2bfloat16(sum);
 }
 
 extern "C" __global__ void exl3_grouped_project(
-    const __nv_bfloat16* __restrict__ x,   // [1, k] one row
+    const __nv_bfloat16* __restrict__ x,   // [topk, x_stride] per-slot input
     const Exl3Desc* __restrict__ descs,    // [experts]
     const int* __restrict__ picks,         // [topk]
-    __nv_bfloat16* __restrict__ y,         // [topk, n] slot outputs
-    int topk
+    __nv_bfloat16* __restrict__ y,         // [topk, y_stride] slot outputs
+    int topk, int x_stride, int y_stride
 ) {
     const int slot = blockIdx.y;
     const int ex = picks[slot];
@@ -306,7 +306,7 @@ extern "C" __global__ void exl3_grouped_project(
             Placement pl = tile_placement(p);
             s_w[pl.row][pl.col] = codebook_value_mcg(tile_state(w, tile, p));
         }
-        if (tid < TILE) s_x[0][tid] = __bfloat162float(x[(size_t)slot * d.k + tk * TILE + tid]);
+        if (tid < TILE) s_x[0][tid] = __bfloat162float(x[(size_t)slot * x_stride + tk * TILE + tid]);
         __syncthreads();
         if (my >= 0) {
             #pragma unroll
@@ -315,7 +315,7 @@ extern "C" __global__ void exl3_grouped_project(
         __syncthreads();
     }
     if (my >= 0)
-        y[(size_t)slot * d.n + (size_t)tn * TILE + my] = __float2bfloat16(acc);
+        y[(size_t)slot * y_stride + (size_t)tn * TILE + my] = __float2bfloat16(acc);
 }
 
 } // namespace tf_exl3_kernel
