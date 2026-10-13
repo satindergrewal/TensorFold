@@ -164,6 +164,7 @@ pub const Engine = struct {
     moe_grouped: bool = false,
     // #741 mixed path
     m41_on: bool = false,
+    m41_rounds: usize = 0,
     m41_up: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
     m41_up_h: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
     m41_down: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
@@ -1277,6 +1278,35 @@ pub const Engine = struct {
             // down: x = act_g [topk, inter_max stride]; y = moe_ye rows [topk, hidden]
             try e.ex.projectGroupedFull(e.stream, e.moe_act_g.ptr, e.moe_inter_max, e.moe_tbl_down, e.moe_pick.ptr, e.moe_xt.ptr, e.moe_ye.ptr, e.c.hidden, e.c.topk, (e.moe_inter_max + 127) / 128, e.moe_tn_h);
             try e.ops.combine(e.stream, e.moe_ys.ptr, e.moe_ye.ptr, e.moe_wts.ptr, e.branch.ptr, rows, e.c.topk, hidden);
+            // tail-dump instrument (the proven pattern): fused-out + down-out rows
+            if (e.m41_rounds < 12) {
+                try e.stream.synchronize();
+                e.m41_rounds += 1;
+                const c2 = @import("cuda");
+                var line: [320]u8 = undefined;
+                var lw: usize = 0;
+                for ([_]struct { nm: []const u8, buf: u64, wid: usize }{
+                    .{ .nm = "up", .buf = e.m41_out.ptr, .wid = e.m41_inter_max },
+                    .{ .nm = "dn", .buf = e.moe_ye.ptr, .wid = hidden },
+                }) |st| {
+                    var rs: []u8 = undefined;
+                    _ = &rs;
+                    const hb2 = try e.gpa.alloc(u8, st.wid * 2);
+                    defer e.gpa.free(hb2);
+                    for (0..e.c.topk) |r| {
+                        try (c2.DeviceBuffer{ .d = e.d, .ptr = st.buf + r * st.wid * 2, .len = st.wid * 2, .borrowed = true }).download(0, hb2);
+                        const hv = std.mem.bytesAsSlice(u16, @as([]align(1) u8, hb2));
+                        var acc: f64 = 0;
+                        for (hv) |h| acc += @as(f32, @bitCast(@as(u32, h) << 16));
+                        const pr = std.fmt.bufPrint(line[lw..], "{s}{d}={d:.2} ", .{ st.nm, r, acc }) catch break;
+                        lw += pr.len;
+                    }
+                }
+                var dir = std.Io.Dir.cwd();
+                var line2: [352]u8 = undefined;
+                const fin = std.fmt.bufPrint(&line2, "r{d} {s}\n", .{ e.m41_rounds, line[0..lw] }) catch return;
+                dir.writeFile(e.io, .{ .sub_path = "/tmp/m41tail.log", .data = fin }) catch {};
+            }
             return;
         }
         if (rows == 1 and w.gate.len > 0 and !e.m41_on) {
