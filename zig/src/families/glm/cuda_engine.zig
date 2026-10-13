@@ -1186,6 +1186,42 @@ pub const Engine = struct {
                 .hist = e.m41_hist.ptr,
             };
             try e.m41_router.?.route(e.stream, e.moe_pick.ptr, pairs, pairs, 16, p);
+            if (e.m41_stage_n < 3) {
+                e.m41_stage_n += 1;
+                try e.stream.synchronize();
+                var pb4: [80]u8 = undefined;
+                const c2b = @import("cuda");
+                try (c2b.DeviceBuffer{ .d = e.d, .ptr = e.m41_counts.ptr, .len = 4, .borrowed = true }).download(0, pb4[0..4]);
+                try (c2b.DeviceBuffer{ .d = e.d, .ptr = e.m41_items.ptr, .len = 36, .borrowed = true }).download(0, pb4[4..40]);
+                try (c2b.DeviceBuffer{ .d = e.d, .ptr = e.m41_members.ptr, .len = 32, .borrowed = true }).download(0, pb4[40..72]);
+                var pk4: [16]u8 = undefined;
+                try (c2b.DeviceBuffer{ .d = e.d, .ptr = e.moe_pick.ptr, .len = 32, .borrowed = true }).download(0, pk4[0..32]);
+                const cnt = std.mem.readInt(i32, pb4[0..4], .little);
+                const it = [_]i32{
+                    std.mem.readInt(i32, pb4[4..8], .little),
+                    std.mem.readInt(i32, pb4[8..12], .little),
+                    std.mem.readInt(i32, pb4[12..16], .little),
+                    std.mem.readInt(i32, pb4[16..20], .little),
+                    std.mem.readInt(i32, pb4[20..24], .little),
+                    std.mem.readInt(i32, pb4[24..28], .little),
+                };
+                const mm = [_]i32{
+                    std.mem.readInt(i32, pb4[40..44], .little),
+                    std.mem.readInt(i32, pb4[44..48], .little),
+                    std.mem.readInt(i32, pb4[48..52], .little),
+                    std.mem.readInt(i32, pb4[52..56], .little),
+                };
+                const picks4 = [_]i32{
+                    std.mem.readInt(i32, pk4[0..4], .little),
+                    std.mem.readInt(i32, pk4[4..8], .little),
+                    std.mem.readInt(i32, pk4[8..12], .little),
+                    std.mem.readInt(i32, pk4[12..16], .little),
+                };
+                var line3: [256]u8 = undefined;
+                const txt = std.fmt.bufPrint(&line3, "cnt={d} it={any} mm={any} pk={any} eng={s}\n", .{ cnt, it, mm, picks4, if (e.cont) "B" else "A" }) catch "";
+                var dir3 = std.Io.Dir.cwd();
+                dir3.writeFile(e.io, .{ .sub_path = "m41plan.log", .data = txt }) catch {};
+            }
             // up: x = normed (1 row, stride hidden), out [topk, inter_max]
             const l_up: @import("cuda").experts.Layer = .{
                 .format = .exl3,
