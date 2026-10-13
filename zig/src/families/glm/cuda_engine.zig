@@ -509,6 +509,19 @@ pub const Engine = struct {
         // the mixer's branch folds LATER, in hcFold, with THESE gates
         if (e.f32_streams) {
             try e.hck.expandMixF32(e.stream, x_old, e.branch.ptr, e.post.ptr, e.comb.ptr, layer_h.fnp, x_new, e.part.ptr, rows, false);
+            if (e.dump_on and rows == 2 and e.hc_calls == 1) {
+                    {
+                        try e.stream.synchronize();
+                        const cb = try e.gpa.alloc(u8, 3 * 3 * 12288 * 2);
+                        defer e.gpa.free(cb);
+                        try (cuda.DeviceBuffer{ .d = e.d, .ptr = e.kda_cs.ptr, .len = cb.len, .borrowed = true }).download(0, cb);
+                        var nmX: [40]u8 = undefined;
+                        e.dump_serial += 1;
+                        const fX = std.fmt.bufPrint(&nmX, "ksh{s}S{d}.bin", .{ @as([]const u8, if (e.cont) "b" else "a"), e.dump_serial }) catch unreachable;
+                        var dirX = std.Io.Dir.cwd();
+                        dirX.writeFile(e.io, .{ .sub_path = fX, .data = cb }) catch {};
+                    }
+            }
             try e.hck.splitF32(e.stream, x_old, e.part.ptr, layer_h.scale, layer_h.base, norm_w, e.eps_buf.ptr, e.normed.ptr, e.post.ptr, e.comb.ptr, rows);
         } else {
             try e.hck.expandMix(e.stream, x_old, e.branch.ptr, e.post.ptr, e.comb.ptr, layer_h.fnp, x_new, e.part.ptr, rows, false);
@@ -723,7 +736,7 @@ pub const Engine = struct {
             std.debug.print("  [kda0] q {d:.2} k {d:.2} v {d:.2} fa {d:.2} ga {d:.2} b {d:.2}\n", .{ q_s, k_s, v_s, fa_s, ga_s, b_s });
         }
         // conv: history per layer, weights the engine built at load (kda_cw)
-        const cs_at = e.kda_cs.ptr + li * 3 * Wq * 2;
+        const cs_at = e.kda_cs.ptr + li * 3 * 3 * Wq * 2;
         try e.kdk.conv(e.stream, e.proj.ptr, ps, cs_at, e.kda_cw.ptr + li * 4 * 3 * Wq * 2, e.qkv.ptr, rows);
         if (li == 0 and !e.quiet) {
             try e.stream.synchronize();
@@ -777,7 +790,7 @@ pub const Engine = struct {
         // conv-history rotate: cs becomes the last TAPS-1 rows of [cs; proj],
         // so the next window's conv sees this window's tail (their _conv_shift)
         {
-            const cs_at2 = e.kda_cs.ptr + li * 3 * Wq * 2;
+            const cs_at2 = e.kda_cs.ptr + li * 3 * 3 * Wq * 2;
             if (rows >= 3) {
                 try e.ops.copy2d(e.stream, e.proj.ptr + (rows - 3) * ps, cs_at2, 3, 3 * Wq, ps);
             } else {
@@ -1070,6 +1083,19 @@ pub const Engine = struct {
             e.xi = 0;
             if (e.mtp_emb.len != 0)
                 try e.ops.embed(e.stream, e.ids.ptr + (rows - 1) * 4, e.w.embed, e.mtp_emb.ptr, 1, hidden, hidden);
+            if (e.dump_on and rows == 2) {
+                    {
+                        try e.stream.synchronize();
+                        const cb = try e.gpa.alloc(u8, 3 * 3 * 12288 * 2);
+                        defer e.gpa.free(cb);
+                        try (cuda.DeviceBuffer{ .d = e.d, .ptr = e.kda_cs.ptr, .len = cb.len, .borrowed = true }).download(0, cb);
+                        var nmX: [40]u8 = undefined;
+                        e.dump_serial += 1;
+                        const fX = std.fmt.bufPrint(&nmX, "kse{s}S{d}.bin", .{ @as([]const u8, if (e.cont) "b" else "a"), e.dump_serial }) catch unreachable;
+                        var dirX = std.Io.Dir.cwd();
+                        dirX.writeFile(e.io, .{ .sub_path = fX, .data = cb }) catch {};
+                    }
+            }
             if (e.dump_on) {
                 try e.stream.synchronize();
                 const n = rows * 4 * hidden * 4;
@@ -1087,7 +1113,18 @@ pub const Engine = struct {
         var mi_mla: usize = 0;
         for (e.w.layers, e.w.blocks_lo..) |*L, bi| {
             e.cur_bi = @intCast(bi);
-            if (e.dump_on and bi <= e.w.blocks_lo + 2) {
+            if (e.dump_on and bi <= 21) {
+                {
+                    try e.stream.synchronize();
+                    const cb = try e.gpa.alloc(u8, 147456);
+                    defer e.gpa.free(cb);
+                    try (cuda.DeviceBuffer{ .d = e.d, .ptr = e.kda_cs.ptr, .len = 147456, .borrowed = true }).download(0, cb);
+                    var nmY: [40]u8 = undefined;
+                    e.dump_serial += 1;
+                    const fY = std.fmt.bufPrint(&nmY, "ksb{d}{s}S{d}.bin", .{ bi, @as([]const u8, if (e.cont) "b" else "a"), e.dump_serial }) catch unreachable;
+                    var dirY = std.Io.Dir.cwd();
+                    dirY.writeFile(e.io, .{ .sub_path = fY, .data = cb }) catch {};
+                }
                 try e.stream.synchronize();
                 const n = rows * 4 * e.c.hidden * 4;
                 const xb = try e.gpa.alloc(u8, n);
