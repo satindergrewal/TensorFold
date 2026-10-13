@@ -163,8 +163,8 @@ pub const Engine = struct {
     moe_tbl_down: u64 = 0,
 
     // #741 mixed path
-    m41_on: bool = false,
     m41_stage_n: u8 = 0,
+    m41_on: bool = true,
     m41_rounds: usize = 0,
     m41_up: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
     m41_up_h: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
@@ -360,6 +360,7 @@ pub const Engine = struct {
         e.logits = try cuda.DeviceBuffer.alloc(d, rows * e.c.vocab * 2);
         e.picks = try cuda.DeviceBuffer.alloc(d, rows * 4);
         e.mlp_tmp = try cuda.DeviceBuffer.alloc(d, rows * 2 * e.c.dense_inter * 2);
+
         e.mlp_act = try cuda.DeviceBuffer.alloc(d, rows * e.c.dense_inter * 2);
         e.scratch = try cuda.DeviceBuffer.alloc(d, 256 << 20);
         // the recurrent state and conv history start zeroed
@@ -1158,7 +1159,7 @@ pub const Engine = struct {
         try e.g.mm(e.stream, e.normed.ptr, w.shared_up, e.mlp_tmp.ptr + rows * inter * 2, rows, inter, hidden, false);
         try e.ops.act(e.stream, e.mlp_tmp.ptr, e.mlp_tmp.ptr + rows * inter * 2, e.mlp_act.ptr, rows, 1, inter, e.c.swiglu_limit);
         try e.g.mm(e.stream, e.mlp_act.ptr, w.shared_down, e.moe_ys.ptr, rows, hidden, inter, false);
-        if (rows == 1 and w.gate.len > 0) {
+        if (e.m41_on and rows == 1 and w.gate.len > 0) {
             const pairs = e.c.topk;
             if (e.m41_xe == null) {
                 e.m41_xe = try @import("cuda").exl3_experts.Experts.load(e.d, 148);
@@ -1167,7 +1168,7 @@ pub const Engine = struct {
                 e.m41_router = try @import("cuda").grouped.Router.resolve(mod);
                 e.m41_members = try cuda.DeviceBuffer.alloc(e.d, 8 * 4);
                 e.m41_items = try cuda.DeviceBuffer.alloc(e.d, 16 * 3 * 4);
-                e.m41_counts = try cuda.DeviceBuffer.alloc(e.d, 4);
+                e.m41_counts = try cuda.DeviceBuffer.alloc(e.d, 8);
                 e.m41_rank = try cuda.DeviceBuffer.alloc(e.d, 8 * 4);
                 e.m41_hist = try cuda.DeviceBuffer.alloc(e.d, 16 * 4);
                 var imax2: usize = 0;
@@ -1185,31 +1186,32 @@ pub const Engine = struct {
                 .rank = e.m41_rank.ptr,
                 .hist = e.m41_hist.ptr,
             };
-            try e.m41_router.?.route(e.stream, e.moe_pick.ptr, pairs, pairs, 16, p);
+            try e.m41_router.?.route(e.stream, e.moe_pick.ptr, pairs, e.c.experts, 16, p);
             if (e.m41_stage_n < 3) {
                 e.m41_stage_n += 1;
                 try e.stream.synchronize();
                 var pb4: [80]u8 = undefined;
                 const c2b = @import("cuda");
-                try (c2b.DeviceBuffer{ .d = e.d, .ptr = e.m41_counts.ptr, .len = 4, .borrowed = true }).download(0, pb4[0..4]);
-                try (c2b.DeviceBuffer{ .d = e.d, .ptr = e.m41_items.ptr, .len = 36, .borrowed = true }).download(0, pb4[4..40]);
-                try (c2b.DeviceBuffer{ .d = e.d, .ptr = e.m41_members.ptr, .len = 32, .borrowed = true }).download(0, pb4[40..72]);
-                var pk4: [16]u8 = undefined;
+                try (c2b.DeviceBuffer{ .d = e.d, .ptr = e.m41_counts.ptr, .len = 8, .borrowed = true }).download(0, pb4[0..8]);
+                try (c2b.DeviceBuffer{ .d = e.d, .ptr = e.m41_items.ptr, .len = 36, .borrowed = true }).download(0, pb4[8..44]);
+                try (c2b.DeviceBuffer{ .d = e.d, .ptr = e.m41_members.ptr, .len = 32, .borrowed = true }).download(0, pb4[44..76]);
+                var pk4: [32]u8 = undefined;
                 try (c2b.DeviceBuffer{ .d = e.d, .ptr = e.moe_pick.ptr, .len = 32, .borrowed = true }).download(0, pk4[0..32]);
                 const cnt = std.mem.readInt(i32, pb4[0..4], .little);
+                const usd = std.mem.readInt(i32, pb4[4..8], .little);
                 const it = [_]i32{
-                    std.mem.readInt(i32, pb4[4..8], .little),
                     std.mem.readInt(i32, pb4[8..12], .little),
                     std.mem.readInt(i32, pb4[12..16], .little),
                     std.mem.readInt(i32, pb4[16..20], .little),
                     std.mem.readInt(i32, pb4[20..24], .little),
                     std.mem.readInt(i32, pb4[24..28], .little),
+                    std.mem.readInt(i32, pb4[28..32], .little),
                 };
                 const mm = [_]i32{
-                    std.mem.readInt(i32, pb4[40..44], .little),
                     std.mem.readInt(i32, pb4[44..48], .little),
                     std.mem.readInt(i32, pb4[48..52], .little),
                     std.mem.readInt(i32, pb4[52..56], .little),
+                    std.mem.readInt(i32, pb4[56..60], .little),
                 };
                 const picks4 = [_]i32{
                     std.mem.readInt(i32, pk4[0..4], .little),
@@ -1218,9 +1220,33 @@ pub const Engine = struct {
                     std.mem.readInt(i32, pk4[12..16], .little),
                 };
                 var line3: [256]u8 = undefined;
-                const txt = std.fmt.bufPrint(&line3, "cnt={d} it={any} mm={any} pk={any} eng={s}\n", .{ cnt, it, mm, picks4, if (e.cont) "B" else "A" }) catch "";
+                const txt = std.fmt.bufPrint(&line3, "cnt={d} used={d} it={any} mm={any} pk={any} eng={s}\n", .{ cnt, usd, it, mm, picks4, if (e.cont) "B" else "A" }) catch "";
                 var dir3 = std.Io.Dir.cwd();
                 dir3.writeFile(e.io, .{ .sub_path = "m41plan.log", .data = txt }) catch {};
+            }
+            if (e.m41_stage_n == 1) { // A/B: the verified old path on this block
+                if (e.moe_pick_h.len == 0) {
+                    e.moe_pick_hb = try cuda.HostBuffer.alloc(e.d, e.rows_max * e.c.topk * 4);
+                    e.moe_pick_h = try e.gpa.alloc(u8, e.rows_max * e.c.topk * 4);
+                }
+                const pick_host0 = e.moe_pick_h[0 .. rows * e.c.topk * 4];
+                try e.moe_pick.downloadAsync(0, pick_host0, e.stream.handle);
+                try e.stream.synchronize();
+                const picks0 = std.mem.bytesAsSlice(i32, @as([]align(1) u8, pick_host0));
+                var k0: usize = 0;
+                while (k0 < e.c.topk) : (k0 += 1) {
+                    const ex = picks0[k0];
+                    if (ex < 0) continue;
+                    const eu: usize = @intCast(ex);
+                    try e.ex.project(e.stream, e.normed.ptr, w.gate[eu], e.moe_gu.ptr, 1);
+                    try e.ex.project(e.stream, e.normed.ptr, w.up[eu], e.moe_gu.ptr + inter * 2, 1);
+                    try e.ops.act(e.stream, e.moe_gu.ptr, e.moe_gu.ptr + inter * 2, e.moe_act.ptr, 1, 1, inter, e.c.swiglu_limit);
+                    var nb0: [32]u8 = undefined;
+                    const nm0 = std.fmt.bufPrint(&nb0, "m41_old_a{d}.bin", .{k0}) catch "m41_old_a.bin";
+                    try e.dumpBin(nm0, e.moe_act.ptr, inter * 2);
+                    try e.ex.project(e.stream, e.moe_act.ptr, w.down[eu], e.moe_ye.ptr + k0 * hidden * 2, 1);
+                }
+                try e.dumpBin("m41_old_ye.bin", e.moe_ye.ptr, rows * e.c.topk * hidden * 2);
             }
             // up: x = normed (1 row, stride hidden), out [topk, inter_max]
             const l_up: @import("cuda").experts.Layer = .{
@@ -1241,6 +1267,10 @@ pub const Engine = struct {
             l_dn.up = e.m41_down.ptr;
             l_dn.up_scale = e.m41_down_h.ptr;
             try e.m41_xe.?.runMixed(e.stream, .down_bf16, .{ .x = e.m41_out.ptr, .stride = e.m41_inter_max, .slots = 0 }, l_dn, p, e.moe_ye.ptr, pairs, -1, desc_dn);
+            if (e.m41_stage_n == 1) {
+                try e.dumpBin("m41_new_out.bin", e.m41_out.ptr, 2 * e.c.topk * e.m41_inter_max * 2);
+                try e.dumpBin("m41_new_ye.bin", e.moe_ye.ptr, rows * e.c.topk * hidden * 2);
+            }
             try e.ops.combine(e.stream, e.moe_ys.ptr, e.moe_ye.ptr, e.moe_wts.ptr, e.branch.ptr, rows, e.c.topk, hidden);
             return;
         }

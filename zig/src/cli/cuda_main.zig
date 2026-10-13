@@ -264,6 +264,8 @@ fn glmServe(gpa: std.mem.Allocator, init: std.process.Init, rest: []const [:0]co
         std.debug.print("listen failed", .{});
         return 1;
     }
+    eng.m41_on = !std.mem.eql(u8, init.environ_map.get("TF_M41") orelse "1", "0");
+    eng_b.m41_on = eng.m41_on;
     std.debug.print("glm-serve: {s} on 0.0.0.0:{d} (POST /generate with a JSON body)", .{ rest[0], port });
     // thread-per-connection: connections are accepted concurrently and queue on
     // the engine mutex (the GPU pair is a single serialized resource; streams
