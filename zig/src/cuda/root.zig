@@ -42,3 +42,4 @@ test {
 }
 
 pub const exl3 = @import("exl3.zig");
+pub const exl3_experts = @import("exl3_experts.zig");

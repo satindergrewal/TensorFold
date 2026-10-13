@@ -31,6 +31,7 @@ const kernels = [_]Kernel{
     .{ .name = "nemotron_keyed", .flags = glue },
     .{ .name = "fp8_lane", .flags = &.{"-O3"} }, // nvfp4/qmmf.cu
     .{ .name = "exl3", .flags = &.{"-O3"} }, // ours: EXL3 trellis decode GEMM, mixed K3/K4
+    .{ .name = "exl3_experts", .flags = &.{ "-O3", "--fmad=false" } }, // #741: EXL3 routed experts on grouped.zig's plan
     .{ .name = "glm_hc", .flags = &.{"-O3"} }, // GLM hyper-connection boundaries
     .{ .name = "glm_ops", .flags = &.{"-O3"} }, // GLM dense ops: embed/rms/act/combine/mean/add/argmax/route
     .{ .name = "glm_kda", .flags = &.{"-O3"} }, // GLM KDA conv + delta step
