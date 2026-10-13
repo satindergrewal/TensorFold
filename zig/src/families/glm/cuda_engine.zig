@@ -1303,9 +1303,11 @@ pub const Engine = struct {
                     }
                 }
                 var dir = std.Io.Dir.cwd();
+                var fn2: [48]u8 = undefined;
+                const fname = std.fmt.bufPrint(&fn2, "/tmp/m41r{d}.log", .{e.m41_rounds}) catch return;
                 var line2: [352]u8 = undefined;
                 const fin = std.fmt.bufPrint(&line2, "r{d} {s}\n", .{ e.m41_rounds, line[0..lw] }) catch return;
-                dir.writeFile(e.io, .{ .sub_path = "/tmp/m41tail.log", .data = fin }) catch {};
+                dir.writeFile(e.io, .{ .sub_path = fname, .data = fin }) catch {};
             }
             return;
         }
