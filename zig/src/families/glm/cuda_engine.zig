@@ -1305,8 +1305,23 @@ pub const Engine = struct {
                 var dir = std.Io.Dir.cwd();
                 var fn2: [48]u8 = undefined;
                 const fname = std.fmt.bufPrint(&fn2, "/tmp/m41r{d}.log", .{e.m41_rounds}) catch return;
-                var line2: [352]u8 = undefined;
-                const fin = std.fmt.bufPrint(&line2, "r{d} {s}\n", .{ e.m41_rounds, line[0..lw] }) catch return;
+                var line2: [420]u8 = undefined;
+                // probe 2: the plan state (counts + first item) and probe 3: which engine
+                var extra: [128]u8 = undefined;
+                var ew: usize = 0;
+                {
+                    var cb4: [16]u8 = undefined;
+                    try (c2.DeviceBuffer{ .d = e.d, .ptr = e.m41_counts.ptr, .len = 4, .borrowed = true }).download(0, cb4[0..4]);
+                    var ib4: [12]u8 = undefined;
+                    try (c2.DeviceBuffer{ .d = e.d, .ptr = e.m41_items.ptr, .len = 12, .borrowed = true }).download(0, ib4[0..12]);
+                    const cnt = std.mem.readInt(i32, cb4[0..4], .little);
+                    const it0 = std.mem.readInt(i32, ib4[0..4], .little);
+                    const it1 = std.mem.readInt(i32, ib4[4..8], .little);
+                    const it2 = std.mem.readInt(i32, ib4[8..12], .little);
+                    const pr2 = std.fmt.bufPrint(extra[ew..], "cnt={d} item=({d},{d},{d}) eng={s} ", .{ cnt, it0, it1, it2, if (e.cont) "B" else "A" }) catch return;
+                    ew += pr2.len;
+                }
+                const fin = std.fmt.bufPrint(&line2, "r{d} {s}{s}\n", .{ e.m41_rounds, extra[0..ew], line[0..lw] }) catch return;
                 dir.writeFile(e.io, .{ .sub_path = fname, .data = fin }) catch {};
             }
             return;
