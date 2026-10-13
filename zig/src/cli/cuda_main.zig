@@ -232,6 +232,9 @@ fn glmServe(gpa: std.mem.Allocator, init: std.process.Init, rest: []const [:0]co
     // engine A's mtp_emb relay buffer must land on GPU 0: allocate under A's context
     try ctx.makeCurrent();
     try eng.wantMtpEmb();
+    for (rest) |a| {
+        if (std.mem.eql(u8, a, "--dump-pf")) pf_dump = true;
+    }
     try ctx.makeCurrent();
     try eng.wantPrefillCache();
     try ctx1.makeCurrent();
@@ -283,6 +286,29 @@ fn glmServe(gpa: std.mem.Allocator, init: std.process.Init, rest: []const [:0]co
 /// One request through the split: the prompt on A, handoff, tail on B; then
 /// decode rows alternate A -> handoff -> B -> handoff... (the split-decode
 /// test's pattern, folded into the server).
+var pf_dump = false; // --dump-pf: dump state at cold-snapshot and warm-restore
+
+fn dumpPfState(tag: []const u8, eng: *glm.engine.Engine, gpa: std.mem.Allocator) void {
+    const pairs = .{
+        .{ "x0", eng.x[0] },     .{ "x1", eng.x[1] },
+        .{ "br", eng.branch },   .{ "post", eng.post },
+        .{ "comb", eng.comb },   .{ "st0", eng.pf_st0 },
+        .{ "st1", eng.pf_st1 },  .{ "cs", eng.pf_cs },
+    };
+    inline for (pairs) |pr| {
+        const buf = pr[1];
+        if (buf.len != 0) {
+            const hb = gpa.alloc(u8, buf.len) catch return;
+            defer gpa.free(hb);
+            buf.download(0, hb) catch return;
+            var nm: [64]u8 = undefined;
+            const f = std.fmt.bufPrint(&nm, "/tmp/pf_{s}_{s}.bin", .{ tag, pr[0] }) catch return;
+            var dir = std.Io.Dir.cwd();
+            dir.writeFile(eng.io, .{ .sub_path = f, .data = hb }) catch {};
+        }
+    }
+}
+
 // single-entry prefill cache: the last prompt's full state
 var pf_valid: bool = false;
 var pf_key: u64 = 0;
@@ -374,38 +400,19 @@ fn serveSplit(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engin
         eng.xi = pf_xi_a;
         eng.fwd_count = 1;
         try eng.stream.synchronize();
-        const hx0 = try gpa.alloc(u8, eng.x[0].len);
-        defer gpa.free(hx0);
-        try eng.x[0].downloadAsync(0, hx0, eng.stream.handle);
-        const hx1 = try gpa.alloc(u8, eng.x[1].len);
-        defer gpa.free(hx1);
-        try eng.x[1].downloadAsync(0, hx1, eng.stream.handle);
-        const hbr = try gpa.alloc(u8, eng.branch.len);
-        defer gpa.free(hbr);
-        try eng.branch.downloadAsync(0, hbr, eng.stream.handle);
-        const hpo = try gpa.alloc(u8, eng.post.len);
-        defer gpa.free(hpo);
-        try eng.post.downloadAsync(0, hpo, eng.stream.handle);
-        const hco = try gpa.alloc(u8, eng.comb.len);
-        defer gpa.free(hco);
-        try eng.comb.downloadAsync(0, hco, eng.stream.handle);
-        const hme_opt: ?[]u8 = if (eng.mtp_emb.len != 0) try gpa.alloc(u8, eng.mtp_emb.len) else null;
-        defer if (hme_opt) |m| gpa.free(m);
-        if (hme_opt) |m| try eng.mtp_emb.downloadAsync(0, m, eng.stream.handle);
-        try eng.stream.synchronize();
         try ctx1.makeCurrent();
         try eng_b.restorePrefill();
         @memcpy(eng_b.kda_st_cur, pf_cur_b[0..eng_b.kda_st_cur.len]);
         eng_b.xi = pf_xi_b;
         eng_b.fwd_count = 1;
-        try eng_b.x[0].uploadAsync(0, hx0, eng_b.stream.handle);
-        try eng_b.x[1].uploadAsync(0, hx1, eng_b.stream.handle);
-        try eng_b.branch.uploadAsync(0, hbr, eng_b.stream.handle);
-        try eng_b.post.uploadAsync(0, hpo, eng_b.stream.handle);
-        try eng_b.comb.uploadAsync(0, hco, eng_b.stream.handle);
-        if (hme_opt) |m| try eng_b.mtp_emb.uploadAsync(0, m, eng_b.stream.handle);
         try eng_b.stream.synchronize();
         cache_hit = true;
+        if (pf_dump) {
+            dumpPfState("warmA", eng, gpa);
+            try ctx1.makeCurrent();
+            dumpPfState("warmB", eng_b, gpa);
+            std.debug.print("pf: warm state dumped\n", .{});
+        }
     }
     try ctx.makeCurrent();
     if (!cache_hit) try eng.resetState();
@@ -457,6 +464,13 @@ fn serveSplit(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engin
         pf_key = key;
         pf_len = n_ids;
         pf_valid = true;
+        if (pf_dump) {
+            dumpPfState("coldA", eng, gpa);
+            try ctx1.makeCurrent();
+            dumpPfState("coldB", eng_b, gpa);
+            try ctx.makeCurrent();
+            std.debug.print("pf: cold state dumped\n", .{});
+        }
         try ctx1.makeCurrent();
     }
     var pick: [128]u8 = undefined;

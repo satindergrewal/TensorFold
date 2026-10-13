@@ -203,6 +203,7 @@ pub const Engine = struct {
     pf_mla_ik: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
     pf_mla_ig: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
     pf_mla_pool: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
+    pf_y: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true }, // the tail stream-mean: the MTP draft's h input
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, dir: []const u8, opts: Options) !*Engine {
         const e = try gpa.create(Engine);
@@ -1096,6 +1097,7 @@ pub const Engine = struct {
         e.pf_branch = try cuda.DeviceBuffer.alloc(d, e.branch.len);
         e.pf_post = try cuda.DeviceBuffer.alloc(d, e.post.len);
         e.pf_comb = try cuda.DeviceBuffer.alloc(d, e.comb.len);
+        e.pf_y = try cuda.DeviceBuffer.alloc(d, e.y.len);
         if (e.mla_keys.len != 0) {
             e.pf_mla_keys = try cuda.DeviceBuffer.alloc(d, e.mla_keys.len);
             e.pf_mla_ik = try cuda.DeviceBuffer.alloc(d, e.mla_ik.len);
@@ -1121,6 +1123,7 @@ pub const Engine = struct {
         try e.snapCopy(e.pf_branch, e.branch);
         try e.snapCopy(e.pf_post, e.post);
         try e.snapCopy(e.pf_comb, e.comb);
+        try e.snapCopy(e.pf_y, e.y);
         if (e.mla_keys.len != 0) {
             try e.snapCopy(e.pf_mla_keys, e.mla_keys);
             try e.snapCopy(e.pf_mla_ik, e.mla_ik);
@@ -1142,6 +1145,7 @@ pub const Engine = struct {
         try e.snapCopy(e.branch, e.pf_branch);
         try e.snapCopy(e.post, e.pf_post);
         try e.snapCopy(e.comb, e.pf_comb);
+        try e.snapCopy(e.y, e.pf_y);
         if (e.mla_keys.len != 0) {
             try e.snapCopy(e.mla_keys, e.pf_mla_keys);
             try e.snapCopy(e.mla_ik, e.pf_ik_dst());
