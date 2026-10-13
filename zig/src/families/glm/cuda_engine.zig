@@ -55,7 +55,7 @@ const Gemms = struct {
     /// D . W^T with independent row strides (bytes) for x, W and out.
     fn mmStrided(g: *Gemms, s: cuda.Stream, x: u64, xs: usize, w: u64, ws_: usize, out: u64, os: usize, rows: usize, n: usize, k: usize) !void {
         // a dedicated Linear per stride combo
-        const m: usize = if (rows == 1) 2 else rows; // 1-row pads to the 2-row plan (spec-decode bit parity)
+        const m: usize = if (rows == 1 and mpad_on) 2 else rows; // 1-row pads to the 2-row plan (spec-decode bit parity)
         const id = key(m | (xs << 8), n, k, false) ^ (ws_ << 20) ^ (os << 26);
         const gop = try g.map.getOrPut(id);
         if (!gop.found_existing) {
@@ -72,7 +72,7 @@ const Gemms = struct {
 
     /// D[rows, n] = X[rows, k] . W[k, n] (W UNtransposed: row-major x @ W).
     fn mmNT(g: *Gemms, s: cuda.Stream, x: u64, xs: usize, w: u64, ws_: usize, out: u64, os: usize, rows: usize, n: usize, k: usize) !void {
-        const m: usize = if (rows == 1) 2 else rows; // 1-row pads to the 2-row plan (spec-decode bit parity)
+        const m: usize = if (rows == 1 and mpad_on) 2 else rows; // 1-row pads to the 2-row plan (spec-decode bit parity)
         const id = key(m | (xs << 8), n, k, false) ^ (ws_ << 20) ^ (os << 26) ^ 0x5A5A;
         const gop = try g.map.getOrPut(id);
         if (!gop.found_existing)
@@ -87,7 +87,7 @@ const Gemms = struct {
     fn mm(g: *Gemms, s: cuda.Stream, x: u64, w: u64, out: u64, rows: usize, n: usize, k: usize, f32_out: bool) !void {
         // m=1 pads to an m=2 plan: 1-row and 2-row windows then share GEMM bits
         // for row 0, so speculative verify rounds agree with plain greedy rounds
-        const m: usize = if (rows == 1) 2 else rows;
+        const m: usize = if (rows == 1 and mpad_on) 2 else rows;
         const id = key(m, n, k, f32_out);
         const gop = try g.map.getOrPut(id);
         if (!gop.found_existing)
@@ -98,6 +98,8 @@ const Gemms = struct {
         };
     }
 };
+
+pub var mpad_on: bool = true; // perf probe: the rows==1->m=2 spec-parity padding
 
 pub const Engine = struct {
     gpa: std.mem.Allocator,

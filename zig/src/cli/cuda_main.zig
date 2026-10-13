@@ -234,6 +234,7 @@ fn glmServe(gpa: std.mem.Allocator, init: std.process.Init, rest: []const [:0]co
     try eng.wantMtpEmb();
     for (rest) |a| {
         if (std.mem.eql(u8, a, "--dump-pf")) pf_dump = true;
+        if (std.mem.eql(u8, a, "--no-mpad")) glm.engine.mpad_on = false;
     }
     try ctx.makeCurrent();
     try eng.wantPrefillCache();
