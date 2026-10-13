@@ -161,7 +161,7 @@ pub const Engine = struct {
     moe_tbl_gate: u64 = 0,
     moe_tbl_up: u64 = 0,
     moe_tbl_down: u64 = 0,
-    moe_grouped: bool = false,
+
     // #741 mixed path
     m41_on: bool = false,
     m41_rounds: usize = 0,
@@ -1141,10 +1141,12 @@ pub const Engine = struct {
         e.m41_hist = try cuda.DeviceBuffer.alloc(e.d, 16 * 4);
         e.m41_out = try cuda.DeviceBuffer.alloc(e.d, 2 * e.c.topk * inter_max * 2);
         e.m41_act = try cuda.DeviceBuffer.alloc(e.d, e.c.topk * inter_max * 2);
+        e.m41Stage("allocs-done ");
         e.m41_xe = @import("cuda").exl3_experts.Experts.load(e.d, 148) catch |err| {
             e.m41Err("experts-load", err);
             return err;
         };
+        e.m41Stage("experts-loaded ");
         e.m41Stage("allocs ");
         // router from the experts module: grouped.Router.resolve needs the experts
         // fatbin module - Experts doesn't expose it; load a second module instance
@@ -1159,6 +1161,7 @@ pub const Engine = struct {
             e.m41_router = try @import("cuda").grouped.Router.resolve(mod);
         }
         e.m41Stage("repack-begin ");
+        e.m41Stage("router-ok ");
         // host staging: copy each expert's trellis + halves into the stacks, fill descs
         const du = try e.gpa.alloc(u8, E * 2 * @sizeOf(MatDesc));
         defer e.gpa.free(du);
@@ -1238,126 +1241,6 @@ pub const Engine = struct {
         try e.g.mm(e.stream, e.normed.ptr, w.shared_up, e.mlp_tmp.ptr + rows * inter * 2, rows, inter, hidden, false);
         try e.ops.act(e.stream, e.mlp_tmp.ptr, e.mlp_tmp.ptr + rows * inter * 2, e.mlp_act.ptr, rows, 1, inter, e.c.swiglu_limit);
         try e.g.mm(e.stream, e.mlp_act.ptr, w.shared_down, e.moe_ys.ptr, rows, hidden, inter, false);
-        if (rows == 1 and w.gate.len > 0 and !e.moe_grouped) {
-            e.moe_tbl_gate = try e.ex.tableFrom(e.stream, w.gate);
-            e.moe_tbl_up = try e.ex.tableFrom(e.stream, w.up);
-            e.moe_tbl_down = try e.ex.tableFrom(e.stream, w.down);
-            var inter_max: usize = 0;
-            var tn_i: usize = 0;
-            var tn_h: usize = 0;
-            for (w.gate) |gw| {
-                inter_max = @max(inter_max, gw.n);
-                tn_i = @max(tn_i, gw.tilesN());
-            }
-            for (w.down) |dw2| tn_h = @max(tn_h, dw2.tilesN());
-            e.moe_inter_max = inter_max;
-            e.moe_tn_i = tn_i;
-            e.moe_tn_h = tn_h;
-            e.moe_k_blocks = (e.c.hidden + 127) / 128;
-            const k_max = e.c.hidden;
-            e.moe_xt = try cuda.DeviceBuffer.alloc(e.d, e.c.topk * k_max * 2);
-            e.moe_yg = try cuda.DeviceBuffer.alloc(e.d, e.c.topk * inter_max * 2);
-            e.moe_yu = try cuda.DeviceBuffer.alloc(e.d, e.c.topk * inter_max * 2);
-            e.moe_act_g = try cuda.DeviceBuffer.alloc(e.d, e.c.topk * inter_max * 2);
-            e.moe_grouped = true;
-        }
-        if (rows == 1 and e.moe_grouped) {
-            // GROUPED: 9 launches + 8 act, picks on device, no host sync.
-            // gate/up: x row0 (stride 0 rows), xt scratch [topk, inter_max stride]
-            try e.ex.projectGroupedFull(e.stream, e.normed.ptr, 0, e.moe_tbl_gate, e.moe_pick.ptr, e.moe_xt.ptr, e.moe_yg.ptr, e.moe_inter_max, e.c.topk, e.moe_k_blocks, e.moe_tn_i);
-            if (group_stage == 1) {
-                // bisect stage 1: gate grouped, up/act/down on the host loop
-                const ph1 = e.moe_pick_h[0 .. rows * e.c.topk * 4];
-                try e.moe_pick.downloadAsync(0, ph1, e.stream.handle);
-                try e.stream.synchronize();
-                const pk1 = std.mem.bytesAsSlice(i32, @as([]align(1) u8, ph1));
-                var k1: usize = 0;
-                while (k1 < e.c.topk) : (k1 += 1) {
-                    const ex1 = pk1[k1];
-                    if (ex1 < 0) continue;
-                    const eu1: usize = @intCast(ex1);
-                    try e.ex.project(e.stream, e.normed.ptr, w.up[eu1], e.moe_gu.ptr + inter * 2, 1);
-                    try e.ops.act(e.stream, e.moe_yg.ptr + k1 * e.moe_inter_max * 2, e.moe_gu.ptr + inter * 2, e.moe_act_g.ptr + k1 * e.moe_inter_max * 2, 1, 1, e.moe_inter_max, e.c.swiglu_limit);
-                    const ye_at1 = e.moe_ye.ptr + k1 * hidden * 2;
-                    try e.ex.project(e.stream, e.moe_act_g.ptr + k1 * e.moe_inter_max * 2, w.down[eu1], ye_at1, 1);
-                }
-                try e.ops.combine(e.stream, e.moe_ys.ptr, e.moe_ye.ptr, e.moe_wts.ptr, e.branch.ptr, rows, e.c.topk, hidden);
-                return;
-            }
-            try e.ex.projectGroupedFull(e.stream, e.normed.ptr, 0, e.moe_tbl_up, e.moe_pick.ptr, e.moe_xt.ptr, e.moe_yu.ptr, e.moe_inter_max, e.c.topk, e.moe_k_blocks, e.moe_tn_i);
-            if (group_stage == 2) {
-                // stage 2: gate+up grouped; act+down on the host loop
-                const ph2 = e.moe_pick_h[0 .. rows * e.c.topk * 4];
-                try e.moe_pick.downloadAsync(0, ph2, e.stream.handle);
-                try e.stream.synchronize();
-                const pk2 = std.mem.bytesAsSlice(i32, @as([]align(1) u8, ph2));
-                var k2: usize = 0;
-                while (k2 < e.c.topk) : (k2 += 1) {
-                    const ex2 = pk2[k2];
-                    if (ex2 < 0) continue;
-                    const eu2: usize = @intCast(ex2);
-                    try e.ops.act(e.stream, e.moe_yg.ptr + k2 * e.moe_inter_max * 2, e.moe_yu.ptr + k2 * e.moe_inter_max * 2, e.moe_act_g.ptr + k2 * e.moe_inter_max * 2, 1, 1, e.moe_inter_max, e.c.swiglu_limit);
-                    const ye_at2 = e.moe_ye.ptr + k2 * hidden * 2;
-                    try e.ex.project(e.stream, e.moe_act_g.ptr + k2 * e.moe_inter_max * 2, w.down[eu2], ye_at2, 1);
-                }
-                try e.ops.combine(e.stream, e.moe_ys.ptr, e.moe_ye.ptr, e.moe_wts.ptr, e.branch.ptr, rows, e.c.topk, hidden);
-                return;
-            }
-            var k2: usize = 0;
-            while (k2 < e.c.topk) : (k2 += 1) {
-                try e.ops.act(e.stream, e.moe_yg.ptr + k2 * e.moe_inter_max * 2, e.moe_yu.ptr + k2 * e.moe_inter_max * 2, e.moe_act_g.ptr + k2 * e.moe_inter_max * 2, 1, 1, e.moe_inter_max, e.c.swiglu_limit);
-            }
-            // down: x = act_g [topk, inter_max stride]; y = moe_ye rows [topk, hidden]
-            try e.ex.projectGroupedFull(e.stream, e.moe_act_g.ptr, e.moe_inter_max, e.moe_tbl_down, e.moe_pick.ptr, e.moe_xt.ptr, e.moe_ye.ptr, e.c.hidden, e.c.topk, (e.moe_inter_max + 127) / 128, e.moe_tn_h);
-            try e.ops.combine(e.stream, e.moe_ys.ptr, e.moe_ye.ptr, e.moe_wts.ptr, e.branch.ptr, rows, e.c.topk, hidden);
-            // tail-dump instrument (the proven pattern): fused-out + down-out rows
-            if (e.m41_rounds < 12) {
-                try e.stream.synchronize();
-                e.m41_rounds += 1;
-                const c2 = @import("cuda");
-                var line: [320]u8 = undefined;
-                var lw: usize = 0;
-                for ([_]struct { nm: []const u8, buf: u64, wid: usize }{
-                    .{ .nm = "up", .buf = e.m41_out.ptr, .wid = e.m41_inter_max },
-                    .{ .nm = "dn", .buf = e.moe_ye.ptr, .wid = hidden },
-                }) |st| {
-                    var rs: []u8 = undefined;
-                    _ = &rs;
-                    const hb2 = try e.gpa.alloc(u8, st.wid * 2);
-                    defer e.gpa.free(hb2);
-                    for (0..e.c.topk) |r| {
-                        try (c2.DeviceBuffer{ .d = e.d, .ptr = st.buf + r * st.wid * 2, .len = st.wid * 2, .borrowed = true }).download(0, hb2);
-                        const hv = std.mem.bytesAsSlice(u16, @as([]align(1) u8, hb2));
-                        var acc: f64 = 0;
-                        for (hv) |h| acc += @as(f32, @bitCast(@as(u32, h) << 16));
-                        const pr = std.fmt.bufPrint(line[lw..], "{s}{d}={d:.2} ", .{ st.nm, r, acc }) catch break;
-                        lw += pr.len;
-                    }
-                }
-                var dir = std.Io.Dir.cwd();
-                var fn2: [48]u8 = undefined;
-                const fname = std.fmt.bufPrint(&fn2, "m41r{d}.log", .{e.m41_rounds}) catch return; // RELATIVE: the pb-dump pattern
-                var line2: [420]u8 = undefined;
-                // probe 2: the plan state (counts + first item) and probe 3: which engine
-                var extra: [128]u8 = undefined;
-                var ew: usize = 0;
-                if (e.m41_counts.len != 0) {
-                    var cb4: [16]u8 = undefined;
-                    try (c2.DeviceBuffer{ .d = e.d, .ptr = e.m41_counts.ptr, .len = 4, .borrowed = true }).download(0, cb4[0..4]);
-                    var ib4: [12]u8 = undefined;
-                    try (c2.DeviceBuffer{ .d = e.d, .ptr = e.m41_items.ptr, .len = 12, .borrowed = true }).download(0, ib4[0..12]);
-                    const cnt = std.mem.readInt(i32, cb4[0..4], .little);
-                    const it0 = std.mem.readInt(i32, ib4[0..4], .little);
-                    const it1 = std.mem.readInt(i32, ib4[4..8], .little);
-                    const it2 = std.mem.readInt(i32, ib4[8..12], .little);
-                    const pr2 = std.fmt.bufPrint(extra[ew..], "cnt={d} item=({d},{d},{d}) eng={s} ", .{ cnt, it0, it1, it2, if (e.cont) "B" else "A" }) catch return;
-                    ew += pr2.len;
-                }
-                const fin = std.fmt.bufPrint(&line2, "r{d} {s}{s}\n", .{ e.m41_rounds, extra[0..ew], line[0..lw] }) catch return;
-                dir.writeFile(e.io, .{ .sub_path = fname, .data = fin }) catch {};
-            }
-            return;
-        }
         if (rows == 1 and w.gate.len > 0 and !e.m41_on) {
             try e.m41Setup(w);
         }
