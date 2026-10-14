@@ -369,7 +369,7 @@ fn serveSplit(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engin
     req_counter += 1;
     eng_b.mtp_tag = req_counter;
     eng_b.mtp_calls = 0;
-    var buf: [1 << 16]u8 = undefined;
+    var buf: [4 << 20]u8 = undefined;
     var n: usize = 0;
     while (n < buf.len) {
         const got: isize = @bitCast(posix.system.read(fd, buf[n..].ptr, buf.len - n));
