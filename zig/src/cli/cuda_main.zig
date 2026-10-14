@@ -306,6 +306,7 @@ fn handleConn(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engin
     defer engine_mutex.unlock(eng.io);
     serveSplit(gpa, eng, eng_b, ctx, ctx1, fd) catch |err| {
         std.debug.print("request: {}", .{err});
+        _ = posix.system.write(fd, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", 71);
         if (@errorReturnTrace()) |tr| std.debug.dumpStackTrace(tr.*);
     };
 }
