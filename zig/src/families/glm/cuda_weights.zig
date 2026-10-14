@@ -359,7 +359,10 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const Driver, dir: []const u
     w.blocks_lo = lo;
     w.blocks_hi = hi;
 
-    if (lo == 0) {
+    {
+        // the embedding now loads on BOTH split devices: the MTP draft head
+        // re-embeds its own last pick (one-ahead drafts for verify), which the
+        // head-side engine needs locally.
         const t = try ck.get(prefix ++ "embed_tokens.weight");
         if (t.dim(0) != c.vocab or t.dim(1) != c.hidden) return error.BadEmbed;
         w.embed = try L.bf16(prefix ++ "embed_tokens.weight");

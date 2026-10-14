@@ -265,6 +265,7 @@ fn glmServe(gpa: std.mem.Allocator, init: std.process.Init, rest: []const [:0]co
         return 1;
     }
     eng.m41_on = !std.mem.eql(u8, init.environ_map.get("TF_M41") orelse "1", "0");
+    verify_dbg = init.environ_map.get("TF_VDBG") != null;
     eng_b.m41_on = eng.m41_on;
     std.debug.print("glm-serve: {s} on 0.0.0.0:{d} (POST /generate with a JSON body)", .{ rest[0], port });
     // thread-per-connection: connections are accepted concurrently and queue on
@@ -347,6 +348,7 @@ var pf_xi_a: usize = 0;
 var pf_xi_b: usize = 0;
 var pf_pick0: u32 = 0;
 var pf_draft0: u32 = 0;
+var verify_dbg: bool = false;
 
 fn hashIds(ids: []const u32) u64 {
     var h: u64 = 1469598103934665603;
@@ -609,6 +611,7 @@ fn serveSplit(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engin
                 eng_b.dump_on = false;
                 eng_b.quiet = true;
             }
+        if (verify_dbg and rejects + accepts < 8) std.debug.print("VRF r{d} pos {d}: draft {d} vs pick0 {d} pick1 {d} mtp {d}\n", .{ req_counter, pos, cur_draft, pv[0], pv[1], pv[2] });
             if (pv[0] == cur_draft) {
                 accepts += 1;
                 if (n_out < out_ids.len) {

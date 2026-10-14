@@ -367,7 +367,6 @@ pub const Engine = struct {
         e.qkv = try cuda.DeviceBuffer.alloc(d, rows * 3 * W * 2);
         e.fg = try cuda.DeviceBuffer.alloc(d, rows * 2 * W * 2);
         e.bv = try cuda.DeviceBuffer.alloc(d, rows * e.c.kda_heads * 2);
-        std.debug.print("BUFS normed={x} part={x} y={x} proj={x} qkv={x} fg={x} bv={x} normed_len={d} fg_len={d} proj_len={d} y_len={d}\\n", .{ e.normed.ptr, e.part.ptr, e.y.ptr, e.proj.ptr, e.qkv.ptr, e.fg.ptr, e.bv.ptr, e.normed.len, e.fg.len, e.proj.len, e.y.len });
         e.kda_st0 = try cuda.DeviceBuffer.alloc(d, n_kda * e.c.kda_heads * D * D * 4);
         e.kda_st1 = try cuda.DeviceBuffer.alloc(d, n_kda * e.c.kda_heads * D * D * 4);
         e.kda_cs = try cuda.DeviceBuffer.alloc(d, n_kda * (4 - 1) * 3 * W * 2);
@@ -645,19 +644,6 @@ pub const Engine = struct {
         return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
     }
 
-    fn nfpPrint(e: *Engine, tag: []const u8) !void {
-        try e.stream.synchronize();
-        const nb = try e.gpa.alloc(u8, 8192);
-        defer e.gpa.free(nb);
-        (cuda.DeviceBuffer{ .d = e.d, .ptr = e.normed.ptr, .len = 8192, .borrowed = true }).download(0, nb) catch return;
-        var acc: f32 = 0;
-        for (0..32) |i| {
-            const h: u16 = std.mem.readInt(u16, nb[i * 2 ..][0..2], .little);
-            acc += @as(f32, @bitCast(@as(u32, h) << 16));
-        }
-        std.debug.print("  NFP {s} {d:.4}\n", .{ tag, acc });
-    }
-
     fn kdaLayer(e: *Engine, li: usize, w: *const weights.Kda, rows: usize) !void {
         if (e.dump_on and li == 0) {
             try e.stream.synchronize();
@@ -784,24 +770,15 @@ pub const Engine = struct {
         const xst = c.hidden * 2;
         const wst = c.hidden * 2;
         const ost = ps * 2;
-        if (li == 0 and !e.quiet) try e.nfpPrint("g0");
         try e.g.mmStrided(e.stream, e.normed.ptr, xst, w.q, wst, e.proj.ptr, ost, rows, Wq, c.hidden);
-        if (li == 0 and !e.quiet) try e.nfpPrint("g1-q");
         try e.g.mmStrided(e.stream, e.normed.ptr, xst, w.k, wst, e.proj.ptr + Wq * 2, ost, rows, Wq, c.hidden);
-        if (li == 0 and !e.quiet) try e.nfpPrint("g2-k");
         try e.g.mmStrided(e.stream, e.normed.ptr, xst, w.v, wst, e.proj.ptr + 2 * Wq * 2, ost, rows, Wq, c.hidden);
-        if (li == 0 and !e.quiet) try e.nfpPrint("g3-v");
         try e.g.mmStrided(e.stream, e.normed.ptr, xst, w.f_a, wst, e.proj.ptr + 3 * Wq * 2, ost, rows, D, c.hidden);
-        if (li == 0 and !e.quiet) try e.nfpPrint("g4-fa");
         try e.g.mmStrided(e.stream, e.normed.ptr, xst, w.g_a, wst, e.proj.ptr + (3 * Wq + D) * 2, ost, rows, D, c.hidden);
-        if (li == 0 and !e.quiet) try e.nfpPrint("g5-ga");
         try e.g.mmStrided(e.stream, e.normed.ptr, xst, w.b, wst, e.proj.ptr + (3 * Wq + 2 * D) * 2, ost, rows, H, c.hidden);
-        if (li == 0 and !e.quiet) try e.nfpPrint("g6-b");
         // f_b / g_b on the f_a/g_a slices; the step kernel reads fg interleaved [rows, 2Wq]
         try e.g.mmStrided(e.stream, e.proj.ptr + 3 * Wq * 2, ost, w.f_b, D * 2, e.fg.ptr, 2 * Wq * 2, rows, Wq, D);
-        if (li == 0 and !e.quiet) try e.nfpPrint("g7-fb");
         try e.g.mmStrided(e.stream, e.proj.ptr + (3 * Wq + D) * 2, ost, w.g_b, D * 2, e.fg.ptr + Wq * 2, 2 * Wq * 2, rows, Wq, D);
-        if (li == 0 and !e.quiet) try e.nfpPrint("g8-gb");
         if (li == 0 and !e.quiet) {
             try e.stream.synchronize();
             const fb2 = try e.gpa.alloc(u8, 2 * Wq * 2);
@@ -856,49 +833,9 @@ pub const Engine = struct {
                 b_s += @as(f32, @bitCast(@as(u32, h) << 16));
             }
             std.debug.print("  [kda0{s}] q {d:.2} k {d:.2} v {d:.2} fa {d:.2} ga {d:.2} b {d:.2}\n", .{ @as([]const u8, if (e.cont) "b" else "a"), q_s, k_s, v_s, fa_s, ga_s, b_s });
-            if (li == 0 and !e.quiet) try e.nfpPrint("g9-predump");
-            if (e.fwd_count != 1) {
-                // debug dumps only on the first forward; the block itself continues
-            } else {
-            const tg: []const u8 = if (e.cont) "b" else "a";
-            var nm9: [24]u8 = undefined;
-            try e.dumpBin(std.fmt.bufPrint(&nm9, "nf{s}.bin", .{tg}) catch "nfx.bin", e.normed.ptr, 8192);
-            if (li == 0 and !e.quiet) try e.nfpPrint("gA-postnf");
-            try e.dumpBin(std.fmt.bufPrint(&nm9, "w_b{s}.bin", .{tg}) catch "w_bx.bin", w.b, 128);
-            if (li == 0 and !e.quiet) try e.nfpPrint("gB-postwb");
-            try e.dumpBin(std.fmt.bufPrint(&nm9, "pq{s}.bin", .{tg}) catch "pqx.bin", e.proj.ptr, 64);
-            try e.dumpBin(std.fmt.bufPrint(&nm9, "pb{s}.bin", .{tg}) catch "pbx.bin", e.proj.ptr + (3 * Wq + 2 * D) * 2, 128);
-            try e.dumpBin(std.fmt.bufPrint(&nm9, "na{s}.bin", .{tg}) catch "nax.bin", e.normed.ptr, 8192);
-            try e.dumpBin(std.fmt.bufPrint(&nm9, "fg{s}.bin", .{tg}) catch "fgx.bin", e.fg.ptr, 2 * Wq * 2);
-            try e.dumpBin(std.fmt.bufPrint(&nm9, "bv{s}.bin", .{tg}) catch "bvx.bin", e.bv.ptr, H * 2);
-            try e.dumpBin(std.fmt.bufPrint(&nm9, "qkv{s}.bin", .{tg}) catch "qkvx.bin", e.qkv.ptr, 3 * Wq * 2);
-            try e.dumpBin(std.fmt.bufPrint(&nm9, "yy{s}.bin", .{tg}) catch "yyx.bin", e.y.ptr, Wq * 2);
-            }
         }
         // conv history + weights (their chain layout)
         const cs_at = e.kda_cs.ptr + li * 3 * 3 * Wq * 2;
-        if (li == 0 and !e.quiet) {
-            try e.stream.synchronize();
-            const qb2 = try e.gpa.alloc(u8, 3 * Wq * 2);
-            defer e.gpa.free(qb2);
-            try e.qkv.download(0, qb2);
-            var qq: f64 = 0;
-            var kk: f64 = 0;
-            var vv: f64 = 0;
-            for (0..Wq) |d| {
-                const h: u16 = std.mem.readInt(u16, qb2[d * 2 ..][0..2], .little);
-                qq += @as(f32, @bitCast(@as(u32, h) << 16));
-            }
-            for (0..Wq) |d| {
-                const h: u16 = std.mem.readInt(u16, qb2[(Wq + d) * 2 ..][0..2], .little);
-                kk += @as(f32, @bitCast(@as(u32, h) << 16));
-            }
-            for (0..Wq) |d| {
-                const h: u16 = std.mem.readInt(u16, qb2[(2 * Wq + d) * 2 ..][0..2], .little);
-                vv += @as(f32, @bitCast(@as(u32, h) << 16));
-            }
-            std.debug.print("  [kda0] convq {d:.2} convk {d:.2} convv {d:.2}\n", .{ qq, kk, vv });
-        }
         // the step: this layer's own parity so windows chain (layer li's next
         // read is always the buffer it last wrote)
         const cur = e.kda_st_cur[li];
@@ -934,11 +871,6 @@ pub const Engine = struct {
         }
         const st_out = if (cur == 0) e.kda_st1.ptr else e.kda_st0.ptr;
         try e.kdk.chain(e.stream, e.proj.ptr, ps, 3 * Wq + 2 * D, e.fg.ptr, e.fg.ptr + Wq * 2, 2 * Wq, cs_at, e.kda_cw.ptr + li * 3 * Wq * 4 * 4, st_in + li * st_bytes, w.a_log, w.dt_bias, w.o_norm, c.eps, c.lower_bound, rows, e.y.ptr, st_out + li * st_bytes);
-        if (li == 0 and !e.quiet and e.fwd_count == 1) {
-            var nmy: [24]u8 = undefined;
-            const tgy: []const u8 = if (e.cont) "b" else "a";
-            try e.dumpBin(std.fmt.bufPrint(&nmy, "yx{s}.bin", .{tgy}) catch "yxx.bin", e.y.ptr, Wq * 2);
-        }
         if (li <= 4 and (e.fwd_count == 1 and !e.quiet)) {
             try e.stream.synchronize();
             const c0 = try e.nzHead(e.kda_st0.ptr);
@@ -1719,6 +1651,18 @@ pub const Engine = struct {
         const D = e.c.hidden;
         const L = &e.w.layers[e.mtp_li.?];
         e.mtp_calls += 1;
+        // one-ahead drafts: the MTP predicts the token AFTER the head's own
+        // last pick (enorm input = e(picks[rows-1]) instead of the window's
+        // last input token); without this every 1-row round's draft lands one
+        // position behind the verify's pick0 and all drafts reject.
+        if (!e.stop_after_blocks and e.w.embed != 0 and e.mtp_emb.len != 0)
+            try e.ops.embed(e.stream, e.picks.ptr + (rows - 1) * 4, e.w.embed, e.mtp_emb.ptr, 1, D, D);
+        // one-ahead drafts: the MTP block predicts the token AFTER the last
+        // OUTPUT token, so the enorm input embeds the head's own last pick
+        // (e.picks[rows-1]) instead of the window's last input token; without
+        // this every draft lands one position behind the verify's pick0 and
+        // all drafts reject.
+
         e.mtpDump1("emb", e.mtp_emb.ptr, D * 2);
         e.mtpDump1("yin", e.y.ptr + (rows - 1) * D * 2, D * 2);
         const plane_rows = 20;
