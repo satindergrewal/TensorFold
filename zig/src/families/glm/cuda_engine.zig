@@ -42,7 +42,7 @@ const Gemms = struct {
             .lt = try glue.Library.open(),
             .map = std.AutoHashMap(u64, cuda.cublaslt.Linear).init(gpa),
             .sig = std.AutoHashMap(u64, u64).init(gpa),
-            .ws = try cuda.DeviceBuffer.alloc(d, 64 << 20),
+            .ws = try cuda.DeviceBuffer.alloc(d, 16 << 20),
         };
     }
 
@@ -74,7 +74,7 @@ const Gemms = struct {
         if (!gop.found_existing) {
             // build with custom layouts (the shared init hardcodes ld=k)
             var lin: cuda.cublaslt.Linear = undefined;
-            lin = try cuda.cublaslt.Linear.initStrided(&g.lt, m, n, k, .bf16, 64 << 20, xs / 2, ws_ / 2, os / 2);
+            lin = try cuda.cublaslt.Linear.initStrided(&g.lt, m, n, k, .bf16, 16 << 20, xs / 2, ws_ / 2, os / 2);
             gop.value_ptr.* = lin;
         }
         gop.value_ptr.run(x, w, out, g.ws.ptr, g.ws.len, s.handle) catch |err| {
@@ -90,7 +90,7 @@ const Gemms = struct {
         g.sigCheck(id, m, n, k, xs, ws_, os);
         const gop = try g.map.getOrPut(id);
         if (!gop.found_existing)
-            gop.value_ptr.* = try cuda.cublaslt.Linear.initNT(&g.lt, m, n, k, .bf16, 64 << 20, xs / 2, ws_ / 2, os / 2);
+            gop.value_ptr.* = try cuda.cublaslt.Linear.initNT(&g.lt, m, n, k, .bf16, 16 << 20, xs / 2, ws_ / 2, os / 2);
         gop.value_ptr.run(x, w, out, g.ws.ptr, g.ws.len, s.handle) catch |err| {
             std.debug.print("mmNT FAIL rows={d} n={d} k={d}" ++ "\n", .{ rows, n, k });
             return err;
@@ -105,7 +105,7 @@ const Gemms = struct {
         const id = key(m, n, k, f32_out);
         const gop = try g.map.getOrPut(id);
         if (!gop.found_existing)
-            gop.value_ptr.* = try cuda.cublaslt.Linear.init(&g.lt, m, n, k, if (f32_out) .f32 else .bf16, 64 << 20);
+            gop.value_ptr.* = try cuda.cublaslt.Linear.init(&g.lt, m, n, k, if (f32_out) .f32 else .bf16, 16 << 20);
         gop.value_ptr.run(x, w, out, g.ws.ptr, g.ws.len, s.handle) catch |err| {
             std.debug.print("mm FAIL rows={d} n={d} k={d} f32={}" ++ "\n", .{ rows, n, k, f32_out });
             return err;
@@ -180,6 +180,7 @@ pub const Engine = struct {
     m41_stage_n: u8 = 0,
     m41_on: bool = true,
     seg_on: bool = false, // replay captured KDA-run segment graphs (rows<=2)
+    seg_pause: bool = false, // the prompt pass: replay ok, capture paused (MLA host uploads are not capture-legal)
     seg_n: usize = 0,
     seg_start: [24]usize = @splat(0),
     seg_end: [24]usize = @splat(0),
@@ -386,7 +387,7 @@ pub const Engine = struct {
         e.mlp_tmp = try cuda.DeviceBuffer.alloc(d, rows * 2 * e.c.dense_inter * 2);
 
         e.mlp_act = try cuda.DeviceBuffer.alloc(d, rows * e.c.dense_inter * 2);
-        e.scratch = try cuda.DeviceBuffer.alloc(d, 256 << 20);
+        e.scratch = try cuda.DeviceBuffer.alloc(d, 16 << 20);
         // the recurrent state and conv history start zeroed
         try e.post.fill32(0, null);
         try e.comb.fill32(0, null);
@@ -1192,7 +1193,7 @@ pub const Engine = struct {
                 e.m41_router_mod = mod;
                 e.m41_router = try @import("cuda").grouped.Router.resolve(mod);
                 e.m41_members = try cuda.DeviceBuffer.alloc(e.d, 192 * 4);
-                e.m41_items = try cuda.DeviceBuffer.alloc(e.d, 200 * 3 * 4);
+                e.m41_items = try cuda.DeviceBuffer.alloc(e.d, 210 * 3 * 4);
                 e.m41_counts = try cuda.DeviceBuffer.alloc(e.d, 8);
                 e.m41_rank = try cuda.DeviceBuffer.alloc(e.d, 8 * 4);
                 e.m41_hist = try cuda.DeviceBuffer.alloc(e.d, 16 * 4);
@@ -1622,7 +1623,7 @@ pub const Engine = struct {
         while (bi < e.w.blocks_hi) {
             const L = &e.w.layers[bi - e.w.blocks_lo];
             e.cur_bi = @intCast(bi);
-            if (e.seg_on and rows <= 2 and seg_i < e.seg_n and bi == e.seg_start[seg_i]) {
+            if (e.seg_on and !e.seg_pause and rows <= 2 and seg_i < e.seg_n and bi == e.seg_start[seg_i]) {
                 const v = (if (rows == 1) @as(usize, 0) else @as(usize, 1)) * 2 + e.kda_st_cur[0];
                 if (e.seg_exec[seg_i][v]) |*ex| {
                     try ex.launchOn(e.stream);
@@ -1643,6 +1644,7 @@ pub const Engine = struct {
                 } else {
                     const saved_quiet = e.quiet;
                     e.quiet = true;
+                    if (e.seg_caps < 40) std.debug.print("CAP seg={d} v={d} rows={d} fwd={d}", .{ seg_i, v, rows, e.fwd_count });
                     try cuda.graph.beginCapture(e.stream, .thread_local);
                     var body_ok = true;
                     var b2 = bi;
@@ -1664,6 +1666,7 @@ pub const Engine = struct {
                         defer gg.deinit();
                         const ex = try gg.instantiate();
                         try ex.upload(e.stream);
+                        if (e.seg_caps < 40) std.debug.print("CAP-OK {d}", .{seg_i});
                         e.seg_exec[seg_i][v] = ex;
                         e.seg_caps += 1;
                         try ex.launchOn(e.stream);

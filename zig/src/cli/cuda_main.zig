@@ -306,6 +306,7 @@ fn handleConn(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engin
     defer engine_mutex.unlock(eng.io);
     serveSplit(gpa, eng, eng_b, ctx, ctx1, fd) catch |err| {
         std.debug.print("request: {}", .{err});
+        if (@errorReturnTrace()) |tr| std.debug.dumpStackTrace(tr.*);
     };
 }
 
@@ -468,36 +469,48 @@ fn serveSplit(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engin
         // already brought BOTH engines to the post-prompt state - re-running
         // the prompt double-advances A's KDA state and resetState() zeroes
         // B's restore (the cur=0/fwd=1 signature)
-        const ta0 = tnow();
-        try eng.forward(ids_buf[0..n_ids], n_ids, 0);
-        try eng.stream.synchronize();
-        const ta1 = tnow();
-        t_pa += ta1 - ta0;
-        try eng.x[0].download(0, hb[0..o1]);
-        try eng.x[1].download(0, hb[o1..o2]);
-        try eng.branch.download(0, hb[o2..o3]);
-        try eng.post.download(0, hb[o3..o4]);
-        try eng.comb.download(0, hb[o4 .. o4 + lco]);
-        if (lme != 0) try eng.mtp_emb.download(0, hb[o4 + lco .. ot]);
-        const xi_hand = eng.xi;
-        try ctx1.makeCurrent();
-        try eng_b.resetState();
-        try eng_b.x[0].upload(0, hb[0..o1]);
-        try eng_b.x[1].upload(0, hb[o1..o2]);
-        try eng_b.branch.upload(0, hb[o2..o3]);
-        try eng_b.post.upload(0, hb[o3..o4]);
-        try eng_b.comb.upload(0, hb[o4 .. o4 + lco]);
-        if (lme != 0) try eng_b.mtp_emb.upload(0, hb[o4 + lco .. ot]);
-        eng_b.xi = xi_hand;
-        eng_b.fwd_count = 0;
-        t_h += tnow() - ta1;
+        // the cold prompt pass in <=24-row chunks (rows_max-sized buffers):
+        // each chunk runs A, hands the layer boundary to B, runs B; both
+        // engines keep their own recurrent state across chunks.
+        eng.seg_pause = true;
+        eng_b.seg_pause = true;
+        var p0: usize = 0;
+        while (p0 < n_ids) {
+            const clen = @min(24, n_ids - p0);
+            const ta0 = tnow();
+            try eng.forward(ids_buf[p0 .. p0 + clen], clen, p0);
+            try eng.stream.synchronize();
+            const ta1 = tnow();
+            t_pa += ta1 - ta0;
+            try eng.x[0].download(0, hb[0..o1]);
+            try eng.x[1].download(0, hb[o1..o2]);
+            try eng.branch.download(0, hb[o2..o3]);
+            try eng.post.download(0, hb[o3..o4]);
+            try eng.comb.download(0, hb[o4 .. o4 + lco]);
+            if (lme != 0) try eng.mtp_emb.download(0, hb[o4 + lco .. ot]);
+            const xi_hand = eng.xi;
+            try ctx1.makeCurrent();
+            if (p0 == 0) try eng_b.resetState();
+            try eng_b.x[0].upload(0, hb[0..o1]);
+            try eng_b.x[1].upload(0, hb[o1..o2]);
+            try eng_b.branch.upload(0, hb[o2..o3]);
+            try eng_b.post.upload(0, hb[o3..o4]);
+            try eng_b.comb.upload(0, hb[o4 .. o4 + lco]);
+            if (lme != 0) try eng_b.mtp_emb.upload(0, hb[o4 + lco .. ot]);
+            eng_b.xi = xi_hand;
+            eng_b.fwd_count = 0;
+            t_h += tnow() - ta1;
+            const tb0 = tnow();
+            try eng_b.forward(ids_buf[p0 .. p0 + clen], clen, p0);
+            try eng_b.stream.synchronize();
+            t_pb += tnow() - tb0;
+            try ctx.makeCurrent();
+            p0 += clen;
+        }
     }
     if (!cache_hit) {
-        const tb0 = tnow();
-        try eng_b.forward(ids_buf[0..n_ids], n_ids, 0);
-        try eng_b.stream.synchronize();
-        t_pb += tnow() - tb0;
         // snapshot the post-prompt state for the next identical prompt
+        try ctx1.makeCurrent();
         try eng_b.snapshotPrefill();
         @memset(pf_cur_b[0..eng_b.kda_st_cur.len], 0);
         @memcpy(pf_cur_b[0..eng_b.kda_st_cur.len], eng_b.kda_st_cur);
@@ -519,7 +532,7 @@ fn serveSplit(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engin
         }
         try ctx1.makeCurrent();
     }
-    var pick: [128]u8 = undefined;
+    var pick: [16384]u8 = undefined;
     var draft_ids: [512]u32 = @splat(0); // draft[i] = MTP pick made at step i (predicts token i+1)
     const pv = std.mem.bytesAsSlice(u32, @as([]align(1) u8, &pick));
     if (!cache_hit) {
@@ -535,9 +548,11 @@ fn serveSplit(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engin
     }
     eng_b.mtp_dump_nth = if (cache_hit) 1 else 2; // the round-1 draft (cold: prompt draft is call 1)
     var pos: usize = n_ids;
+    eng.seg_pause = false;
     // segment graphs on from the first decode round (captures lazily per
     // rows x parity variant; the prefill and round-1 lazy inits ran uncaptured)
     eng.seg_on = true;
+    eng_b.seg_pause = false;
     eng_b.seg_on = true;
     var out_ids: [512]u32 = @splat(0);
 
