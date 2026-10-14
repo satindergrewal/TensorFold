@@ -179,6 +179,7 @@ pub const Engine = struct {
     // #741 mixed path
     m41_stage_n: u8 = 0,
     m41_on: bool = true,
+    vis: ?*@import("cuda_vision.zig").Vision = null, // engine A: the vision tower + feature embed
     seg_on: bool = false, // replay captured KDA-run segment graphs (rows<=2)
     seg_pause: bool = false, // the prompt pass: replay ok, capture paused (MLA host uploads are not capture-legal)
     seg_n: usize = 0,
@@ -1600,7 +1601,11 @@ pub const Engine = struct {
         if (!e.cont) {
             // embed into the four streams
             try e.ids.uploadAsync(0, std.mem.sliceAsBytes(ids)[0 .. rows * 4], e.stream.handle); // stream-ordered: a null-stream upload races the embed kernel
-            for (0..4) |s_i| { if (e.f32_streams) try e.ops.embedF32(e.stream, e.ids.ptr, e.w.embed, e.x[e.xi].ptr + s_i * hidden * 4, rows, hidden, 4 * hidden) else try e.ops.embed(e.stream, e.ids.ptr, e.w.embed, e.x[e.xi].ptr + s_i * hidden * 2, rows, hidden, 4 * hidden); }
+            for (0..4) |s_i| {
+                if (e.vis) |v| {
+                    try v.embedRows(e.ids.ptr, e.w.embed, v.feats.ptr, v.feat_map.ptr, rows, hidden, e.x[e.xi].ptr + s_i * hidden * (if (e.f32_streams) @as(usize, 4) else 2), 4 * hidden, e.f32_streams);
+                } else if (e.f32_streams) try e.ops.embedF32(e.stream, e.ids.ptr, e.w.embed, e.x[e.xi].ptr + s_i * hidden * 4, rows, hidden, 4 * hidden) else try e.ops.embed(e.stream, e.ids.ptr, e.w.embed, e.x[e.xi].ptr + s_i * hidden * 2, rows, hidden, 4 * hidden);
+            }
             e.xi = 0;
             if (e.mtp_emb.len != 0)
                 try e.ops.embed(e.stream, e.ids.ptr + (rows - 1) * 4, e.w.embed, e.mtp_emb.ptr, 1, hidden, hidden);

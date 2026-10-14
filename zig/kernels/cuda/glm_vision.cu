@@ -228,3 +228,38 @@ extern "C" __global__ void vv_gather_merge(const __nv_bfloat16* __restrict__ x, 
 }
 
 }  // namespace tf_glm_vision
+
+// The vision-feature embed: rows whose id == image_token take their row from
+// the features buffer at the ordinal the caller's map names (feat_of_row[r]
+// = the feature row, or -1 for table lookups). The map is host-built - the
+// caller knows the prompt layout. bf16 streams.
+extern "C" __global__ void vv_embed(const int* __restrict__ ids, const __nv_bfloat16* __restrict__ e,
+                                    const __nv_bfloat16* __restrict__ feats, const int* __restrict__ feat_of_row,
+                                    int image_token, __nv_bfloat16* __restrict__ out, int rows, int d, int stride) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = rows * d;
+    if (i >= total) return;
+    const int r = i / d, c = i - r * d;
+    const int fo = __ldg(feat_of_row + r);
+    if (fo >= 0) {
+        out[(size_t)r * stride + c] = __ldg(feats + (size_t)fo * d + c);
+    } else {
+        out[(size_t)r * stride + c] = __ldg(e + (size_t)__ldg(ids + r) * d + c);
+    }
+}
+
+// f32-stream form.
+extern "C" __global__ void vv_embed_f32(const int* __restrict__ ids, const __nv_bfloat16* __restrict__ e,
+                                        const __nv_bfloat16* __restrict__ feats, const int* __restrict__ feat_of_row,
+                                        int image_token, float* __restrict__ out, int rows, int d, int stride) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = rows * d;
+    if (i >= total) return;
+    const int r = i / d, c = i - r * d;
+    const int fo = __ldg(feat_of_row + r);
+    if (fo >= 0) {
+        out[(size_t)r * stride + c] = __bfloat162float(__ldg(feats + (size_t)fo * d + c));
+    } else {
+        out[(size_t)r * stride + c] = __bfloat162float(__ldg(e + (size_t)__ldg(ids + r) * d + c));
+    }
+}

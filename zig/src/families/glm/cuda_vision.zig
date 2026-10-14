@@ -29,6 +29,8 @@ pub const Kernels = struct {
     qknr_fn: cuda.Function,
     add_fn: cuda.Function,
     gather_fn: cuda.Function,
+    embed_fn: cuda.Function,
+    embedf32_fn: cuda.Function,
 
     pub fn load(d: *const Driver) !Kernels {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
@@ -49,6 +51,8 @@ pub const Kernels = struct {
             .qknr_fn = try mod.function("vv_qk_norm_rope"),
             .add_fn = try mod.function("vv_add"),
             .gather_fn = try mod.function("vv_gather_merge"),
+            .embed_fn = try mod.function("vv_embed"),
+            .embedf32_fn = try mod.function("vv_embed_f32"),
         };
     }
 
@@ -110,6 +114,7 @@ pub const Vision = struct {
     sin: DeviceBuffer,
     groups: DeviceBuffer, // [S/4, 4*hidden]
     feats: DeviceBuffer, // [S/4, out]
+    feat_map: DeviceBuffer, // [rows_max] i32: -1 or the feature row (host-built)
 
     plans: std.ArrayList(GPlan) = .empty, // lazy shape cache
 
@@ -143,7 +148,7 @@ pub const Vision = struct {
     pub fn deinit(v: *Vision) void {
         for (v.bufs.items) |*b| b.free();
         v.bufs.deinit(v.gpa);
-        inline for (.{ "x", "h", "qkv", "o", "g", "u", "cos", "sin", "groups", "feats", "ws" }) |f| @field(v, f).free();
+        inline for (.{ "x", "h", "qkv", "o", "g", "u", "cos", "sin", "groups", "feats", "feat_map", "ws" }) |f| @field(v, f).free();
         v.gpa.free(v.blocks);
         v.lt.close();
         v.k.deinit();
@@ -201,6 +206,7 @@ pub const Vision = struct {
             .sin = undefined,
             .groups = undefined,
             .feats = undefined,
+            .feat_map = undefined,
         };
         errdefer {
             for (v.bufs.items) |*b| b.free();
@@ -266,6 +272,7 @@ pub const Vision = struct {
         v.sin = try DeviceBuffer.alloc(d, S * c.hd * 4);
         v.groups = try DeviceBuffer.alloc(d, (S / 4) * 4 * c.hidden * 2);
         v.feats = try DeviceBuffer.alloc(d, (S / 4) * c.out * 2);
+        v.feat_map = try DeviceBuffer.alloc(d, 24 * 4);
         return v;
     }
 
@@ -361,6 +368,31 @@ pub const Vision = struct {
         var dirv = std.Io.Dir.cwd();
         dirv.writeFile(v.io, .{ .sub_path = "/tmp/vzig_attnmicro.bin", .data = b }) catch {};
     }
+    /// The serving embed: rows with a >=0 feature ordinal read the vision
+    /// features; the rest the embedding table. feat_map: [rows] i32 (the
+    /// host builds it - it knows the image positions). streams in bf16 or
+    /// f32 to match the engine's stream dtype.
+    pub fn embedRows(v: *Vision, ids: u64, table: u64, feats: u64, feat_map: u64, rows: usize, d: usize, out: u64, stride: usize, f32_streams: bool) !void {
+        var a: cuda.Args = .{};
+        a.add(ids);
+        a.add(table);
+        a.add(feats);
+        a.add(feat_map);
+        a.add(@as(i32, 154854));
+        a.add(out);
+        a.add(@as(i32, @intCast(rows)));
+        a.add(@as(i32, @intCast(d)));
+        a.add(@as(i32, @intCast(stride)));
+        const total = rows * d;
+        const fn_ = if (f32_streams) v.k.embedf32_fn else v.k.embed_fn;
+        try go(fn_, v.s, .{ .x = @as(u32, @intCast((total + 255) / 256)), .y = 1, .z = 1 }, 256, 0, &a);
+    }
+
+    /// Upload the host-built feature map (i32 per prompt row: -1 = table).
+    pub fn uploadMap(v: *Vision, map: []const i32) !void {
+        try (DeviceBuffer{ .d = v.d, .ptr = v.feat_map.ptr, .len = map.len * 4, .borrowed = true }).upload(0, std.mem.sliceAsBytes(map));
+    }
+
     fn biasW(v: *Vision, y: u64, b: u64, rows: usize, n: usize) !void {
         var a: cuda.Args = .{};
         a.add(y);
