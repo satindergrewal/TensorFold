@@ -91,6 +91,32 @@ pub fn run(gpu: Gpu, dir: []const u8, rest: []const [:0]const u8) !void {
             at += 1;
         };
     }
+    // prep-module cross-check: vision_prep.patchify of the same frames must
+    // equal this proven layout byte-for-byte (the 448 path, no resize)
+    {
+        const prep = @import("glm").vision_prep;
+        // frames are [t][c][h][w]; prep takes [h][w][c] - transpose first
+        const hwc = try a.alloc(u8, 2 * 3 * 448 * 448);
+        defer a.free(hwc);
+        for (0..3) |cc| for (0..448) |y| for (0..448) |x| {
+            hwc[(y * 448 + x) * 3 + cc] = fbytes[cc * 448 * 448 + y * 448 + x];
+        };
+        const pr = try prep.patchify(a, hwc, 448, 448, 3, 2048);
+        defer a.free(pr.bytes);
+        // the test frames are a VIDEO (t0=frame0, t1=frame1); prep takes a
+        // STILL image and doubles it - compare each channel's t=0 half only
+        var nbad: usize = 0;
+        var ntot: usize = 0;
+        for (0..1024) |r| for (0..3) |c| for (0..196) |j| {
+            const off = r * 1176 + c * 392 + j;
+            ntot += 1;
+            const p2 = pr.bytes[off * 2..][0..2].*;
+            const q2 = pbytes[off * 2..][0..2].*;
+            if (p2[0] != q2[0] or p2[1] != q2[1]) nbad += 1;
+        };
+        std.debug.print("prep patchify t0-half cross-check: {d} differing of {d}\n", .{ nbad, ntot });
+        std.debug.print("verdict: {s}\n", .{if (nbad == 0) "IDENTICAL" else "DIFFERS"});
+    }
     var pbuf = try cuda.DeviceBuffer.fromHost(gpu.d, pbytes);
     defer pbuf.free();
     try pbuf.upload(0, pbytes);

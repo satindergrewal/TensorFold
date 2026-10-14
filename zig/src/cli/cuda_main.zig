@@ -225,6 +225,9 @@ fn glmServe(gpa: std.mem.Allocator, init: std.process.Init, rest: []const [:0]co
     var eng = try glm.engine.Engine.init(gpa, init.io, &driver, rest[0], .{ .context = context, .blocks_lo = 0, .blocks_hi = 22, .stop_after_blocks = true });
     eng.quiet = true;
     defer eng.deinit();
+    var vis = try @import("glm").vision.Vision.load(gpa, init.io, &driver, rest[0]);
+    defer vis.deinit();
+    eng.vis = vis;
     var ctx1 = try cuda.Context.init(&driver, 1);
     defer ctx1.deinit();
     try ctx1.makeCurrent();
@@ -275,7 +278,7 @@ fn glmServe(gpa: std.mem.Allocator, init: std.process.Init, rest: []const [:0]co
         const rc2 = posix.system.accept(fd, null, null);
         if (posix.errno(rc2) != .SUCCESS) continue;
         const conn_fd: posix.socket_t = @intCast(rc2);
-        const th = std.Thread.spawn(.{}, handleConn, .{ gpa, eng, eng_b, ctx, ctx1, conn_fd }) catch {
+        const th = std.Thread.spawn(.{}, handleConn, .{ gpa, eng, eng_b, vis, ctx, ctx1, conn_fd }) catch {
             _ = posix.system.close(conn_fd);
             continue;
         };
@@ -300,11 +303,11 @@ inline fn tnow() i128 {
     return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
 }
 
-fn handleConn(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engine.Engine, ctx: cuda.Context, ctx1: cuda.Context, fd: posix.socket_t) void {
+fn handleConn(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engine.Engine, vis: *@import("glm").vision.Vision, ctx: cuda.Context, ctx1: cuda.Context, fd: posix.socket_t) void {
     defer _ = posix.system.close(fd);
     engine_mutex.lockUncancelable(eng.io);
     defer engine_mutex.unlock(eng.io);
-    serveSplit(gpa, eng, eng_b, ctx, ctx1, fd) catch |err| {
+    serveSplit(gpa, eng, eng_b, vis, ctx, ctx1, fd) catch |err| {
         std.debug.print("request: {}", .{err});
         _ = posix.system.write(fd, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", 71);
         if (@errorReturnTrace()) |tr| std.debug.dumpStackTrace(tr.*);
@@ -350,6 +353,7 @@ var pf_xi_a: usize = 0;
 var pf_xi_b: usize = 0;
 var pf_pick0: u32 = 0;
 var pf_draft0: u32 = 0;
+var pf_image_rows: usize = 0; // this request's image-span size (0 = text-only)
 var verify_dbg: bool = false;
 
 fn hashIds(ids: []const u32) u64 {
@@ -361,7 +365,7 @@ fn hashIds(ids: []const u32) u64 {
     return h;
 }
 
-fn serveSplit(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engine.Engine, ctx: cuda.Context, ctx1: cuda.Context, fd: posix.socket_t) !void {
+fn serveSplit(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engine.Engine, vis: *@import("glm").vision.Vision, ctx: cuda.Context, ctx1: cuda.Context, fd: posix.socket_t) !void {
     req_counter += 1;
     eng_b.mtp_tag = req_counter;
     eng_b.mtp_calls = 0;
@@ -420,6 +424,77 @@ fn serveSplit(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engin
                 any = true;
             }
             if (any) max_tokens = v;
+        }
+    }
+    pf_image_rows = 0;
+    if (std.mem.indexOf(u8, body, "\"image\"")) |i0x| {
+        var img_b64: []const u8 = "";
+        var img_w: usize = 0;
+        var img_h: usize = 0;
+        {
+            var j = i0x;
+            while (j < body.len and body[j] != ':') j += 1;
+            if (j < body.len) {
+                j += 1;
+                while (j < body.len and (body[j] == ' ' or body[j] == 9)) j += 1;
+                if (j < body.len and body[j] == '"') {
+                    j += 1;
+                    const st = j;
+                    while (j < body.len and body[j] != '"') j += 1;
+                    img_b64 = body[st..j];
+                }
+            }
+        }
+        {
+            var k: usize = 0;
+            if (std.mem.indexOf(u8, body, "\"width\"")) |w0| {
+                k = w0;
+                while (k < body.len and body[k] != ':') k += 1;
+                var v: usize = 0;
+                var any = false;
+                while (k < body.len and body[k] >= '0' and body[k] <= '9') : (k += 1) {
+                    v = v * 10 + (body[k] - '0');
+                    any = true;
+                }
+                if (any) img_w = v;
+            }
+            if (std.mem.indexOf(u8, body, "\"height\"")) |h0| {
+                k = h0;
+                while (k < body.len and body[k] != ':') k += 1;
+                var v: usize = 0;
+                var any = false;
+                while (k < body.len and body[k] >= '0' and body[k] <= '9') : (k += 1) {
+                    v = v * 10 + (body[k] - '0');
+                    any = true;
+                }
+                if (any) img_h = v;
+            }
+        }
+        if (img_b64.len > 0 and img_w > 0 and img_h > 0 and img_w <= 8192 and img_h <= 8192 and n_ids + 8200 < ids_buf.len) {
+            const prep = @import("glm").vision_prep;
+            const b64bytes = prep.b64decode(gpa, img_b64) catch &[_]u8{};
+            defer if (b64bytes.len > 0) gpa.free(b64bytes);
+            if (b64bytes.len >= img_w * img_h * 3) {
+                const pr = try prep.patchify(gpa, b64bytes, img_w, img_h, 3, 2048);
+                defer gpa.free(pr.bytes);
+                var pbuf = try cuda.DeviceBuffer.fromHost(vis.d, pr.bytes);
+                defer pbuf.free();
+                try vis.encode(pbuf.ptr, pr.gh, pr.gw);
+                try vis.s.synchronize();
+                const ftoks = pr.gh * pr.gw / 4;
+                std.mem.copyBackwards(u32, ids_buf[ftoks + 2 .. ftoks + 2 + n_ids], ids_buf[0..n_ids]);
+                var at2: usize = 0;
+                ids_buf[at2] = 154830;
+                at2 += 1;
+                for (0..ftoks) |_| {
+                    ids_buf[at2] = 154854;
+                    at2 += 1;
+                }
+                ids_buf[at2] = 154831;
+                at2 += 1;
+                n_ids += at2;
+                pf_image_rows = at2;
+            }
         }
     }
     if (n_ids == 0) {
@@ -506,6 +581,24 @@ fn serveSplit(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engin
             try eng_b.forward(ids_buf[p0 .. p0 + clen], clen, p0);
             try eng_b.stream.synchronize();
             t_pb += tnow() - tb0;
+            if (pf_image_rows > 0) {
+                var cmap: [24]i32 = undefined;
+                var fidx: i32 = 0;
+                for (0..p0) |gr2| {
+                    if (gr2 >= 1 and gr2 < pf_image_rows - 1) fidx += 1;
+                }
+                for (0..clen) |j2| {
+                    const gr2 = p0 + j2;
+                    cmap[j2] = if (gr2 >= 1 and gr2 < pf_image_rows - 1) blk: {
+                        const v2 = fidx;
+                        fidx += 1;
+                        break :blk v2;
+                    } else -1;
+                }
+                try ctx.makeCurrent();
+                try vis.uploadMap(cmap[0..clen], eng.stream);
+                try ctx1.makeCurrent();
+            }
             try ctx.makeCurrent();
             last_clen = clen;
             p0 += clen;

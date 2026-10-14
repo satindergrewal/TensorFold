@@ -5,6 +5,7 @@
 pub const Config = @import("config.zig").Config;
 pub const Kind = @import("config.zig").Kind;
 pub const vision = @import("cuda_vision.zig");
+pub const vision_prep = @import("vision_prep.zig");
 pub const weights = @import("cuda_weights.zig");
 pub const hc = @import("cuda_hc.zig");
 pub const glue = @import("glm_glue.zig");
