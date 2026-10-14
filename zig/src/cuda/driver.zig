@@ -3,7 +3,7 @@
 const std = @import("std");
 const abi = @import("abi.zig");
 
-pub const Error = error{ DriverUnavailable, MissingSymbol, CudaFailed, OutOfDeviceMemory, NotReady, NotFound, Invalid };
+pub const Error = error{ DriverUnavailable, MissingSymbol, CudaFailed, OutOfDeviceMemory, NotReady, NotFound, Invalid, LaunchZero, LaunchTooBig, DlOffset, DlRange };
 
 pub const Driver = struct {
     lib: std.DynLib,

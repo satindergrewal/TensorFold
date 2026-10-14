@@ -464,6 +464,7 @@ fn serveSplit(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engin
     const ot = o4 + lco + lme;
     const hb = try gpa.alloc(u8, 32 * 1024 * 1024);
     defer gpa.free(hb);
+    var last_clen: usize = n_ids; // the prompt final chunk length (its last pick row)
     if (!cache_hit) {
         // the whole cold prompt pass + handoff: on a cache hit the restore
         // already brought BOTH engines to the post-prompt state - re-running
@@ -505,6 +506,7 @@ fn serveSplit(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engin
             try eng_b.stream.synchronize();
             t_pb += tnow() - tb0;
             try ctx.makeCurrent();
+            last_clen = clen;
             p0 += clen;
         }
     }
@@ -536,12 +538,12 @@ fn serveSplit(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engin
     var draft_ids: [512]u32 = @splat(0); // draft[i] = MTP pick made at step i (predicts token i+1)
     const pv = std.mem.bytesAsSlice(u32, @as([]align(1) u8, &pick));
     if (!cache_hit) {
-        try eng_b.picks.download(0, pick[0 .. 4 * n_ids]);
+        try eng_b.picks.download((last_clen - 1) * 4, pick[0..4]); // the last chunk last row (picks sized rows_max)
         if (eng_b.mtp_li != null) {
             try eng_b.mtp_pick.download(0, pick[8..12]);
             draft_ids[0] = pv[2];
         }
-        pf_pick0 = pv[n_ids - 1];
+        pf_pick0 = pv[0];
         pf_draft0 = if (eng_b.mtp_li != null) pv[2] else 0;
     } else {
         draft_ids[0] = pf_draft0;
@@ -557,7 +559,7 @@ fn serveSplit(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engin
     var out_ids: [512]u32 = @splat(0);
 
     var n_out: usize = 0;
-    out_ids[0] = if (cache_hit) pf_pick0 else pv[n_ids - 1];
+    out_ids[0] = if (cache_hit) pf_pick0 else pv[0];
     n_out = 1;
     var one: [1]u32 = .{0};
     var two: [2]u32 = .{ 0, 0 };

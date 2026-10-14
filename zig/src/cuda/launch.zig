@@ -68,8 +68,8 @@ pub const Config = struct {
     pub fn validate(self: Config) Error!void {
         const g = self.grid;
         const b = self.block;
-        if (g.x == 0 or g.y == 0 or g.z == 0 or b.x == 0 or b.y == 0 or b.z == 0) return error.Invalid;
-        if (@as(u64, b.x) * b.y * b.z > 1024) return error.Invalid;
+        if (g.x == 0 or g.y == 0 or g.z == 0 or b.x == 0 or b.y == 0 or b.z == 0) return error.LaunchZero;
+        if (@as(u64, b.x) * b.y * b.z > 1024) return error.LaunchTooBig;
     }
 };
 

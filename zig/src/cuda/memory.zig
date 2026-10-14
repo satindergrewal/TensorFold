@@ -81,12 +81,12 @@ pub const DeviceBuffer = struct {
 
     /// The device address `offset` bytes in; out of range is refused.
     pub fn at(self: DeviceBuffer, offset: usize) Error!abi.DevicePtr {
-        if (offset > self.len) return error.Invalid;
+        if (offset > self.len) return error.DlOffset;
         return self.ptr + offset;
     }
 
     fn span(self: DeviceBuffer, offset: usize, n: usize) Error!abi.DevicePtr {
-        if (offset > self.len or n > self.len - offset) return error.Invalid;
+        if (offset > self.len or n > self.len - offset) return error.DlRange;
         return self.ptr + offset;
     }
 

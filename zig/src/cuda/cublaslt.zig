@@ -29,7 +29,7 @@ pub const desc_transb: c_int = 4;
 pub const layout_order: c_int = 1;
 pub const pref_max_workspace_bytes: c_int = 1;
 
-pub const Error = error{ LibraryUnavailable, MissingSymbol, CublasFailed, NoAlgorithm, Invalid };
+pub const Error = error{ LibraryUnavailable, MissingSymbol, CublasFailed, NoAlgorithm, Invalid, WsTooSmall };
 
 const S = Status;
 const CPtr = ?*const anyopaque;
@@ -220,7 +220,7 @@ pub const Linear = struct {
 
     /// D = X . W^T on `stream`; the workspace must hold `workspace_need` bytes.
     pub fn run(self: *const Linear, x: abi.DevicePtr, w: abi.DevicePtr, d: abi.DevicePtr, workspace: abi.DevicePtr, workspace_len: usize, stream: abi.Stream) Error!void {
-        if (workspace_len < self.workspace_need) return error.Invalid;
+        if (workspace_len < self.workspace_need) return error.WsTooSmall;
         const one: f32 = 1;
         const zero: f32 = 0;
         try self.lt.check(self.lt.api.cublasLtMatmul(self.handle, self.desc, &one, w, self.a, x, self.b, &zero, d, self.c, d, self.c, &self.algo, workspace, workspace_len, stream), "cublasLtMatmul");
