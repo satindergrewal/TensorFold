@@ -1249,31 +1249,7 @@ pub const Engine = struct {
                 var dir3 = std.Io.Dir.cwd();
                 dir3.writeFile(e.io, .{ .sub_path = "m41plan.log", .data = txt }) catch {};
             }
-            if (e.m41_stage_n == 1) { // A/B: the verified old path on this block
-                if (e.moe_pick_h.len == 0) {
-                    e.moe_pick_hb = try cuda.HostBuffer.alloc(e.d, e.rows_max * e.c.topk * 4);
-                    e.moe_pick_h = try e.gpa.alloc(u8, e.rows_max * e.c.topk * 4);
-                }
-                const pick_host0 = e.moe_pick_h[0 .. rows * e.c.topk * 4];
-                try e.moe_pick.downloadAsync(0, pick_host0, e.stream.handle);
-                try e.stream.synchronize();
-                const picks0 = std.mem.bytesAsSlice(i32, @as([]align(1) u8, pick_host0));
-                var k0: usize = 0;
-                while (k0 < e.c.topk) : (k0 += 1) {
-                    const ex = picks0[k0];
-                    if (ex < 0) continue;
-                    const eu: usize = @intCast(ex);
-                    try e.ex.project(e.stream, e.normed.ptr, w.gate[eu], e.moe_gu.ptr, 1);
-                    try e.ex.project(e.stream, e.normed.ptr, w.up[eu], e.moe_gu.ptr + inter * 2, 1);
-                    try e.ops.act(e.stream, e.moe_gu.ptr, e.moe_gu.ptr + inter * 2, e.moe_act.ptr, 1, 1, inter, e.c.swiglu_limit);
-                    var nb0: [32]u8 = undefined;
-                    const nm0 = std.fmt.bufPrint(&nb0, "m41_old_a{d}.bin", .{k0}) catch "m41_old_a.bin";
-                    try e.dumpBin(nm0, e.moe_act.ptr, inter * 2);
-                    try e.ex.project(e.stream, e.moe_act.ptr, w.down[eu], e.moe_ye.ptr + k0 * hidden * 2, 1);
-                }
-                try e.dumpBin("m41_old_ye.bin", e.moe_ye.ptr, rows * e.c.topk * hidden * 2);
-            }
-            // up: x = normed (1 row, stride hidden), out [topk, inter_max]
+            // up: x = normed, out [pairs, inter_max]
             const l_up: @import("cuda").experts.Layer = .{
                 .format = .exl3,
                 .up = e.m41_up.ptr,
@@ -1283,16 +1259,15 @@ pub const Engine = struct {
                 .dims = e.c.hidden,
                 .experts = w.gate.len,
                 .limit = e.c.swiglu_limit,
-                .exl3 = .{ .codebook = .mcg }, // our checkpoint is MCG; widths stay 0 (desc-driven)
+                .exl3 = .{ .codebook = .mcg }, // our checkpoint is MCG
             };
-            // their .up epi writes swiglu(gate,up) inline: one row per pair at
-            // [0..topk) - the down family reads those rows directly
             const m41_items_n = @import("cuda").grouped.maxItems(pairs, e.c.experts, 16);
             try e.m41_xe.?.runMixed(e.stream, .up, .{ .x = e.normed.ptr, .stride = e.c.hidden, .slots = e.c.topk }, l_up, p, e.m41_out.ptr, m41_items_n, -1, desc_up);
             var l_dn = l_up;
             l_dn.up = e.m41_down.ptr;
             l_dn.up_scale = e.m41_down_h.ptr;
             try e.m41_xe.?.runMixed(e.stream, .down_bf16, .{ .x = e.m41_out.ptr, .stride = e.m41_inter_max, .slots = 0 }, l_dn, p, e.moe_ye.ptr, m41_items_n, -1, desc_dn);
+
             if (e.m41_stage_n == 1) {
                 try e.dumpBin("m41_new_out.bin", e.m41_out.ptr, 2 * e.c.topk * e.m41_inter_max * 2);
                 try e.dumpBin("m41_new_ye.bin", e.moe_ye.ptr, rows * e.c.topk * hidden * 2);

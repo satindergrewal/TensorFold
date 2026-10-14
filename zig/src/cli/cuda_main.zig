@@ -410,6 +410,7 @@ fn serveSplit(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engin
         while (j < body.len and body[j] != ':') j += 1;
         if (j < body.len) {
             j += 1;
+            while (j < body.len and (body[j] == ' ' or body[j] == 9)) j += 1;
             var v: usize = 0;
             var any = false;
             while (j < body.len and body[j] >= '0' and body[j] <= '9') : (j += 1) {
