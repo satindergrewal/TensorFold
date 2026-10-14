@@ -34,6 +34,7 @@ const kernels = [_]Kernel{
     .{ .name = "exl3_experts", .flags = &.{ "-O3", "--fmad=false" } }, // #741: EXL3 routed experts on grouped.zig's plan
     .{ .name = "glm_hc", .flags = &.{"-O3"} }, // GLM hyper-connection boundaries
     .{ .name = "glm_ops", .flags = &.{"-O3"} }, // GLM dense ops: embed/rms/act/combine/mean/add/argmax/route
+    .{ .name = "glm_vision", .flags = &.{"-O3"} }, // Phase 4: the vision tower helpers
     .{ .name = "glm_kda", .flags = &.{"-O3"} }, // GLM KDA conv + delta step
     .{ .name = "glm_dsa", .flags = &.{"-O3"} }, // GLM DSA sparse attention
     .{ .name = "glm_index", .flags = &.{"-O3"} }, // GLM DSA indexer scores+select's FP8G device code, tensorfold_nvfp4_v3

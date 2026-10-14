@@ -28,6 +28,7 @@ pub const fp8_lane: []const u8 = if (available) &Blob("fatbin_fp8_lane").bytes e
 pub const exl3: []const u8 = if (available) &Blob("fatbin_exl3").bytes else &.{};
 pub const exl3_experts: []const u8 = if (available) &Blob("fatbin_exl3_experts").bytes else &.{};
 pub const glm_hc: []const u8 = if (available) &Blob("fatbin_glm_hc").bytes else &.{};
+pub const glm_vision: []const u8 = if (available) &Blob("fatbin_glm_vision").bytes else &.{};
 pub const glm_ops: []const u8 = if (available) &Blob("fatbin_glm_ops").bytes else &.{};
 pub const glm_kda: []const u8 = if (available) &Blob("fatbin_glm_kda").bytes else &.{};
 pub const glm_dsa: []const u8 = if (available) &Blob("fatbin_glm_dsa").bytes else &.{};
