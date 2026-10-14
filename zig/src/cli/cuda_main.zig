@@ -534,6 +534,10 @@ fn serveSplit(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engin
     }
     eng_b.mtp_dump_nth = if (cache_hit) 1 else 2; // the round-1 draft (cold: prompt draft is call 1)
     var pos: usize = n_ids;
+    // segment graphs on from the first decode round (captures lazily per
+    // rows x parity variant; the prefill and round-1 lazy inits ran uncaptured)
+    eng.seg_on = true;
+    eng_b.seg_on = true;
     var out_ids: [512]u32 = @splat(0);
 
     var n_out: usize = 0;
@@ -678,7 +682,7 @@ fn serveSplit(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engin
     if (glm.engine.Engine.op_timing) {
         std.debug.print("opms: attn(gates+kda) {d:.2} moe {d:.2} per-BLOCK0\n", .{ @as(f64, @floatFromInt(glm.engine.Engine.opt_gates)) / 1e6, @as(f64, @floatFromInt(glm.engine.Engine.opt_moe)) / 1e6 });
     }
-    std.debug.print("glm-serve: accepts {d} rejects {d} | ms: promptA {d:.1} hoff {d:.1} promptB {d:.1} | rounds: A {d:.1} hoff {d:.1} B {d:.1} pick {d:.1}\n", .{ accepts, rejects, @as(f64, @floatFromInt(t_pa)) / 1e6, @as(f64, @floatFromInt(t_h)) / 1e6, @as(f64, @floatFromInt(t_pb)) / 1e6, @as(f64, @floatFromInt(t_ra)) / 1e6, @as(f64, @floatFromInt(t_rh)) / 1e6, @as(f64, @floatFromInt(t_rb)) / 1e6, @as(f64, @floatFromInt(t_rp)) / 1e6 });
+    std.debug.print("SEGCAP a{d}/p{d} b{d}/p{d} | accepts {d} rejects {d} | ms: promptA {d:.1} hoff {d:.1} promptB {d:.1} | rounds: A {d:.1} hoff {d:.1} B {d:.1} pick {d:.1}\n", .{ eng.seg_caps, eng.seg_plays, eng_b.seg_caps, eng_b.seg_plays, accepts, rejects, @as(f64, @floatFromInt(t_pa)) / 1e6, @as(f64, @floatFromInt(t_h)) / 1e6, @as(f64, @floatFromInt(t_pb)) / 1e6, @as(f64, @floatFromInt(t_ra)) / 1e6, @as(f64, @floatFromInt(t_rh)) / 1e6, @as(f64, @floatFromInt(t_rb)) / 1e6, @as(f64, @floatFromInt(t_rp)) / 1e6 });
     var jbuf: [8192]u8 = undefined;
     var w: usize = 0;
     w += (std.fmt.bufPrint(jbuf[w..], "{{\"tokens\":[", .{}) catch unreachable).len;

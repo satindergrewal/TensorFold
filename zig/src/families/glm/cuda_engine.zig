@@ -179,6 +179,16 @@ pub const Engine = struct {
     // #741 mixed path
     m41_stage_n: u8 = 0,
     m41_on: bool = true,
+    seg_on: bool = false, // replay captured KDA-run segment graphs (rows<=2)
+    seg_n: usize = 0,
+    seg_start: [24]usize = @splat(0),
+    seg_end: [24]usize = @splat(0),
+    seg_len: [24]usize = @splat(0),
+    seg_li0: [24]usize = @splat(0),
+    seg_exec: [24][4]?cuda.graph.Exec = @splat(@splat(null)),
+    seg_seen: [24][4]u8 = @splat(@splat(0)),
+    seg_caps: usize = 0,
+    seg_plays: usize = 0,
     m41_rounds: usize = 0,
     m41_up: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
     m41_up_h: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
@@ -475,7 +485,19 @@ pub const Engine = struct {
             @memset(z, 0);
             e.fn_zero = try cuda.DeviceBuffer.fromHost(d, z);
         }
-        return e;
+        {
+            // segment graphs: maximal runs of KDA-attention blocks
+            var bi2: usize = 0;
+            var li_acc: usize = 0;
+            while (bi2 < w.layers.len) : (bi2 += 1) {
+                if (w.layers[bi2].attn == .kda) {
+                    if (e.seg_n == 0 or e.seg_end[e.seg_n - 1] != w.blocks_lo + bi2) {
+                        e.seg_start[e.seg_n] = w.blocks_lo + bi2;
+                        e.seg_li0[e.seg_n] = li_acc;
+                        e.seg_len[e.seg_n] = 0;
+                        e.seg_n += 1;
+                    }
+                    e.seg_end[e.seg_n - 1] = w.blocks_lo + bi2 + 1;                    e.seg_len[e.seg_n - 1] += 1;                    li_acc += 1;                }            }        }        return e;
     }
 
 
@@ -1162,23 +1184,23 @@ pub const Engine = struct {
         try e.g.mm(e.stream, e.normed.ptr, w.shared_up, e.mlp_tmp.ptr + rows * inter * 2, rows, inter, hidden, false);
         try e.ops.act(e.stream, e.mlp_tmp.ptr, e.mlp_tmp.ptr + rows * inter * 2, e.mlp_act.ptr, rows, 1, inter, e.c.swiglu_limit);
         try e.g.mm(e.stream, e.mlp_act.ptr, w.shared_down, e.moe_ys.ptr, rows, hidden, inter, false);
-        if (e.m41_on and rows <= 2 and w.gate.len > 0) {
+        if (e.m41_on and w.gate.len > 0) {
             const pairs = rows * e.c.topk;
             if (e.m41_xe == null) {
                 e.m41_xe = try @import("cuda").exl3_experts.Experts.load(e.d, 148);
                 const mod = try cuda.Module.load(e.d, @import("cuda").kernels.experts);
                 e.m41_router_mod = mod;
                 e.m41_router = try @import("cuda").grouped.Router.resolve(mod);
-                e.m41_members = try cuda.DeviceBuffer.alloc(e.d, 16 * 4);
-                e.m41_items = try cuda.DeviceBuffer.alloc(e.d, 17 * 3 * 4);
+                e.m41_members = try cuda.DeviceBuffer.alloc(e.d, 192 * 4);
+                e.m41_items = try cuda.DeviceBuffer.alloc(e.d, 200 * 3 * 4);
                 e.m41_counts = try cuda.DeviceBuffer.alloc(e.d, 8);
                 e.m41_rank = try cuda.DeviceBuffer.alloc(e.d, 8 * 4);
                 e.m41_hist = try cuda.DeviceBuffer.alloc(e.d, 16 * 4);
                 var imax2: usize = 0;
                 for (w.gate) |gw| imax2 = @max(imax2, gw.n);
                 e.m41_inter_max = imax2;
-                e.m41_out = try cuda.DeviceBuffer.alloc(e.d, 2 * e.c.topk * imax2 * 2 * 2);
-                e.m41_act = try cuda.DeviceBuffer.alloc(e.d, e.c.topk * imax2 * 2 * 2);
+                e.m41_out = try cuda.DeviceBuffer.alloc(e.d, 24 * e.c.topk * imax2 * 2);
+                e.m41_act = try cuda.DeviceBuffer.alloc(e.d, 24 * e.c.topk * imax2 * 2);
             }
             const desc_up = try e.m41DescFor(e.cur_bi, w);
             const desc_dn = e.m41_layer_descs.?.get(e.cur_bi * 2 + 1).?;
@@ -1408,6 +1430,178 @@ pub const Engine = struct {
     }
 
     /// One window of `rows` tokens: ids -> picks (argmax) + logits on device.
+    /// One block's whole walk, separated so segment graphs can capture KDA runs.
+    fn blockBody(e: *Engine, L: *const weights.Layer, bi: usize, rows: usize, pos: usize, mi_mla: *usize, ki: *usize) !void {
+        e.cur_bi = @intCast(bi);
+        if (e.dump_on and bi <= 21) {
+            {
+                try e.stream.synchronize();
+                const cb = try e.gpa.alloc(u8, 147456);
+                defer e.gpa.free(cb);
+                try (cuda.DeviceBuffer{ .d = e.d, .ptr = e.kda_cs.ptr, .len = 147456, .borrowed = true }).download(0, cb);
+                var nmY: [40]u8 = undefined;
+                e.dump_serial += 1;
+                const fY = std.fmt.bufPrint(&nmY, "ksb{d}{s}S{d}.bin", .{ bi, @as([]const u8, if (e.cont) "b" else "a"), e.dump_serial }) catch unreachable;
+                var dirY = std.Io.Dir.cwd();
+                dirY.writeFile(e.io, .{ .sub_path = fY, .data = cb }) catch {};
+            }
+            try e.stream.synchronize();
+            const n = rows * 4 * e.c.hidden * 4;
+            const xb = try e.gpa.alloc(u8, n);
+            defer e.gpa.free(xb);
+            try e.x[e.xi].download(0, xb);
+            var nm9: [40]u8 = undefined;
+            e.dump_serial += 1;
+            const f9 = std.fmt.bufPrint(&nm9, "kx{d}{s}S{d}.bin", .{ bi, @as([]const u8, if (e.cont) "b" else "a"), e.dump_serial }) catch unreachable;
+            var dir9 = std.Io.Dir.cwd();
+            dir9.writeFile(e.io, .{ .sub_path = f9, .data = xb }) catch {};
+        }
+        const hc_a = L.hc_attn orelse return; // the MTP block runs after the tail
+        if ((e.fwd_count == 1 and !e.quiet) and bi == 4) {
+            try e.stream.synchronize();
+            try e.dumpBin("at4_xpre.bin", e.x[e.xi].ptr, rows * 4 * e.c.hidden * 4);
+            try e.dumpBin("at4_branch.bin", e.branch.ptr, rows * e.c.hidden * 2);
+            try e.dumpBin("at4_afn.bin", hc_a.fnp, 24 * 4 * e.c.hidden * 2);
+        }
+        try e.hcGates(rows, hc_a, L.in_norm);
+        if ((e.fwd_count == 1 and !e.quiet) and bi == 4) {
+            try e.stream.synchronize();
+            try e.dumpBin("at4_post.bin", e.post.ptr, 16 * 4);
+            try e.dumpBin("at4_comb.bin", e.comb.ptr, 16 * 4 * 4);
+            try e.dumpBin("at4_xpost.bin", e.x[e.xi].ptr, rows * 4 * e.c.hidden * 4);
+            try e.dumpBin("at4_abase.bin", hc_a.base, 24 * 4);
+            try e.dumpBin("at4_ascale.bin", hc_a.scale, 3 * 4);
+        }
+        if (e.attn_sums) |asums| {
+            if ((e.fwd_count == 1 and !e.quiet) and bi >= 1) {
+            try e.stream.synchronize();
+            const hd = e.c.hidden;
+            const xb = try e.gpa.alloc(u8, 4 * hd * 4);
+            defer e.gpa.free(xb);
+            try e.x[e.xi].download(0, xb);
+            var acc: f64 = 0;
+            if (e.f32_streams) {
+                const fv = std.mem.bytesAsSlice(f32, @as([]align(1) u8, xb));
+                for (0..hd) |d| {
+                    var m: f64 = 0;
+                    for (0..4) |st| m += fv[st * hd + d];
+                    acc += m / 4.0;
+                }
+            } else {
+                const hv = std.mem.bytesAsSlice(u16, @as([]align(1) u8, xb));
+                for (0..hd) |d| {
+                    var m: f64 = 0;
+                    for (0..4) |st| m += @as(f32, @bitCast(@as(u32, hv[st * hd + d]) << 16));
+                    acc += m / 4.0;
+                }
+            }
+            asums[bi - 1] = acc;
+            }
+        }
+        if (((e.fwd_count == 1 or e.dump_on) and !e.quiet) and bi <= 45) try e.dumpPb(bi, "na", e.normed.ptr, rows);
+        if (bi == 0 and !e.quiet) {
+            try e.b0Print("normed", e.normed);
+            const nb = try e.gpa.alloc(u8, e.c.hidden * 2);
+            defer e.gpa.free(nb);
+            e.normed.download(0, nb) catch {};
+            var dir = std.Io.Dir.cwd();
+            dir.writeFile(e.io, .{ .sub_path = "normed0.bin", .data = nb }) catch {};
+            std.debug.print("  normed row0 dumped 8192B\n", .{});
+        }
+        const ot0 = if (op_timing and bi == 0) tns() else 0;
+        switch (L.attn) {
+            .kda => |*w| {
+                const oa0 = if (op_timing and bi == 0) tns() else 0;
+                try e.kdaLayer(ki.*, w, rows);
+                if (op_timing and bi == 0) opt_gates += tns() - oa0;
+                ki.* += 1;
+                if (bi == 0 and !e.quiet) try e.b0Print("attn", e.y);
+            },
+            .mla => {
+                if (!e.skip_mla) try e.mlaLayer(mi_mla.*, switch (L.attn) {
+                    .mla => |*x| x,
+                    .kda => unreachable,
+                }, rows, pos) else try e.branch.fill8(0, e.stream.handle);
+                mi_mla.* += 1;
+            },
+        }
+        if (((e.fwd_count == 1 or e.dump_on) and !e.quiet) and bi <= 45) try e.dumpPb(bi, "ba", e.branch.ptr, rows);
+        if ((e.fwd_count == 1 and !e.quiet) and bi <= 45) {
+            try e.stream.synchronize();
+            var n1: [24]u8 = undefined;
+            try e.dumpBin(std.fmt.bufPrint(&n1, "pb{d}_xpre.bin", .{bi}) catch unreachable, e.x[if (e.xi < 2) e.xi else 0].ptr, rows * 4 * e.c.hidden * 4);
+            var n2: [24]u8 = undefined;
+            try e.dumpBin(std.fmt.bufPrint(&n2, "pb{d}_fnp.bin", .{bi}) catch unreachable, (L.hc_ffn orelse unreachable).fnp, 24 * 4 * e.c.hidden * 2);
+            try e.dumpBin("hc_fbase.bin", (L.hc_ffn orelse unreachable).base, 24 * 4);
+            try e.dumpBin("hc_fscale.bin", (L.hc_ffn orelse unreachable).scale, 3 * 4);
+        }
+        try e.hcFold(hc_a.fnp, rows);
+        try e.hcGates(rows, L.hc_ffn orelse return error.UnexpectedMtp, L.post_norm);
+        if (((e.fwd_count == 1 or e.dump_on) and !e.quiet) and bi <= 45) try e.dumpPb(bi, "nf", e.normed.ptr, rows);
+        if ((e.fwd_count == 1 and !e.quiet) and bi <= 45) {
+            var n3: [24]u8 = undefined;
+            try e.dumpBin(std.fmt.bufPrint(&n3, "pb{d}_post.bin", .{bi}) catch unreachable, e.post.ptr, rows * 4 * 4);
+            var n4: [24]u8 = undefined;
+            try e.dumpBin(std.fmt.bufPrint(&n4, "pb{d}_comb.bin", .{bi}) catch unreachable, e.comb.ptr, rows * 16 * 4);
+            var n5: [24]u8 = undefined;
+            try e.dumpBin(std.fmt.bufPrint(&n5, "pb{d}_xpost.bin", .{bi}) catch unreachable, e.x[if (e.xi < 2) e.xi else 0].ptr, rows * 4 * e.c.hidden * 4);
+            var n7: [24]u8 = undefined;
+            try e.dumpBin(std.fmt.bufPrint(&n7, "pb{d}_part.bin", .{bi}) catch unreachable, e.part.ptr, rows * hc.partBytes(1));
+        }
+        switch (L.mlp) {
+            .dense => |*w| try e.denseMlp(w, rows),
+            .moe => |*w| try e.moeBlock(w, rows),
+        }
+        if (op_timing and bi == 0) opt_gates += tns() - ot0;
+        try e.hcFold((L.hc_ffn orelse return error.UnexpectedMtp).fnp, rows);
+        if (((e.fwd_count == 1 or e.dump_on) and !e.quiet) and bi <= 45) try e.dumpPb(bi, "bf", e.branch.ptr, rows);
+        if (e.block_sums) |sums| {
+            // their tap metric: row 0's mean of the 4 streams, summed over D
+            const hd = e.c.hidden;
+            const b = e.gpa.alloc(u8, 4 * hd * 4) catch |err| return err;
+            defer e.gpa.free(b);
+            e.stream.synchronize() catch {};
+            e.x[e.xi].download(0, b) catch {};
+            var acc: f64 = 0;
+            if (e.f32_streams) {
+                const fv = std.mem.bytesAsSlice(f32, @as([]align(1) u8, b));
+                for (0..hd) |d| {
+                    var m: f64 = 0;
+                    for (0..4) |st| m += fv[st * hd + d];
+                    acc += m / 4.0;
+                }
+            } else {
+                const hv = std.mem.bytesAsSlice(u16, @as([]align(1) u8, b));
+                for (0..hd) |d| {
+                    var m: f64 = 0;
+                    for (0..4) |st| m += @as(f32, @bitCast(@as(u32, hv[st * hd + d]) << 16));
+                    acc += m / 4.0;
+                }
+            }
+            sums[bi] = acc;
+            if (bi == 0 and !e.quiet) {
+                e.stream.synchronize() catch {};
+                var br: f64 = 0;
+                const bb = e.gpa.alloc(u8, e.c.hidden * 2) catch |err| return err;
+                defer e.gpa.free(bb);
+                e.branch.download(0, bb) catch {};
+                for (0..e.c.hidden) |d| {
+                    const h: u16 = std.mem.readInt(u16, bb[d * 2 ..][0..2], .little);
+                    br += @as(f32, @bitCast(@as(u32, h) << 16));
+                }
+                var yr: f64 = 0;
+                const yb = e.gpa.alloc(u8, e.c.hidden * 2) catch |err| return err;
+                defer e.gpa.free(yb);
+                e.y.download(0, yb) catch {};
+                for (0..e.c.hidden) |d| {
+                    const h: u16 = std.mem.readInt(u16, yb[d * 2 ..][0..2], .little);
+                    yr += @as(f32, @bitCast(@as(u32, h) << 16));
+                }
+                std.debug.print("  b0 branch sum {d:.2} attn-y sum {d:.2}\n", .{br, yr});
+            }
+        }
+    }
+
     pub fn forward(e: *Engine, ids: []const u32, rows: usize, pos: usize) !void {
         e.fwd_count += 1;
         e.hc_calls = 0;
@@ -1446,177 +1640,72 @@ pub const Engine = struct {
                 dir.writeFile(e.io, .{ .sub_path = fname, .data = hb2 }) catch {};
             }
         }
-        var ki: usize = 0;
+        var bi: usize = e.w.blocks_lo;
         var mi_mla: usize = 0;
-        for (e.w.layers, e.w.blocks_lo..) |*L, bi| {
+        var ki: usize = 0;
+        var seg_i: usize = 0;
+        while (bi < e.w.blocks_hi) {
+            const L = &e.w.layers[bi - e.w.blocks_lo];
             e.cur_bi = @intCast(bi);
-            if (e.dump_on and bi <= 21) {
-                {
-                    try e.stream.synchronize();
-                    const cb = try e.gpa.alloc(u8, 147456);
-                    defer e.gpa.free(cb);
-                    try (cuda.DeviceBuffer{ .d = e.d, .ptr = e.kda_cs.ptr, .len = 147456, .borrowed = true }).download(0, cb);
-                    var nmY: [40]u8 = undefined;
-                    e.dump_serial += 1;
-                    const fY = std.fmt.bufPrint(&nmY, "ksb{d}{s}S{d}.bin", .{ bi, @as([]const u8, if (e.cont) "b" else "a"), e.dump_serial }) catch unreachable;
-                    var dirY = std.Io.Dir.cwd();
-                    dirY.writeFile(e.io, .{ .sub_path = fY, .data = cb }) catch {};
-                }
-                try e.stream.synchronize();
-                const n = rows * 4 * e.c.hidden * 4;
-                const xb = try e.gpa.alloc(u8, n);
-                defer e.gpa.free(xb);
-                try e.x[e.xi].download(0, xb);
-                var nm9: [40]u8 = undefined;
-                e.dump_serial += 1;
-                const f9 = std.fmt.bufPrint(&nm9, "kx{d}{s}S{d}.bin", .{ bi, @as([]const u8, if (e.cont) "b" else "a"), e.dump_serial }) catch unreachable;
-                var dir9 = std.Io.Dir.cwd();
-                dir9.writeFile(e.io, .{ .sub_path = f9, .data = xb }) catch {};
-            }
-            const hc_a = L.hc_attn orelse break; // the MTP block runs after the tail
-            if ((e.fwd_count == 1 and !e.quiet) and bi == 4) {
-                try e.stream.synchronize();
-                try e.dumpBin("at4_xpre.bin", e.x[e.xi].ptr, rows * 4 * e.c.hidden * 4);
-                try e.dumpBin("at4_branch.bin", e.branch.ptr, rows * e.c.hidden * 2);
-                try e.dumpBin("at4_afn.bin", hc_a.fnp, 24 * 4 * e.c.hidden * 2);
-            }
-            try e.hcGates(rows, hc_a, L.in_norm);
-            if ((e.fwd_count == 1 and !e.quiet) and bi == 4) {
-                try e.stream.synchronize();
-                try e.dumpBin("at4_post.bin", e.post.ptr, 16 * 4);
-                try e.dumpBin("at4_comb.bin", e.comb.ptr, 16 * 4 * 4);
-                try e.dumpBin("at4_xpost.bin", e.x[e.xi].ptr, rows * 4 * e.c.hidden * 4);
-                try e.dumpBin("at4_abase.bin", hc_a.base, 24 * 4);
-                try e.dumpBin("at4_ascale.bin", hc_a.scale, 3 * 4);
-            }
-            if (e.attn_sums) |asums| {
-                if ((e.fwd_count == 1 and !e.quiet) and bi >= 1) {
-                try e.stream.synchronize();
-                const hd = e.c.hidden;
-                const xb = try e.gpa.alloc(u8, 4 * hd * 4);
-                defer e.gpa.free(xb);
-                try e.x[e.xi].download(0, xb);
-                var acc: f64 = 0;
-                if (e.f32_streams) {
-                    const fv = std.mem.bytesAsSlice(f32, @as([]align(1) u8, xb));
-                    for (0..hd) |d| {
-                        var m: f64 = 0;
-                        for (0..4) |st| m += fv[st * hd + d];
-                        acc += m / 4.0;
+            if (e.seg_on and rows <= 2 and seg_i < e.seg_n and bi == e.seg_start[seg_i]) {
+                const v = (if (rows == 1) @as(usize, 0) else @as(usize, 1)) * 2 + e.kda_st_cur[0];
+                if (e.seg_exec[seg_i][v]) |*ex| {
+                    try ex.launchOn(e.stream);
+                    e.seg_plays += 1;
+                    // the replayed body skipped the host-side state advance
+                    var l2 = e.seg_li0[seg_i];
+                    while (l2 < e.seg_li0[seg_i] + e.seg_len[seg_i]) : (l2 += 1) e.kda_st_cur[l2] = 1 - e.kda_st_cur[l2];
+                } else if (e.seg_seen[seg_i][v] == 0) {
+                    // first encounter runs uncaptured: the lazy inits (m41
+                    // module load, buffer allocs) are not capture-legal
+                    e.seg_seen[seg_i][v] = 1;
+                    var b2 = bi;
+                    while (b2 < e.seg_end[seg_i]) : (b2 += 1) {
+                        const L2 = &e.w.layers[b2 - e.w.blocks_lo];
+                        e.cur_bi = @intCast(b2);
+                        try e.blockBody(L2, b2, rows, pos, &mi_mla, &ki);
                     }
                 } else {
-                    const hv = std.mem.bytesAsSlice(u16, @as([]align(1) u8, xb));
-                    for (0..hd) |d| {
-                        var m: f64 = 0;
-                        for (0..4) |st| m += @as(f32, @bitCast(@as(u32, hv[st * hd + d]) << 16));
-                        acc += m / 4.0;
+                    const saved_quiet = e.quiet;
+                    e.quiet = true;
+                    try cuda.graph.beginCapture(e.stream, .thread_local);
+                    var body_ok = true;
+                    var b2 = bi;
+                    while (b2 < e.seg_end[seg_i]) : (b2 += 1) {
+                        const L2 = &e.w.layers[b2 - e.w.blocks_lo];
+                        e.cur_bi = @intCast(b2);
+                        e.blockBody(L2, b2, rows, pos, &mi_mla, &ki) catch {
+                            body_ok = false;
+                            break;
+                        };
                     }
+                    if (cuda.graph.endCapture(e.stream)) |g| {
+                        var gg = g;
+                        if (!body_ok) {
+                            gg.deinit();
+                            e.quiet = saved_quiet;
+                            return error.SegCaptureFailed;
+                        }
+                        defer gg.deinit();
+                        const ex = try gg.instantiate();
+                        try ex.upload(e.stream);
+                        e.seg_exec[seg_i][v] = ex;
+                        e.seg_caps += 1;
+                        try ex.launchOn(e.stream);
+                    } else |cerr| {
+                        e.quiet = saved_quiet;
+                        return cerr;
+                    }
+                    e.quiet = saved_quiet;
                 }
-                asums[bi - 1] = acc;
-                }
+                e.cur_bi = @intCast(e.seg_end[seg_i] - 1);
+                bi = e.seg_end[seg_i];
+                seg_i += 1;
+                continue;
             }
-            if (((e.fwd_count == 1 or e.dump_on) and !e.quiet) and bi <= 45) try e.dumpPb(bi, "na", e.normed.ptr, rows);
-            if (bi == 0 and !e.quiet) {
-                try e.b0Print("normed", e.normed);
-                const nb = try e.gpa.alloc(u8, e.c.hidden * 2);
-                defer e.gpa.free(nb);
-                e.normed.download(0, nb) catch {};
-                var dir = std.Io.Dir.cwd();
-                dir.writeFile(e.io, .{ .sub_path = "normed0.bin", .data = nb }) catch {};
-                std.debug.print("  normed row0 dumped 8192B\n", .{});
-            }
-            const ot0 = if (op_timing and bi == 0) tns() else 0;
-            switch (L.attn) {
-                .kda => |*w| {
-                    const oa0 = if (op_timing and bi == 0) tns() else 0;
-                    try e.kdaLayer(ki, w, rows);
-                    if (op_timing and bi == 0) opt_gates += tns() - oa0;
-                    ki += 1;
-                    if (bi == 0 and !e.quiet) try e.b0Print("attn", e.y);
-                },
-                .mla => {
-                    if (!e.skip_mla) try e.mlaLayer(mi_mla, switch (L.attn) {
-                        .mla => |*x| x,
-                        .kda => unreachable,
-                    }, rows, pos) else try e.branch.fill8(0, e.stream.handle);
-                    mi_mla += 1;
-                },
-            }
-            if (((e.fwd_count == 1 or e.dump_on) and !e.quiet) and bi <= 45) try e.dumpPb(bi, "ba", e.branch.ptr, rows);
-            if ((e.fwd_count == 1 and !e.quiet) and bi <= 45) {
-                try e.stream.synchronize();
-                var n1: [24]u8 = undefined;
-                try e.dumpBin(std.fmt.bufPrint(&n1, "pb{d}_xpre.bin", .{bi}) catch unreachable, e.x[if (e.xi < 2) e.xi else 0].ptr, rows * 4 * e.c.hidden * 4);
-                var n2: [24]u8 = undefined;
-                try e.dumpBin(std.fmt.bufPrint(&n2, "pb{d}_fnp.bin", .{bi}) catch unreachable, (L.hc_ffn orelse unreachable).fnp, 24 * 4 * e.c.hidden * 2);
-                try e.dumpBin("hc_fbase.bin", (L.hc_ffn orelse unreachable).base, 24 * 4);
-                try e.dumpBin("hc_fscale.bin", (L.hc_ffn orelse unreachable).scale, 3 * 4);
-            }
-            try e.hcFold(hc_a.fnp, rows);
-            try e.hcGates(rows, L.hc_ffn orelse return error.UnexpectedMtp, L.post_norm);
-            if (((e.fwd_count == 1 or e.dump_on) and !e.quiet) and bi <= 45) try e.dumpPb(bi, "nf", e.normed.ptr, rows);
-            if ((e.fwd_count == 1 and !e.quiet) and bi <= 45) {
-                var n3: [24]u8 = undefined;
-                try e.dumpBin(std.fmt.bufPrint(&n3, "pb{d}_post.bin", .{bi}) catch unreachable, e.post.ptr, rows * 4 * 4);
-                var n4: [24]u8 = undefined;
-                try e.dumpBin(std.fmt.bufPrint(&n4, "pb{d}_comb.bin", .{bi}) catch unreachable, e.comb.ptr, rows * 16 * 4);
-                var n5: [24]u8 = undefined;
-                try e.dumpBin(std.fmt.bufPrint(&n5, "pb{d}_xpost.bin", .{bi}) catch unreachable, e.x[if (e.xi < 2) e.xi else 0].ptr, rows * 4 * e.c.hidden * 4);
-                var n7: [24]u8 = undefined;
-                try e.dumpBin(std.fmt.bufPrint(&n7, "pb{d}_part.bin", .{bi}) catch unreachable, e.part.ptr, rows * hc.partBytes(1));
-            }
-            switch (L.mlp) {
-                .dense => |*w| try e.denseMlp(w, rows),
-                .moe => |*w| try e.moeBlock(w, rows),
-            }
-            if (op_timing and bi == 0) opt_gates += tns() - ot0;
-            try e.hcFold((L.hc_ffn orelse return error.UnexpectedMtp).fnp, rows);
-            if (((e.fwd_count == 1 or e.dump_on) and !e.quiet) and bi <= 45) try e.dumpPb(bi, "bf", e.branch.ptr, rows);
-            if (e.block_sums) |sums| {
-                // their tap metric: row 0's mean of the 4 streams, summed over D
-                const hd = e.c.hidden;
-                const b = e.gpa.alloc(u8, 4 * hd * 4) catch |err| return err;
-                defer e.gpa.free(b);
-                e.stream.synchronize() catch {};
-                e.x[e.xi].download(0, b) catch {};
-                var acc: f64 = 0;
-                if (e.f32_streams) {
-                    const fv = std.mem.bytesAsSlice(f32, @as([]align(1) u8, b));
-                    for (0..hd) |d| {
-                        var m: f64 = 0;
-                        for (0..4) |st| m += fv[st * hd + d];
-                        acc += m / 4.0;
-                    }
-                } else {
-                    const hv = std.mem.bytesAsSlice(u16, @as([]align(1) u8, b));
-                    for (0..hd) |d| {
-                        var m: f64 = 0;
-                        for (0..4) |st| m += @as(f32, @bitCast(@as(u32, hv[st * hd + d]) << 16));
-                        acc += m / 4.0;
-                    }
-                }
-                sums[bi] = acc;
-                if (bi == 0 and !e.quiet) {
-                    e.stream.synchronize() catch {};
-                    var br: f64 = 0;
-                    const bb = e.gpa.alloc(u8, e.c.hidden * 2) catch |err| return err;
-                    defer e.gpa.free(bb);
-                    e.branch.download(0, bb) catch {};
-                    for (0..e.c.hidden) |d| {
-                        const h: u16 = std.mem.readInt(u16, bb[d * 2 ..][0..2], .little);
-                        br += @as(f32, @bitCast(@as(u32, h) << 16));
-                    }
-                    var yr: f64 = 0;
-                    const yb = e.gpa.alloc(u8, e.c.hidden * 2) catch |err| return err;
-                    defer e.gpa.free(yb);
-                    e.y.download(0, yb) catch {};
-                    for (0..e.c.hidden) |d| {
-                        const h: u16 = std.mem.readInt(u16, yb[d * 2 ..][0..2], .little);
-                        yr += @as(f32, @bitCast(@as(u32, h) << 16));
-                    }
-                    std.debug.print("  b0 branch sum {d:.2} attn-y sum {d:.2}\n", .{br, yr});
-                }
-            }
+            try e.blockBody(L, bi, rows, pos, &mi_mla, &ki);
+            if (seg_i < e.seg_n and bi + 1 == e.seg_end[seg_i]) seg_i += 1;
+            bi += 1;
         }
         if (e.stop_after_blocks) return; // the handoff: x, branch, post, comb in place
         // glue's tail: every branch already folded at its own boundary; the
