@@ -1603,7 +1603,7 @@ pub const Engine = struct {
             try e.ids.uploadAsync(0, std.mem.sliceAsBytes(ids)[0 .. rows * 4], e.stream.handle); // stream-ordered: a null-stream upload races the embed kernel
             for (0..4) |s_i| {
                 if (e.vis) |v| {
-                    try v.embedRows(e.ids.ptr, e.w.embed, v.feats.ptr, v.feat_map.ptr, rows, hidden, e.x[e.xi].ptr + s_i * hidden * (if (e.f32_streams) @as(usize, 4) else 2), 4 * hidden, e.f32_streams);
+                    try v.embedRows(e.stream, e.ids.ptr, e.w.embed, v.feats.ptr, v.feat_map.ptr, rows, hidden, e.x[e.xi].ptr + s_i * hidden * (if (e.f32_streams) @as(usize, 4) else 2), 4 * hidden, e.f32_streams);
                 } else if (e.f32_streams) try e.ops.embedF32(e.stream, e.ids.ptr, e.w.embed, e.x[e.xi].ptr + s_i * hidden * 4, rows, hidden, 4 * hidden) else try e.ops.embed(e.stream, e.ids.ptr, e.w.embed, e.x[e.xi].ptr + s_i * hidden * 2, rows, hidden, 4 * hidden);
             }
             e.xi = 0;
@@ -1633,6 +1633,8 @@ pub const Engine = struct {
                 const fname = std.fmt.bufPrint(&fn2, "xembS{s}S{d}.bin", .{ @as([]const u8, if (e.cont) "b" else "a"), e.dump_serial }) catch unreachable;
                 var dir = std.Io.Dir.cwd();
                 dir.writeFile(e.io, .{ .sub_path = fname, .data = hb2 }) catch {};
+                var dirf = std.Io.Dir.cwd();
+                dirf.writeFile(e.io, .{ .sub_path = "xemb_last.bin", .data = hb2[0 .. rows * 4 * e.c.hidden * 4] }) catch {};
             }
         }
         var bi: usize = e.w.blocks_lo;

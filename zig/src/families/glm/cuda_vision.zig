@@ -372,7 +372,7 @@ pub const Vision = struct {
     /// features; the rest the embedding table. feat_map: [rows] i32 (the
     /// host builds it - it knows the image positions). streams in bf16 or
     /// f32 to match the engine's stream dtype.
-    pub fn embedRows(v: *Vision, ids: u64, table: u64, feats: u64, feat_map: u64, rows: usize, d: usize, out: u64, stride: usize, f32_streams: bool) !void {
+    pub fn embedRows(v: *Vision, s: cuda.Stream, ids: u64, table: u64, feats: u64, feat_map: u64, rows: usize, d: usize, out: u64, stride: usize, f32_streams: bool) !void {
         var a: cuda.Args = .{};
         a.add(ids);
         a.add(table);
@@ -385,12 +385,18 @@ pub const Vision = struct {
         a.add(@as(i32, @intCast(stride)));
         const total = rows * d;
         const fn_ = if (f32_streams) v.k.embedf32_fn else v.k.embed_fn;
-        try go(fn_, v.s, .{ .x = @as(u32, @intCast((total + 255) / 256)), .y = 1, .z = 1 }, 256, 0, &a);
+        try go(fn_, s, .{ .x = @as(u32, @intCast((total + 255) / 256)), .y = 1, .z = 1 }, 256, 0, &a);
     }
 
     /// Upload the host-built feature map (i32 per prompt row: -1 = table).
-    pub fn uploadMap(v: *Vision, map: []const i32) !void {
-        try (DeviceBuffer{ .d = v.d, .ptr = v.feat_map.ptr, .len = map.len * 4, .borrowed = true }).upload(0, std.mem.sliceAsBytes(map));
+    /// MUST be stream-ordered: a null-stream upload races the embed kernel
+    /// (the ids-race bug class).
+    pub fn uploadMap(v: *Vision, map: []const i32, stream: ?cuda.Stream) !void {
+        if (stream) |st| {
+            try (DeviceBuffer{ .d = v.d, .ptr = v.feat_map.ptr, .len = map.len * 4, .borrowed = true }).uploadAsync(0, std.mem.sliceAsBytes(map), st.handle);
+        } else {
+            try (DeviceBuffer{ .d = v.d, .ptr = v.feat_map.ptr, .len = map.len * 4, .borrowed = true }).upload(0, std.mem.sliceAsBytes(map));
+        }
     }
 
     fn biasW(v: *Vision, y: u64, b: u64, rows: usize, n: usize) !void {
