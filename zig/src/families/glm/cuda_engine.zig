@@ -1162,23 +1162,23 @@ pub const Engine = struct {
         try e.g.mm(e.stream, e.normed.ptr, w.shared_up, e.mlp_tmp.ptr + rows * inter * 2, rows, inter, hidden, false);
         try e.ops.act(e.stream, e.mlp_tmp.ptr, e.mlp_tmp.ptr + rows * inter * 2, e.mlp_act.ptr, rows, 1, inter, e.c.swiglu_limit);
         try e.g.mm(e.stream, e.mlp_act.ptr, w.shared_down, e.moe_ys.ptr, rows, hidden, inter, false);
-        if (e.m41_on and rows == 1 and w.gate.len > 0) {
-            const pairs = e.c.topk;
+        if (e.m41_on and rows <= 2 and w.gate.len > 0) {
+            const pairs = rows * e.c.topk;
             if (e.m41_xe == null) {
                 e.m41_xe = try @import("cuda").exl3_experts.Experts.load(e.d, 148);
                 const mod = try cuda.Module.load(e.d, @import("cuda").kernels.experts);
                 e.m41_router_mod = mod;
                 e.m41_router = try @import("cuda").grouped.Router.resolve(mod);
-                e.m41_members = try cuda.DeviceBuffer.alloc(e.d, 8 * 4);
-                e.m41_items = try cuda.DeviceBuffer.alloc(e.d, 16 * 3 * 4);
+                e.m41_members = try cuda.DeviceBuffer.alloc(e.d, 16 * 4);
+                e.m41_items = try cuda.DeviceBuffer.alloc(e.d, 17 * 3 * 4);
                 e.m41_counts = try cuda.DeviceBuffer.alloc(e.d, 8);
                 e.m41_rank = try cuda.DeviceBuffer.alloc(e.d, 8 * 4);
                 e.m41_hist = try cuda.DeviceBuffer.alloc(e.d, 16 * 4);
                 var imax2: usize = 0;
                 for (w.gate) |gw| imax2 = @max(imax2, gw.n);
                 e.m41_inter_max = imax2;
-                e.m41_out = try cuda.DeviceBuffer.alloc(e.d, 2 * e.c.topk * imax2 * 2);
-                e.m41_act = try cuda.DeviceBuffer.alloc(e.d, e.c.topk * imax2 * 2);
+                e.m41_out = try cuda.DeviceBuffer.alloc(e.d, 2 * e.c.topk * imax2 * 2 * 2);
+                e.m41_act = try cuda.DeviceBuffer.alloc(e.d, e.c.topk * imax2 * 2 * 2);
             }
             const desc_up = try e.m41DescFor(e.cur_bi, w);
             const desc_dn = e.m41_layer_descs.?.get(e.cur_bi * 2 + 1).?;
@@ -1265,11 +1265,12 @@ pub const Engine = struct {
             };
             // their .up epi writes swiglu(gate,up) inline: one row per pair at
             // [0..topk) - the down family reads those rows directly
-            try e.m41_xe.?.runMixed(e.stream, .up, .{ .x = e.normed.ptr, .stride = e.c.hidden, .slots = e.c.topk }, l_up, p, e.m41_out.ptr, pairs, -1, desc_up);
+            const m41_items_n = @import("cuda").grouped.maxItems(pairs, e.c.experts, 16);
+            try e.m41_xe.?.runMixed(e.stream, .up, .{ .x = e.normed.ptr, .stride = e.c.hidden, .slots = e.c.topk }, l_up, p, e.m41_out.ptr, m41_items_n, -1, desc_up);
             var l_dn = l_up;
             l_dn.up = e.m41_down.ptr;
             l_dn.up_scale = e.m41_down_h.ptr;
-            try e.m41_xe.?.runMixed(e.stream, .down_bf16, .{ .x = e.m41_out.ptr, .stride = e.m41_inter_max, .slots = 0 }, l_dn, p, e.moe_ye.ptr, pairs, -1, desc_dn);
+            try e.m41_xe.?.runMixed(e.stream, .down_bf16, .{ .x = e.m41_out.ptr, .stride = e.m41_inter_max, .slots = 0 }, l_dn, p, e.moe_ye.ptr, m41_items_n, -1, desc_dn);
             if (e.m41_stage_n == 1) {
                 try e.dumpBin("m41_new_out.bin", e.m41_out.ptr, 2 * e.c.topk * e.m41_inter_max * 2);
                 try e.dumpBin("m41_new_ye.bin", e.moe_ye.ptr, rows * e.c.topk * hidden * 2);
