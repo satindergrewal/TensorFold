@@ -1578,7 +1578,21 @@ pub const Engine = struct {
         }
     }
 
+    /// A request thread that died mid-capture (a panic never unwinds) leaves
+    /// the stream capturing; every later graph op would fail Invalid. End
+    /// and discard any leaked capture before this forward runs.
+    fn segClean(e: *Engine) void {
+        const st = cuda.graph.captureStatus(e.stream) catch return;
+        if (st == .active and false) return; // BENCH-DEBUG: segClean body disabled
+        if (st != .active) return;
+        if (cuda.graph.endCapture(e.stream)) |g| {
+            var gg = g;
+            gg.deinit();
+        } else |_| {}
+    }
+
     pub fn forward(e: *Engine, ids: []const u32, rows: usize, pos: usize) !void {
+        e.segClean();
         e.fwd_count += 1;
         e.hc_calls = 0;
         
