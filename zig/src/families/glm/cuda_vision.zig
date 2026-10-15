@@ -271,7 +271,7 @@ pub const Vision = struct {
         v.cos = try DeviceBuffer.alloc(d, S * c.hd * 4);
         v.sin = try DeviceBuffer.alloc(d, S * c.hd * 4);
         v.groups = try DeviceBuffer.alloc(d, (S / 4) * 4 * c.hidden * 2);
-        v.feats = try DeviceBuffer.alloc(d, (S / 4) * c.out * 2);
+        v.feats = try DeviceBuffer.alloc(d, (S / 4) * c.out * 2 * 4); // x4: multi-image requests concatenate features here
         v.feat_map = try DeviceBuffer.alloc(d, 24 * 4);
         { // the table path until a request uploads a map: garbage here would route rows to features
             const neg: [24]i32 = @splat(-1);

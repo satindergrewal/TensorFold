@@ -381,7 +381,9 @@ fn serveSplit(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engin
         const idx = std.mem.indexOf(u8, buf[0..n], "\r\n\r\n") orelse break :blk buf[0..n];
         break :blk buf[idx + 4 .. n];
     };
-    var ids_buf: [8192]u32 = @splat(0);
+    var pf_is_img: [8192]bool = @splat(false);
+var pf_is_img_len: usize = 0;
+var ids_buf: [8192]u32 = @splat(0);
     var n_ids: usize = 0;
     var max_tokens: usize = 64;
     if (std.mem.indexOf(u8, body, "\"prompt\"")) |p0| {
@@ -470,33 +472,98 @@ fn serveSplit(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engin
                 if (any) img_h = v;
             }
         }
-        if (img_b64.len > 0 and img_w > 0 and img_h > 0 and img_w <= 8192 and img_h <= 8192 and n_ids + 8200 < ids_buf.len) {
-            const prep = @import("glm").vision_prep;
-            const b64bytes = prep.b64decode(gpa, img_b64) catch &[_]u8{};
-            defer if (b64bytes.len > 0) gpa.free(b64bytes);
-            if (b64bytes.len >= img_w * img_h * 3) {
-                const pr = try prep.patchify(gpa, b64bytes, img_w, img_h, 3, 2048);
-                defer gpa.free(pr.bytes);
-                var pbuf = try cuda.DeviceBuffer.fromHost(vis.d, pr.bytes);
-                defer pbuf.free();
-                try vis.encode(pbuf.ptr, pr.gh, pr.gw);
-                try vis.s.synchronize();
-                const ftoks = pr.gh * pr.gw / 4;
-                std.mem.copyBackwards(u32, ids_buf[ftoks + 2 .. ftoks + 2 + n_ids], ids_buf[0..n_ids]);
-                var at2: usize = 0;
-                ids_buf[at2] = 154830;
-                at2 += 1;
-                for (0..ftoks) |_| {
-                    ids_buf[at2] = 154854;
-                    at2 += 1;
+        // up to four images: "image" (or "image1") plus "image2"/"image3"/"image4"; "width"/"height" default
+        // for all, "widthN"/"heightN" per image. Features are encoded one tower pass at a time, harvested to
+        // host and re-uploaded concatenated; the span holds one <boi><image>*ftoks<eoi> group per image.
+        {
+            const Img = struct { b64: []const u8 = &.{}, w: usize = 0, h: usize = 0 };
+            var imgs: [4]Img = @splat(.{});
+            var n_img: usize = 0;
+            inline for (.{ "image", "image2", "image3", "image4" }, 0..) |base, idx| {
+                var b64: []const u8 = &.{};
+                var found = false;
+                if (std.mem.indexOf(u8, body, "\"" ++ base ++ "\"")) |p0| {
+                    var k0 = p0 + base.len + 2;
+                    while (k0 < body.len and (body[k0] == ' ' or body[k0] == ':')) k0 += 1;
+                    if (k0 < body.len and body[k0] == '"') {
+                        k0 += 1;
+                        const st = k0;
+                        while (k0 < body.len and body[k0] != '"') k0 += 1;
+                        b64 = body[st..k0];
+                        found = true;
+                    }
                 }
-                ids_buf[at2] = 154831;
-                at2 += 1;
-                n_ids += at2;
-                pf_image_rows = at2;
+                var wv: usize = img_w;
+                var hv: usize = img_h;
+                if (!found and idx > 0) wv = 0; // a missing numbered image: skip below
+                inline for (.{ "width", "height" }, 0..) |dim, di| {
+                    const nm = if (idx == 0) dim else dim ++ std.fmt.comptimePrint("{d}", .{idx + 1});
+                    if (std.mem.indexOf(u8, body, "\"" ++ nm ++ "\"")) |p1| {
+                        var k1 = p1 + nm.len + 2;
+                        while (k1 < body.len and (body[k1] == ' ' or body[k1] == ':')) k1 += 1;
+                        var v: usize = 0;
+                        var any = false;
+                        while (k1 < body.len and body[k1] >= '0' and body[k1] <= '9') : (k1 += 1) {
+                            v = v * 10 + (body[k1] - '0');
+                            any = true;
+                        }
+                        if (any) {
+                            if (di == 0) wv = v else hv = v;
+                        }
+                    }
+                }
+                if (found and b64.len > 0 and wv > 0 and hv > 0 and wv <= 8192 and hv <= 8192) {
+                    imgs[n_img] = .{ .b64 = b64, .w = wv, .h = hv };
+                    n_img += 1;
+                }
+            }
+            if (n_img > 0 and n_ids + 8200 * n_img < ids_buf.len) {
+                const prep = @import("glm").vision_prep;
+                var feats_all: std.ArrayList(u8) = .empty;
+                defer feats_all.deinit(gpa);
+                var span: [8192]u32 = undefined;
+                var is_img_row: [8192]bool = @splat(false);
+                var at2: usize = 0;
+                var total_feats: usize = 0;
+                for (imgs[0..n_img]) |im| {
+                    const b64bytes = prep.b64decode(gpa, im.b64) catch &[_]u8{};
+                    defer if (b64bytes.len > 0) gpa.free(b64bytes);
+                    if (b64bytes.len < im.w * im.h * 3) continue;
+                    const pr = try prep.patchify(gpa, b64bytes, im.w, im.h, 3, 2048);
+                    defer gpa.free(pr.bytes);
+                    var pbuf = try cuda.DeviceBuffer.fromHost(vis.d, pr.bytes);
+                    defer pbuf.free();
+                    try vis.encode(pbuf.ptr, pr.gh, pr.gw);
+                    try vis.s.synchronize();
+                    const ftoks = pr.gh * pr.gw / 4;
+                    const fbytes = ftoks * vis.c.out * 2;
+                    const before = feats_all.items.len;
+                    try feats_all.resize(gpa, before + fbytes);
+                    try (cuda.DeviceBuffer{ .d = vis.d, .ptr = vis.feats.ptr, .len = fbytes, .borrowed = true }).download(0, feats_all.items[before..]);
+                    span[at2] = 154830;
+                    at2 += 1;
+                    for (0..ftoks) |_| {
+                        span[at2] = 154854;
+                        is_img_row[at2] = true;
+                        at2 += 1;
+                    }
+                    span[at2] = 154831;
+                    at2 += 1;
+                    total_feats += ftoks;
+                }
+                if (total_feats > 0) {
+                    if (feats_all.items.len > vis.feats.len) return error.TooManyFeatureRows;
+                    try vis.feats.upload(0, feats_all.items);
+                    std.mem.copyBackwards(u32, ids_buf[at2 .. at2 + n_ids], ids_buf[0..n_ids]);
+                    @memcpy(ids_buf[0..at2], span[0..at2]);
+                    n_ids += at2;
+                    pf_image_rows = at2;
+                    @memcpy(pf_is_img[0..at2], is_img_row[0..at2]);
+                    pf_is_img_len = at2;
+                }
             }
         }
-    }
+    } // the image-request guard
     if (n_ids == 0) {
         _ = posix.system.write(fd, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n", 45);
         return;
@@ -564,11 +631,11 @@ fn serveSplit(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engin
                 var cmap: [24]i32 = undefined;
                 var fidx: i32 = 0;
                 for (0..p0) |gr2| {
-                    if (gr2 >= 1 and gr2 < pf_image_rows - 1) fidx += 1;
+                    if (pf_is_img[gr2]) fidx += 1;
                 }
                 for (0..clen) |j2| {
                     const gr2 = p0 + j2;
-                    cmap[j2] = if (gr2 >= 1 and gr2 < pf_image_rows - 1) blk: {
+                    cmap[j2] = if (pf_is_img[gr2]) blk: {
                         const v2 = fidx;
                         fidx += 1;
                         break :blk v2;
