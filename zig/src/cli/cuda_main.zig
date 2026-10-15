@@ -527,6 +527,10 @@ fn serveSplit(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engin
     }
     try ctx.makeCurrent();
     if (!cache_hit) try eng.resetState();
+    if (pf_image_rows == 0 and eng.vis != null) { // a stale image map would route text rows to features
+        const neg: [24]i32 = @splat(-1);
+        try eng.vis.?.uploadMap(neg[0..24], eng.stream);
+    }
     const lx0 = eng.x[0].len;
     const lx1 = eng.x[1].len;
     const lbr = eng.branch.len;
@@ -554,6 +558,24 @@ fn serveSplit(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engin
         var p0: usize = 0;
         while (p0 < n_ids) {
             const clen = @min(24, n_ids - p0);
+            // the chunk's feature map FIRST: the embed kernel reads it during the forward (the e2e test's
+            // order; the old after-the-forward upload left every chunk reading the previous chunk's map)
+            if (pf_image_rows > 0) {
+                var cmap: [24]i32 = undefined;
+                var fidx: i32 = 0;
+                for (0..p0) |gr2| {
+                    if (gr2 >= 1 and gr2 < pf_image_rows - 1) fidx += 1;
+                }
+                for (0..clen) |j2| {
+                    const gr2 = p0 + j2;
+                    cmap[j2] = if (gr2 >= 1 and gr2 < pf_image_rows - 1) blk: {
+                        const v2 = fidx;
+                        fidx += 1;
+                        break :blk v2;
+                    } else -1;
+                }
+                try vis.uploadMap(cmap[0..clen], eng.stream);
+            }
             const ta0 = tnow();
             try eng.forward(ids_buf[p0 .. p0 + clen], clen, p0);
             try eng.stream.synchronize();
@@ -581,24 +603,6 @@ fn serveSplit(gpa: std.mem.Allocator, eng: *glm.engine.Engine, eng_b: *glm.engin
             try eng_b.forward(ids_buf[p0 .. p0 + clen], clen, p0);
             try eng_b.stream.synchronize();
             t_pb += tnow() - tb0;
-            if (pf_image_rows > 0) {
-                var cmap: [24]i32 = undefined;
-                var fidx: i32 = 0;
-                for (0..p0) |gr2| {
-                    if (gr2 >= 1 and gr2 < pf_image_rows - 1) fidx += 1;
-                }
-                for (0..clen) |j2| {
-                    const gr2 = p0 + j2;
-                    cmap[j2] = if (gr2 >= 1 and gr2 < pf_image_rows - 1) blk: {
-                        const v2 = fidx;
-                        fidx += 1;
-                        break :blk v2;
-                    } else -1;
-                }
-                try ctx.makeCurrent();
-                try vis.uploadMap(cmap[0..clen], eng.stream);
-                try ctx1.makeCurrent();
-            }
             try ctx.makeCurrent();
             last_clen = clen;
             p0 += clen;
