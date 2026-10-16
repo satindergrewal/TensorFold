@@ -557,7 +557,10 @@ pub const Forward = struct {
             try f.wholeWave(f.wave.?, R);
         } else if (pieces > 1 or (pieces == 1 and f.splits(R))) try f.pieced(f.pieces.?, R, cut[0..pieces]) else try f.whole(R);
         try f.finish(R);
-        if (std.c.getenv("TF_GLM_WAVE_DUMP") != null and !f.ranks[0].b.prefill) dumpBytes(f, f.ranks[0].b.logits, R * f.ranks[0].w.share.vocab.len() * 2, "logits");
+        if (std.c.getenv("TF_GLM_WAVE_DUMP") != null and !f.ranks[0].b.prefill) {
+            dumpBytes(f, f.ranks[0].b.logits, R * f.ranks[0].w.share.vocab.len() * 2, "logits");
+            dumpBytes(f, f.ranks[0].b.fnormed, R * c.hidden * 2, "fnormed");
+        }
     }
 
     /// The two-group decode wavefront (docs/WAVEFRONT.md): clones of the rank with offset
@@ -594,12 +597,14 @@ pub const Forward = struct {
         for (r0.st.cur, 0..) |v, i| { if (i < flipped.len) flipped[i] = 1 - v; }
         const nch_a = @min(latent.chunksFor(r0.st.pos + a), r0.b.nch);
         const nch_b = @min(latent.chunksFor(r0.st.pos + a + br), r0.b.nch);
-        const hl = r0.st.caches.len;
-        const part_b = a * nch_b * hl * c.kv_lora * 4; // bytes: group B's partials past A's
+        // the partials are [nch][rows][mla heads][lw]: the row stride is the HEAD count (the
+        // rank's mla span), not the mla LAYER count - caches.len() is the layer count
+        const mh = r0.w.share.mla.len();
+        const part_b = a * nch_b * mh * c.kv_lora * 4; // bytes: group B's partials past A's
         var bA = r0.b.*;
         if (R - a < R) bA.gathered = w.scratch; // a lone full-window group keeps the real gathered:
         // bisect - if A-only still differs from eager with the real buffer, the bug is outside wholeWave
-        var bB = groupBuffers(f, r0.b, a, w.scratch + 2 * a * D * 4, part_b);
+        var bB = groupBuffers(f, r0.b, a, w.scratch + 2 * a * D * 4, part_b, a * nch_b * mh * 4);
         var stA = r0.st.*;
         var stB = groupState(r0.st, a, w.pos2, &flipped);
         var ranks_a = [1]Rank{.{ .w = r0.w, .st = &stA, .b = &bA }};
@@ -676,7 +681,9 @@ pub const Forward = struct {
             }
         }
         try glue.streamMean(f.set(), f.stream, r0.b.x, r0.b.hidden, R, c.hidden, c.hc);
-        r0.st.last_wave = R - a != R; // a lone full-window group writes the ring like eager
+        r0.st.last_wave = a < R; // both groups ran; a lone full-window group (a == R) writes the ring like eager
+        if (std.c.getenv("TF_GLM_WAVE_DUMP") != null)
+            std.log.info("LAYERDUMP waveend r{d} R={d} a={d} lw={} stptr={x}", .{ dump_rounds, R, a, r0.st.last_wave, @intFromPtr(r0.st) });
     }
 
     /// TF_GLM_WAVE_DUMP=1: xxhash of rows x [0..rows) of bf16 [rows][S*D] at `ptr` (a layer's
@@ -726,7 +733,7 @@ pub const Forward = struct {
 
     /// A copy of `src`'s Buffers whose row-sized pointers advance `off` rows (group B);
     /// `gathered` redirects to the group's exchange scratch, the partials past `part_off` bytes.
-    fn groupBuffers(f: *const Forward, src: *const Buffers, off: usize, gathered: u64, part_off: usize) Buffers {
+    fn groupBuffers(f: *const Forward, src: *const Buffers, off: usize, gathered: u64, part_off: usize, part_off_m: usize) Buffers {
         const c = &f.ranks[0].w.config;
         const s = &f.ranks[0].w.share;
         const D = c.hidden;
@@ -779,8 +786,8 @@ pub const Forward = struct {
         b.dsa.tokens = src.dsa.tokens + off * sparse.width * 4;
         b.dsa.counts = src.dsa.counts + off * 4;
         b.dsa.partials.po = src.dsa.partials.po + part_off;
-        b.dsa.partials.pm = src.dsa.partials.pm + part_off / lw;
-        b.dsa.partials.pl = src.dsa.partials.pl + part_off / lw;
+        b.dsa.partials.pm = src.dsa.partials.pm + part_off_m;
+        b.dsa.partials.pl = src.dsa.partials.pl + part_off_m;
         return b;
     }
 
@@ -859,6 +866,7 @@ pub const Forward = struct {
             if (n == 0 or n > r.b.rows) return error.BadWindow;
             if (r.st.mtp_len + n > r.st.capacity) return error.PastCapacity;
             try f.d.check(f.d.api.cuMemcpyHtoDAsync_v2(r.b.ids, ids.ptr, n * 4, f.stream.handle), "cuMemcpyHtoDAsync");
+            if (std.c.getenv("TF_GLM_WAVE_DUMP") != null) dumpBytes(f, h, n * D * 2, "mtp_src");
             if (h != r.b.hin) try f.d.check(f.d.api.cuMemcpyDtoDAsync_v2(r.b.hin, h, n * D * 2, f.stream.handle), "cuMemcpyDtoDAsync");
             const m = r.w.mtp.?;
             const b = r.b;
@@ -898,6 +906,8 @@ pub const Forward = struct {
     pub fn commit(f: *const Forward, keep: usize) !void {
         for (f.ranks) |r| {
             const st = r.st;
+            if (std.c.getenv("TF_GLM_WAVE_DUMP") != null)
+                std.log.info("LAYERDUMP commit keep={d} pending={d} last_wave={} pos={d} stptr={x}", .{ keep, st.pending, st.last_wave, st.pos, @intFromPtr(st) });
             if (keep == 0 or keep > st.pending or (st.prompt and keep != st.pending)) return error.BadCommit;
             if (!st.prompt and st.kda_layers > 0) {
                 const cur = st.cur[0];
