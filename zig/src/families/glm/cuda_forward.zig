@@ -211,7 +211,7 @@ pub const Forward = struct {
             .shm => |sh| {
                 const r = f.ranks[0];
                 const count = rows * c.hidden;
-                if (count > rows_one_stream and count <= sh.slot_units) {
+                if (r.segs.len > 1 and count > rows_one_stream and count <= sh.slot_units) { // segs.len: a 9-row solo window also passes the size test, and that path corrupts
                     // multi-stream only: the engine's single-stream shm path corrupts (deterministic;
                     // the standalone kernel + graph test passes, so it's the engine integration)
                     var a: cuda.Args = .{};
@@ -368,10 +368,20 @@ pub const Forward = struct {
                     try x.lib.check(x.lib.api.ncclAllGather(room(r, lo) + r.w.share.rank * bytes, room(r, lo), n * D, .f32, x.comm, p.side.handle), "ncclAllGather");
                 },
             } else switch (f.exchange) {
-                .shm => |x| {
+                .shm => |x| { // the split exchange is send/recv halves, never an allgather (the allgather
+                    // here corrupted every pieced prefill: rank halves never crossed)
                     const r = f.ranks[0];
-                    const mine = share(n, world, r.w.share.rank);
-                    try x.lib.check(x.lib.api.ncclAllGather(r.b.part, r.b.part, (mine[1] - mine[0]) * D, .f32, x.comm, p.side.handle), "ncclAllGather");
+                    const me = r.w.share.rank;
+                    const mine = share(n, world, me);
+                    const own = mine[1] - mine[0];
+                    try x.lib.check(x.lib.api.ncclGroupStart(), "ncclGroupStart");
+                    for (0..world) |peer| if (peer != me) {
+                        const theirs = share(n, world, peer);
+                        try x.lib.check(x.lib.api.ncclSend(r.b.part + (lo + theirs[0]) * D * 4, (theirs[1] - theirs[0]) * D, .f32, @intCast(peer), x.comm, p.side.handle), "ncclSend");
+                        try x.lib.check(x.lib.api.ncclRecv(room(r, lo) + peer * own * D * 4, own * D, .f32, @intCast(peer), x.comm, p.side.handle), "ncclRecv");
+                    };
+                    try x.lib.check(x.lib.api.ncclGroupEnd(), "ncclGroupEnd");
+                    try f.copy(p.side, room(r, lo) + me * own * D * 4, r.b.part + (lo + mine[0]) * D * 4, own * D * 4);
                 },
                 .local => for (f.ranks) |to| {
                     const mine = share(n, world, to.w.share.rank);
@@ -448,11 +458,19 @@ pub const Forward = struct {
             try p.glues[q].record(f.stream);
             try p.side.wait(p.glues[q]);
             switch (f.exchange) {
-                .shm => |x| {
+                .shm => |x| { // send/recv halves as .nccl below: the old allgather here dropped the
+                    // peer's span entirely, corrupting every pieced prefill
                     const r = f.ranks[0];
-                    const mine = share(n, world, r.w.share.rank);
-                    const bytes2 = (mine[1] - mine[0]) * D * 2;
-                    try x.lib.check(x.lib.api.ncclAllGather((if (last) r.b.hidden else r.b.normed) + (lo + mine[0]) * D * 2, (if (last) r.b.hidden else r.b.normed) + lo * D * 2, bytes2 / 2, .bf16, x.comm, p.side.handle), "ncclAllGather");
+                    const me = r.w.share.rank;
+                    const rows_of = if (last) r.b.hidden else r.b.normed;
+                    const mine = share(n, world, me);
+                    try x.lib.check(x.lib.api.ncclGroupStart(), "ncclGroupStart");
+                    for (0..world) |peer| if (peer != me) {
+                        const theirs = share(n, world, peer);
+                        try x.lib.check(x.lib.api.ncclSend(rows_of + (lo + mine[0]) * D * 2, (mine[1] - mine[0]) * D, .bf16, @intCast(peer), x.comm, p.side.handle), "ncclSend");
+                        try x.lib.check(x.lib.api.ncclRecv(rows_of + (lo + theirs[0]) * D * 2, (theirs[1] - theirs[0]) * D, .bf16, @intCast(peer), x.comm, p.side.handle), "ncclRecv");
+                    };
+                    try x.lib.check(x.lib.api.ncclGroupEnd(), "ncclGroupEnd");
                 },
                 .local => for (f.ranks) |from| {
                     const mine = share(n, world, from.w.share.rank);

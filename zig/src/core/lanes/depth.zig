@@ -47,6 +47,13 @@ pub const Probe = struct {
 /// A shared round's time past its forward: `ms` without its head steps, `head` the steps' modeled time.
 pub const Overhead = struct { streams: u32, ms: f64, head: f64 = 0.0 };
 
+/// TF_GLM_FORCE_DEPTH=N: every round drafts N deep whatever the rule's estimates say (experiments).
+fn forcedDepth() ?i64 {
+    const v = std.c.getenv("TF_GLM_FORCE_DEPTH") orelse return null;
+    const n = std.fmt.parseInt(i64, std.mem.span(v), 10) catch return null;
+    return if (n >= 1) n else null;
+}
+
 pub const Rule = struct {
     gpa: Allocator,
     k: Constants = .{},
@@ -139,6 +146,7 @@ pub const Rule = struct {
     /// The most expected tokens a ms, probing one depth farther every `depth_probe_every` rounds.
     pub fn depth(r: *Rule, who: Who) !i64 {
         const most = @min(@as(i64, r.most_drafts), @max(1, who.draft_room - 1));
+        if (forcedDepth()) |n| return @min(n, most); // TF_GLM_FORCE_DEPTH: measure a fixed depth's true cost
         if (most <= 0) return 0;
         const p = try r.rates(who);
         if (r.family_costs.empty()) {
