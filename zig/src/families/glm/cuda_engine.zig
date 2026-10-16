@@ -169,7 +169,9 @@ pub const Engine = struct {
             const rec_layer = e.w.share.kda.len() * 128 * 128 * 4; // kda.dk * kda.dv * 4
             e.wave_keep = try cuda.DeviceBuffer.alloc(d, nk * rec_layer);
             for (&e.wave_ev) |*ev| ev.* = try cuda.Event.init(d, false);
-            e.wave = .{ .scratch = e.wave_scratch.ptr, .pos2 = e.wave_pos2.ptr, .preserve = e.wave_keep.ptr, .preserve_len = e.wave_keep.len, .side = e.pieces.side, .ev = e.wave_ev };
+            var split: usize = 0;
+            if (std.c.getenv("TF_GLM_WAVE_SPLIT")) |v| split = std.fmt.parseInt(usize, std.mem.span(v), 10) catch 0;
+            e.wave = .{ .scratch = e.wave_scratch.ptr, .pos2 = e.wave_pos2.ptr, .preserve = e.wave_keep.ptr, .preserve_len = e.wave_keep.len, .split = split, .sync = std.c.getenv("TF_GLM_WAVE_SYNC") != null, .side = e.pieces.side, .ev = e.wave_ev };
         }
         e.ids_stage = try cuda.HostBuffer.alloc(d, fw.window_rows * 4);
         errdefer e.ids_stage.free();
