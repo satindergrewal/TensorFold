@@ -95,6 +95,7 @@ pub const Engine = struct {
     wave_scratch: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
     wave_pos2: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
     wave_keep: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
+    wave_conv: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
     wave_ev: [4]cuda.Event = undefined,
     ids_stage: cuda.HostBuffer = undefined, // pinned: a captured H2D from pageable memory snapshots
     // the driver staging at capture time (every replay would copy the first round's ids)
@@ -171,7 +172,10 @@ pub const Engine = struct {
             for (&e.wave_ev) |*ev| ev.* = try cuda.Event.init(d, false);
             var split: usize = 0;
             if (std.c.getenv("TF_GLM_WAVE_SPLIT")) |v| split = std.fmt.parseInt(usize, std.mem.span(v), 10) catch 0;
-            e.wave = .{ .scratch = e.wave_scratch.ptr, .pos2 = e.wave_pos2.ptr, .preserve = e.wave_keep.ptr, .preserve_len = e.wave_keep.len, .split = split, .sync = std.c.getenv("TF_GLM_WAVE_SYNC") != null, .side = e.pieces.side, .ev = e.wave_ev };
+            // group B's conv taps: the conv state's own size (kda layers x 3 x conv_c bf16)
+            const conv_c = 3 * e.w.share.kda.len() * e.w.config.kda_dim;
+            e.wave_conv = try cuda.DeviceBuffer.alloc(d, nk * 3 * conv_c * 2);
+            e.wave = .{ .scratch = e.wave_scratch.ptr, .pos2 = e.wave_pos2.ptr, .preserve = e.wave_keep.ptr, .preserve_len = e.wave_keep.len, .conv = e.wave_conv.ptr, .split = split, .sync = std.c.getenv("TF_GLM_WAVE_SYNC") != null, .side = e.pieces.side, .ev = e.wave_ev };
         }
         e.ids_stage = try cuda.HostBuffer.alloc(d, fw.window_rows * 4);
         errdefer e.ids_stage.free();
@@ -184,6 +188,7 @@ pub const Engine = struct {
         if (e.wave_scratch.ptr != 0) e.wave_scratch.free();
         if (e.wave_pos2.ptr != 0) e.wave_pos2.free();
         if (e.wave_keep.ptr != 0) e.wave_keep.free();
+        if (e.wave_conv.ptr != 0) e.wave_conv.free();
         if (e.wave != null) for (&e.wave_ev) |*ev| ev.deinit();
         var git = e.graphs.valueIterator();
         while (git.next()) |g| g.exec.deinit();

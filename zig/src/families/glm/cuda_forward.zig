@@ -172,6 +172,7 @@ pub const Wave = struct {
     sync: bool = false, // TF_GLM_WAVE_SYNC=1: gathers on the main stream, no events (bisect the dance)
     preserve: u64, // the round's pre-round KDA ring half, saved for commit's partial-keep replay
     preserve_len: usize,
+    conv: u64, // group B's conv taps: [kda layers][2 rows] refilled from A's staging each layer
     side: cuda.Stream,
     ev: [4]cuda.Event,
 };
@@ -607,6 +608,7 @@ pub const Forward = struct {
         var bB = groupBuffers(f, r0.b, a, w.scratch + 2 * a * D * 4, part_b, a * nch_b * mh * 4);
         var stA = r0.st.*;
         var stB = groupState(r0.st, a, w.pos2, &flipped);
+        if (br > 0) stB.conv = w.conv; // B's prep reads its first taps here, not the pre-window state
         var ranks_a = [1]Rank{.{ .w = r0.w, .st = &stA, .b = &bA }};
         var ranks_b = [1]Rank{.{ .w = r0.w, .st = &stB, .b = &bB }};
         var fA = f.*;
@@ -628,6 +630,23 @@ pub const Forward = struct {
             const l = r0.w.layers[j];
             try fA.pre(ranks_a[0], l.attn_hc, l.in_norm, a);
             if (a > 0) try fA.mixer(ranks_a[0], l, li, di, a, nch_a, slot(ranks_a[0], a));
+            if (br > 0 and a >= 2) {
+                switch (l.mixer) {
+                // B's prep sources its first TAPS-1 conv taps from the staging rows just before it
+                // (window rows a-2, a-1 - A's rows); its conv-state slots hold the PRE-WINDOW rows
+                .kda => {
+                    const taps = 2; // TAPS - 1
+                    const c_dim = 3 * r0.st.heads * 128; // C: q|k|v bf16 a row
+                    const src = r0.st.proj + li * r0.st.proj_layer * 2 + (a - taps) * r0.st.proj_row * 2;
+                    const dst = w.conv + li * 3 * r0.st.conv_c * 2;
+                    var t_i: usize = 0;
+                    while (t_i < taps) : (t_i += 1) {
+                        try f.d.check(f.d.api.cuMemcpyDtoDAsync_v2(dst + t_i * c_dim * 2, src + t_i * r0.st.proj_row * 2, c_dim * 2, f.stream.handle), "wave taps");
+                    }
+                },
+                else => {},
+                }
+            }
             if (std.c.getenv("TF_GLM_WAVE_DUMP") != null and dump_rounds == 1 and j == 0 and a > 0) kdaDump(f, &ranks_a[0], li, "A");
             if (w.sync) {
                 // bisect: identical ops to the danced path, but ordered on one stream - if this
