@@ -183,7 +183,7 @@ pub const Kernels = struct {
                 k.chunks32_nvfp4 = null;
             };
             k.chunks16_nvfp4_s32 = m.function("tf_glm_chunks16_nvfp4_s32") catch null;
-            if (k.chunks16_nvfp4_s32) |*f| f.allowDynamicShared(chunksSmemNvfp4(16)) catch {
+            if (k.chunks16_nvfp4_s32) |*f| f.allowDynamicShared(chunksSmemNvfp4Slice()) catch {
                 k.chunks16_nvfp4_s32 = null;
             };
         }
@@ -272,9 +272,15 @@ pub fn chunksSmem(comptime hb: u32) u32 {
     return (hb * 512 + 2 * 32 * 512 + hb * 32) * 2 + (hb * 4 + 2 * hb) * 4;
 }
 
-/// NVFP4 chunks kernels add a double-buffered staging tile of the packed e2m1 halves (2 * 32 * 256 bytes).
+/// NVFP4 chunks kernels add a double-buffered staging tile of the packed e2m1 halves (2 * 32 * 256
+/// bytes) and the 16-entry bf16 LUT.
 pub fn chunksSmemNvfp4(comptime hb: u32) u32 {
-    return chunksSmem(hb) + 2 * 32 * 256;
+    return chunksSmem(hb) + 2 * 32 * 256 + 32;
+}
+
+/// The 32-row sliced form stages one tile: the packed e2m1 halves, the 32 B/row of e4m3 scales, the LUT.
+pub fn chunksSmemNvfp4Slice() u32 {
+    return chunksSmem(16) + 32 * 256 + 32 * 32 + 32;
 }
 
 /// K slices of the router's dot (glue.ROUTER_KS): fixed by the shape, as the sliced and the single pass differ in bits.

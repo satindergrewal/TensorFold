@@ -53,7 +53,12 @@ constexpr int wide_smem() {
 // bytes of e4m3 scales stay in global and convert reads them: sm_120's 99KB budget fits +16KB, not +18KB).
 template <int HB>
 constexpr int nvfp4_smem() {
-  return wide_smem<HB>() + 2 * KT * (LW / 2);
+  return wide_smem<HB>() + 2 * KT * (LW / 2) + 32;  // + the 16-entry bf16 LUT
+}
+// The sliced form (CHW = 32) walks one tile a block: single staging, plus the 32B/row of e4m3 scales.
+template <int HB>
+constexpr int nvfp4_slice_smem() {
+  return wide_smem<HB>() + KT * (LW / 2) + KT * 32 + 32;
 }
 
 
@@ -74,7 +79,11 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
   __nv_bfloat16* ps = kvs + 2 * KT * LW;
   float* red = reinterpret_cast<float*>(ps + HB * KT);
   float* stat = red + HB * 4;
+  constexpr bool SLICED = (CHW != CH);
+  constexpr int STAGES = SLICED ? 1 : 2;  // a one-tile block never double-buffers
   unsigned char* staging = reinterpret_cast<unsigned char*>(stat + 2 * HB);  // e2m1 tiles, 16B-aligned end
+  // staging: [STAGES x KT x 256 packed e2m1][SLICED: KT x 32 e4m3 scales][16-entry bf16 LUT]
+  __nv_bfloat16* lut = reinterpret_cast<__nv_bfloat16*>(staging + STAGES * KT * (LW / 2) + (SLICED ? KT * 32 : 0));
   const int t = threadIdx.x, lane = t & 31, warp = t >> 5, g = lane >> 2, q = lane & 3;
   const int kg = warp & 3, hh = warp >> 2;
   const int64_t r = blockIdx.x, h0 = (int64_t)blockIdx.y * HB, c = blockIdx.z;
@@ -89,14 +98,18 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
       constexpr int RB = LW / 2 + LW / 16;  // cache row stride: 256 packed + 32 scale bytes
       constexpr int RB8 = LW / 2;           // staged span: the packed bytes only
       constexpr int CHUNKS = RB8 / 16;      // 16 x 16B per row
-      unsigned char* stage = staging + (tile & 1) * KT * RB8;
+      unsigned char* stage = staging + (tile % STAGES) * KT * RB8;
       const unsigned char* lc8 = reinterpret_cast<const unsigned char*>(lc);
-      for (int idx = t; idx < KT * CHUNKS; idx += blockDim.x) {
-        const int key = idx / CHUNKS, chunk = idx % CHUNKS;
+      constexpr int PER_ROW = CHUNKS + (SLICED ? 2 : 0);  // the sliced form also stages the row's scales
+      for (int idx = t; idx < KT * PER_ROW; idx += blockDim.x) {
+        const int key = idx / PER_ROW, chunk = idx % PER_ROW;
         const int64_t ki = first + key;
         const bool ok = sparse ? ki < n : ki <= limit;
         const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
-        cp16(stage + key * RB8 + chunk * 16, lc8 + src * RB + chunk * 16, ok);
+        if (chunk < CHUNKS)
+          cp16(stage + key * RB8 + chunk * 16, lc8 + src * RB + chunk * 16, ok);
+        else
+          cp16(stage + KT * RB8 + key * 32 + (chunk - CHUNKS) * 16, lc8 + src * RB + (LW >> 1) + (chunk - CHUNKS) * 16, ok);
       }
     } else {
       for (int idx = t; idx < KT * (LW / 8); idx += blockDim.x) {
@@ -113,20 +126,28 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
     constexpr int RB = LW / 2 + LW / 16;  // cache row stride
     constexpr int RB8 = LW / 2;           // staged span
     __nv_bfloat16* dst = kvs + (tile & 1) * KT * LW;
-    const unsigned char* stage = staging + (tile & 1) * KT * RB8;
+    const unsigned char* stage = staging + (tile % STAGES) * KT * RB8;
+    const unsigned char* scales = stage + KT * RB8;  // the sliced form's staged e4m3 scales
     const unsigned char* lc8 = reinterpret_cast<const unsigned char*>(lc);
     const int64_t cfirst = start + tile * KT;
-    for (int idx = t; idx < KT * LW; idx += blockDim.x) {
-      const int key = idx / LW, u = idx % LW;
-      const int64_t ki = cfirst + key;
-      const bool ok = sparse ? ki < n : ki <= limit;
-      const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
-      const unsigned char* row = stage + key * RB8;
-      __nv_fp8_e4m3 s8;
-      *reinterpret_cast<unsigned char*>(&s8) = *(lc8 + src * RB + (LW >> 1) + (u >> 4));
-      const float sc = __half2float(__half(s8));
-      const unsigned char code = (u & 1) ? (row[u >> 1] >> 4) & 0xF : row[u >> 1] & 0xF;
-      dst[wide(key, u >> 3) + (u & 7)] = __float2bfloat16_rn(nvfp4_mag(code) * sc);
+    // one packed byte a pass: its two nibbles share a 16-value block, so one scale covers both.
+    // the LUT is shared memory; nvfp4_mag's local array would spill 64 dynamically-indexed
+    // float loads a thread into local memory.
+    for (int idx = t; idx < KT * RB8; idx += blockDim.x) {
+      const int key = idx / RB8, u = (idx % RB8) * 2;
+      const unsigned char packed = stage[idx];
+      const __nv_bfloat16 sc = SLICED
+          ? __nv_bfloat16(*reinterpret_cast<const __nv_fp8_e4m3*>(scales + key * 32 + (u >> 4)))
+          : __nv_bfloat16([&] {
+              const int64_t ki = cfirst + key;
+              const bool ok = sparse ? ki < n : ki <= limit;
+              const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
+              __nv_fp8_e4m3 s8;
+              *reinterpret_cast<unsigned char*>(&s8) = *(lc8 + src * RB + (LW >> 1) + (u >> 4));
+              return s8;
+            }());
+      dst[wide(key, u >> 3) + (u & 7)] = __hmul(lut[packed & 0xF], sc);
+      dst[wide(key, (u + 1) >> 3) + ((u + 1) & 7)] = __hmul(lut[(packed >> 4) & 0xF], sc);
     }
   };
   float m[MT][2], l[MT][2], o[MT][8][4];
@@ -142,10 +163,13 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
       const bool ok = h0 + hd < heads;
       cp16(qs + wide(hd, u), qa + (r * heads + (ok ? h0 + hd : 0)) * LW + u * 8, ok);
     }
+    if (NVFP4 && t < 16) lut[t] = __float2bfloat16_rn(nvfp4_mag(t));
     load_kv(0);
     commit();
-    load_kv(1);
-    commit();
+    if (tiles > 1) {
+      load_kv(1);
+      commit();
+    }
   }
   for (int tile = 0; live && tile < tiles; ++tile) {
     if (tile + 1 < tiles) wait<1>(); else wait<0>();

@@ -168,6 +168,7 @@ pub const Engine = struct {
     }
 
     fn exchange(e: *const Engine) fw.Exchange {
+        if (e.shm != null and std.c.getenv("TF_GLM_SHM_NCCL") != null) return .{ .nccl = .{ .lib = e.lib, .comm = e.comm } }; // bisect: arena up, exchange over NCCL
         if (e.shm) |s| return .{ .shm = .{
             .base = s.base,
             .seq = s.seq,

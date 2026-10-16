@@ -120,11 +120,13 @@ fn dequantFor(set: glue.Set, stream: cuda.Stream, cache_fp8: u64, start: usize, 
 
 
 /// Launch an NVFP4 chunks kernel (the direct e2m1 attention, no dequant).
-fn launchNvfp4(f: cuda.Function, stream: cuda.Stream, qa: u64, cache: u64, pos: u64, tokens: u64, counts: u64, p: Partials, rows: usize, heads: usize, lw: usize, nch: usize, w: usize, scale: f32, hb: usize, sparse: bool) !void {
+fn launchNvfp4(f: cuda.Function, stream: cuda.Stream, qa: u64, cache: u64, pos: u64, tokens: u64, counts: u64, p: Partials, rows: usize, heads: usize, lw: usize, nch: usize, w: usize, scale: f32, hb: usize, sparse: bool, comptime sliced: bool) !void {
     if (lw != 512) return error.LatentShape;
     var a: cuda.Args = .{};
     inline for (.{ qa, cache, pos, tokens, counts, p.po, p.pm, p.pl, @as(i64, @intCast(rows)), @as(i64, @intCast(heads)), @as(i64, @intCast(w)), scale, @as(c_int, @intFromBool(sparse)) }) |v| a.add(v);
-    const shared = if (hb == heads_tile_wide) glue.chunksSmemNvfp4(heads_tile_wide) else glue.chunksSmemNvfp4(heads_tile);
+    const shared = if (sliced)
+        glue.chunksSmemNvfp4Slice()
+    else if (hb == heads_tile_wide) glue.chunksSmemNvfp4(heads_tile_wide) else glue.chunksSmemNvfp4(heads_tile);
     try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(rows), .y = cdiv(heads, hb), .z = @intCast(nch) }, .block = .{ .x = 256 }, .shared = shared }, stream, &a);
 }
 
@@ -142,7 +144,7 @@ pub fn attention(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, pos: u
     if (rows <= 8) { // a solo decode window: one 32-row tile a block instead of a 16-tile serial chain
         const nch32 = nch * 16; // over-covers the last chunk; empty slices merge as -inf
         if (set.glue.chunks16_nvfp4_s32) |f| {
-            try launchNvfp4(f, stream, qa, cache, pos, 0, 0, p, rows, heads, lw, nch32, 0, scale, heads_tile, false);
+            try launchNvfp4(f, stream, qa, cache, pos, 0, 0, p, rows, heads, lw, nch32, 0, scale, heads_tile, false, true);
         } else if (set.glue.chunks_16_s32) |f| {
             try launchBf16(f, stream, qa, cache, pos, 0, 0, p, rows, heads, lw, nch32, 0, scale, heads_tile, false);
         } else return error.NoSlicedKernel;
@@ -151,9 +153,9 @@ pub fn attention(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, pos: u
     }
     if (set.glue.chunks16_nvfp4) |f16v| {
         if (hb == heads_tile_wide and set.glue.chunks32_nvfp4 != null) {
-            try launchNvfp4(set.glue.chunks32_nvfp4.?, stream, qa, cache, pos, 0, 0, p, rows, heads, lw, nch, 0, scale, hb, false);
+            try launchNvfp4(set.glue.chunks32_nvfp4.?, stream, qa, cache, pos, 0, 0, p, rows, heads, lw, nch, 0, scale, hb, false, false);
         } else {
-            try launchNvfp4(f16v, stream, qa, cache, pos, 0, 0, p, rows, heads, lw, nch, 0, scale, heads_tile, false);
+            try launchNvfp4(f16v, stream, qa, cache, pos, 0, 0, p, rows, heads, lw, nch, 0, scale, heads_tile, false, false);
         }
         try merge(set, stream, p, out, dummy, rows, heads, lw, nch, false);
         return;
@@ -186,7 +188,7 @@ pub fn sparseAttention(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, 
     if (rows <= 8) { // a solo decode window: one 32-row tile a block
         const nch32 = (w + 31) / 32;
         if (set.glue.chunks16_nvfp4_s32) |f| {
-            try launchNvfp4(f, stream, qa, cache, 0, tokens, counts, p, rows, heads, lw, nch32, w, scale, heads_tile, true);
+            try launchNvfp4(f, stream, qa, cache, 0, tokens, counts, p, rows, heads, lw, nch32, w, scale, heads_tile, true, true);
         } else if (set.glue.chunks_16_s32) |f| {
             try launchBf16(f, stream, qa, cache, 0, tokens, counts, p, rows, heads, lw, nch32, w, scale, heads_tile, true);
         } else return error.NoSlicedKernel;
@@ -195,9 +197,9 @@ pub fn sparseAttention(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, 
     }
     if (set.glue.chunks16_nvfp4) |f16v| {
         if (headBlock(rows) == heads_tile_wide and set.glue.chunks32_nvfp4 != null) {
-            try launchNvfp4(set.glue.chunks32_nvfp4.?, stream, qa, cache, 0, tokens, counts, p, rows, heads, lw, nch, w, scale, headBlock(rows), true);
+            try launchNvfp4(set.glue.chunks32_nvfp4.?, stream, qa, cache, 0, tokens, counts, p, rows, heads, lw, nch, w, scale, headBlock(rows), true, false);
         } else {
-            try launchNvfp4(f16v, stream, qa, cache, 0, tokens, counts, p, rows, heads, lw, nch, w, scale, heads_tile, true);
+            try launchNvfp4(f16v, stream, qa, cache, 0, tokens, counts, p, rows, heads, lw, nch, w, scale, heads_tile, true, false);
         }
         try merge(set, stream, p, out, counts, rows, heads, lw, nch, true);
         return;
