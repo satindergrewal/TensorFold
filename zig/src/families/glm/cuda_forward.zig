@@ -162,6 +162,18 @@ pub const Shm = struct {
     comm: cuda.nccl.Comm,
 };
 
+/// The decode wavefront's shared pieces (docs/WAVEFRONT.md): the group-exchange scratch (two
+/// [2][rows][D] fp32 regions), group B's pos word, the side stream, and the four events
+/// choreographing mixer-done / exchange-done per group.
+pub const Wave = struct {
+    scratch: u64,
+    pos2: u64,
+    preserve: u64, // the round's pre-round KDA ring half, saved for commit's partial-keep replay
+    preserve_len: usize,
+    side: cuda.Stream,
+    ev: [4]cuda.Event,
+};
+
 /// One rank of the forward: its weights, its sequence's caches, the window's buffers.
 pub const Rank = struct {
     w: *const weights.Weights,
@@ -181,6 +193,7 @@ pub const Forward = struct {
     ranks: []const Rank, // every rank of a local check, or this process's one
     exchange: Exchange,
     kda_wide: bool = true, // TF_GLM_KDA_DECODE_WIDE (the Python family's default): decode windows on KDA's three-kernel chain
+    wave: ?*const Wave = null, // TF_GLM_WAVE=1: decode windows run the two-group exchange wavefront
     pieces: ?*const Pieces = null, // a prompt chunk's exchanges in row pieces on a second stream (null: whole)
     split: bool = true, // TF_GLM_PREFILL_REDUCE=split (the default with send/recv): each rank glues its own rows
 
@@ -536,9 +549,172 @@ pub const Forward = struct {
         for (f.ranks) |r| try glue.embedB16(f.set(), f.stream, r.b.ids, r.w.embed, r.b.x, R, c.hidden, c.hc);
         var cut: [max_pieces][2]usize = undefined;
         const pieces = if (f.pieces) |p| (if (f.ranks[0].b.prefill) ranges(R, p.count, &cut) else 0) else 0;
-        // overlap.Overlap.begin: pieced with two pieces or more, and split takes a chunk of one piece too
-        if (pieces > 1 or (pieces == 1 and f.splits(R))) try f.pieced(f.pieces.?, R, cut[0..pieces]) else try f.whole(R);
+        f.ranks[0].st.last_wave = false;
+        if (f.wave != null and pieces == 0 and !f.ranks[0].b.prefill and f.ranks[0].segs.len == 0 and R >= 4) {
+            try f.wholeWave(f.wave.?, R);
+        } else if (pieces > 1 or (pieces == 1 and f.splits(R))) try f.pieced(f.pieces.?, R, cut[0..pieces]) else try f.whole(R);
         try f.finish(R);
+    }
+
+    /// The two-group decode wavefront (docs/WAVEFRONT.md): clones of the rank with offset
+    /// pointers carry each group's rows, so every kernel runs unchanged. Group A's exchange
+    /// overlaps group B's mixer compute on the side stream; B's exchange overlaps A's post.
+    /// The ffn site stays whole in v1. The KDA ring recurrence stays ordered by launching
+    /// A before B on the main stream.
+    fn wholeWave(f: *const Forward, w: *const Wave, R: usize) !void {
+        const c = &f.ranks[0].w.config;
+        const r0 = f.ranks[0];
+        const D = c.hidden;
+        const a = R / 2;
+        const br = R - a;
+        // a memset, never an async copy from a stack word: the copy could outlive this frame
+        const p2v: u32 = @bitCast(@as(i32, @intCast(r0.st.pos + a)));
+        try f.d.check(f.d.api.cuMemsetD32Async(w.pos2, p2v, 1, f.stream.handle), "Memset pos2");
+        // the wave's second launch overwrites BOTH ring halves: keep the pre-round half for the
+        // partial-keep replay commit may need (rejections are common)
+        const half_bytes = r0.st.kda_layers * r0.st.rec_layer;
+        if (half_bytes > w.preserve_len) {
+            std.log.err("wave: preserve buffer {d} < half {d} (layers {d}, rec_layer {d})", .{ w.preserve_len, half_bytes, r0.st.kda_layers, r0.st.rec_layer });
+            return error.WavePreserveTooSmall;
+        }
+        try f.d.check(f.d.api.cuMemcpyDtoDAsync_v2(w.preserve, r0.st.recAt(r0.st.cur[0], 0), half_bytes, f.stream.handle), "preserve ring");
+        r0.st.wave_preserve = w.preserve;
+        var flipped: [128]u1 = undefined;
+        for (r0.st.cur, 0..) |v, i| { if (i < flipped.len) flipped[i] = 1 - v; }
+        const nch_a = @min(latent.chunksFor(r0.st.pos + a), r0.b.nch);
+        const nch_b = @min(latent.chunksFor(r0.st.pos + a + br), r0.b.nch);
+        const hl = r0.st.caches.len;
+        const part_b = a * nch_b * hl * c.kv_lora * 4; // bytes: group B's partials past A's
+        var bA = r0.b.*;
+        bA.gathered = w.scratch;
+        var bB = groupBuffers(f, r0.b, a, w.scratch + 2 * a * D * 4, part_b);
+        var stA = r0.st.*;
+        var stB = groupState(r0.st, a, w.pos2, &flipped);
+        var ranks_a = [1]Rank{.{ .w = r0.w, .st = &stA, .b = &bA }};
+        var ranks_b = [1]Rank{.{ .w = r0.w, .st = &stB, .b = &bB }};
+        var fA = f.*;
+        fA.ranks = &ranks_a;
+        fA.pieces = null;
+        fA.wave = null;
+        var fB = f.*;
+        fB.ranks = &ranks_b;
+        fB.pieces = null;
+        fB.wave = null;
+        var li: usize = 0;
+        var di: usize = 0;
+        for (r0.w.layers, 0..) |_, j| {
+            const l = r0.w.layers[j];
+            try fA.pre(ranks_a[0], l.attn_hc, l.in_norm, a);
+            try fA.mixer(ranks_a[0], l, li, di, a, nch_a, slot(ranks_a[0], a));
+            try w.ev[0].record(f.stream);
+            try fB.pre(ranks_b[0], l.attn_hc, l.in_norm, br);
+            try fB.mixer(ranks_b[0], l, li, di, br, nch_b, slot(ranks_b[0], br));
+            try w.ev[2].record(f.stream);
+            try w.side.wait(w.ev[0]);
+            try waveGather(f.exchange, w, w.scratch + r0.w.share.rank * a * D * 4, w.scratch, a * D);
+            try w.ev[1].record(w.side);
+            try w.side.wait(w.ev[2]);
+            try waveGather(f.exchange, w, w.scratch + 2 * a * D * 4 + r0.w.share.rank * br * D * 4, w.scratch + 2 * a * D * 4, br * D);
+            try w.ev[3].record(w.side);
+            try f.stream.wait(w.ev[1]);
+            try fA.post(ranks_a[0], a);
+            try f.stream.wait(w.ev[3]);
+            try fB.post(ranks_b[0], br);
+            try f.pre(r0, l.ffn_hc, l.post_norm, R);
+            try f.ffn(r0, l, R, slot(r0, R));
+            try f.gather(R);
+            try f.post(r0, R);
+            switch (l.mixer) {
+                .kda => li += 1,
+                .mla => di += 1,
+            }
+        }
+        try glue.streamMean(f.set(), f.stream, r0.b.x, r0.b.hidden, R, c.hidden, c.hc);
+        r0.st.last_wave = true;
+    }
+
+    fn waveGather(ex: Exchange, w: *const Wave, send: u64, recv: u64, count: usize) !void {
+        switch (ex) {
+            .local => return error.WaveNeedsExchange,
+            .nccl => |x| try x.lib.check(x.lib.api.ncclAllGather(send, recv, count, .f32, x.comm, w.side.handle), "waveGather"),
+            .shm => |x| try x.lib.check(x.lib.api.ncclAllGather(send, recv, count, .f32, x.comm, w.side.handle), "waveGather"),
+        }
+    }
+
+    /// A copy of `src`'s Buffers whose row-sized pointers advance `off` rows (group B);
+    /// `gathered` redirects to the group's exchange scratch, the partials past `part_off` bytes.
+    fn groupBuffers(f: *const Forward, src: *const Buffers, off: usize, gathered: u64, part_off: usize) Buffers {
+        const c = &f.ranks[0].w.config;
+        const s = &f.ranks[0].w.share;
+        const D = c.hidden;
+        const S = c.hc;
+        const n = s.kda.len() * c.kda_dim;
+        var mla_heads: usize = 0;
+        var mla_qk: usize = 0;
+        var mla_dv: usize = 0;
+        for (f.ranks[0].w.layers) |l| switch (l.mixer) {
+            .mla => |m| {
+                mla_heads = m.heads;
+                mla_qk = m.qk;
+                mla_dv = m.dv;
+                break;
+            },
+            else => {},
+        };
+        var b = src.*;
+        b.x = src.x + off * S * D * 2;
+        b.normed = src.normed + off * D * 2;
+        b.xs = src.xs + off * (D / 64) * 4;
+        b.post = src.post + off * S * 4;
+        b.comb = src.comb + off * S * S * 4;
+        b.hcpart = src.hcpart + off * glue.hcPartBytes(1);
+        b.gathered = gathered;
+        b.kda.ka = src.kda.ka + off * n * 2;
+        b.kda.kg = src.kda.kg + off * n * 2;
+        b.kda.saves.out = src.kda.saves.out + off * n * 2;
+        b.kda.wide.q = src.kda.wide.q + off * n * 4;
+        b.kda.wide.y = src.kda.wide.y + off * n * 2;
+        const lw = c.kv_lora;
+        const q_lora = c.q_lora;
+        b.dsa.dp = src.dsa.dp + off * (q_lora + lw) * 2;
+        b.dsa.qr = src.dsa.qr + off * q_lora * 2;
+        b.dsa.xs_qr = src.dsa.xs_qr + off * (q_lora / 64) * 4;
+        b.dsa.lat = src.dsa.lat + off * lw * 2;
+        b.dsa.xs_lat = src.dsa.xs_lat + off * (lw / 64) * 4;
+        b.dsa.q = src.dsa.q + off * mla_heads * mla_qk * 2;
+        b.dsa.ikr = src.dsa.ikr + off * (c.i_dim + c.i_heads) * 2;
+        b.dsa.igr = src.dsa.igr + off * c.i_dim * 4;
+        b.dsa.router_part = src.dsa.router_part + off * 128 * 4;
+        b.dsa.qa = src.dsa.qa + off * mla_heads * lw * 2;
+        b.dsa.ol = src.dsa.ol + off * mla_heads * lw * 2;
+        b.dsa.vn = src.dsa.vn + off * mla_heads * mla_dv * 2;
+        b.dsa.qi = src.dsa.qi + off * c.i_heads * c.i_dim * 2;
+        b.dsa.select.scores = src.dsa.select.scores + off * (f.ranks[0].st.capacity / sparse.pool) * 4;
+        b.dsa.select.ls = src.dsa.select.ls + off * sparse.select_list * 4;
+        b.dsa.select.li = src.dsa.select.li + off * sparse.select_list * 4;
+        b.dsa.select.pools = src.dsa.select.pools + off * sparse.topk_pools * 8;
+        b.dsa.tokens = src.dsa.tokens + off * sparse.width * 4;
+        b.dsa.counts = src.dsa.counts + off * 4;
+        b.dsa.partials.po = src.dsa.partials.po + part_off;
+        b.dsa.partials.pm = src.dsa.partials.pm + part_off / lw;
+        b.dsa.partials.pl = src.dsa.partials.pl + part_off / lw;
+        return b;
+    }
+
+    /// A copy of `src`'s State for group B: positions shift `off` rows, the pos word swaps to
+    /// `pos2`, the KDA save/proj staging advances, and cur reads a flipped copy.
+    fn groupState(src: *const State, off: usize, pos2: u64, flipped: []const u1) State {
+        var st = src.*;
+        const row = st.heads * kda.dk;
+        st.save_k = src.save_k + off * row * 4;
+        st.save_v = src.save_v + off * row * 2;
+        st.save_g = src.save_g + off * row * 4;
+        st.save_b = src.save_b + off * st.heads * 4;
+        st.proj = src.proj + off * st.proj_row * 2;
+        st.pos = src.pos + off;
+        st.pos_dev = pos2;
+        st.cur = @constCast(flipped);
+        return st;
     }
 
     /// The unpieced loop over the layers (and the stream mean): each site's partials whole, then the glue.
@@ -630,20 +806,22 @@ pub const Forward = struct {
             if (!st.prompt and st.kda_layers > 0) {
                 const cur = st.cur[0];
                 for (st.cur) |x| if (x != cur) return error.KdaLayersOutOfStep;
+                // the wave's two-launch ping-pong leaves the newest ring half at cur; eager at 1-cur
+                const new_half: u1 = if (st.last_wave) cur else @as(u1, 1) - cur;
                 if (keep < st.pending) {
                     const h = st.heads;
                     var a: cuda.Args = .{};
                     a.add(@as(c_int, @intCast(h)));
-                    a.add(st.recAt(cur, 0));
+                    a.add(if (st.last_wave) st.wave_preserve else st.recAt(cur, 0));
                     a.add(@as(usize, st.rec_layer / 4));
                     for ([_]u64{ st.save_k, st.save_v, st.save_g, st.save_b }) |x| a.add(x);
                     a.add(@as(usize, window_rows * h * kda.dk));
                     a.add(@as(usize, window_rows * h));
                     a.add(@as(c_int, @intCast(keep)));
-                    a.add(st.recAt(1 - cur, 0));
+                    a.add(st.recAt(new_half, 0));
                     try cuda.launch.launch(f.m.kda.replay_layers, .{ .grid = .{ .x = @intCast(st.kda_layers * h) }, .block = .{ .x = 1024 } }, f.stream, &a);
                 }
-                for (st.cur) |*x| x.* = 1 - x.*;
+                if (!st.last_wave) { for (st.cur) |*x| x.* = 1 - x.*; }
                 if (st.kda_layers > 0) try glue.convShift(f.set(), f.stream, st.conv, st.proj, keep, st.proj_layer, st.proj_row, st.kda_layers, st.conv_c);
             }
             st.pending = 0;

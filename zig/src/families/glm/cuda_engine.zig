@@ -90,6 +90,12 @@ pub const Engine = struct {
     // skips, and pos is read on the device). ids_stage is the stable host source whose bytes the
     // captured H2D memcpy re-reads at every replay.
     graphs: std.AutoHashMapUnmanaged(GraphKey, VerifyGraph) = .empty,
+    // TF_GLM_WAVE=1: the decode wavefront's scratch, pos2 word and events (docs/WAVEFRONT.md)
+    wave: ?fw.Wave = null,
+    wave_scratch: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
+    wave_pos2: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
+    wave_keep: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
+    wave_ev: [4]cuda.Event = undefined,
     ids_stage: cuda.HostBuffer = undefined, // pinned: a captured H2D from pageable memory snapshots
     // the driver staging at capture time (every replay would copy the first round's ids)
     slot: u32 = 0,
@@ -150,6 +156,21 @@ pub const Engine = struct {
         @import("cuda_latent.zig").setDriver(d);
         errdefer e.smp.deinit();
         e.shared_buf = try cuda.DeviceBuffer.alloc(d, 8);
+        if (std.c.getenv("TF_GLM_WAVE") != null) {
+            e.wave_scratch = try cuda.DeviceBuffer.alloc(d, 4 * fw.window_rows * c.hidden * 4);
+            e.wave_pos2 = try cuda.DeviceBuffer.alloc(d, 4);
+            // one ring half is kda_layers * rec_layer: the layer count from w.layers' kda mixers,
+            // rec_layer from share.kda (they differ: the share list excludes some layers)
+            var nk: usize = 0;
+            for (e.w.layers) |l| switch (l.mixer) {
+                .kda => nk += 1,
+                else => {},
+            };
+            const rec_layer = e.w.share.kda.len() * 128 * 128 * 4; // kda.dk * kda.dv * 4
+            e.wave_keep = try cuda.DeviceBuffer.alloc(d, nk * rec_layer);
+            for (&e.wave_ev) |*ev| ev.* = try cuda.Event.init(d, false);
+            e.wave = .{ .scratch = e.wave_scratch.ptr, .pos2 = e.wave_pos2.ptr, .preserve = e.wave_keep.ptr, .preserve_len = e.wave_keep.len, .side = e.pieces.side, .ev = e.wave_ev };
+        }
         e.ids_stage = try cuda.HostBuffer.alloc(d, fw.window_rows * 4);
         errdefer e.ids_stage.free();
         try e.stream.synchronize();
@@ -158,6 +179,10 @@ pub const Engine = struct {
 
     pub fn deinit(e: *Engine) void {
         e.stream.synchronize() catch {};
+        if (e.wave_scratch.ptr != 0) e.wave_scratch.free();
+        if (e.wave_pos2.ptr != 0) e.wave_pos2.free();
+        if (e.wave_keep.ptr != 0) e.wave_keep.free();
+        if (e.wave != null) for (&e.wave_ev) |*ev| ev.deinit();
         var git = e.graphs.valueIterator();
         while (git.next()) |g| g.exec.deinit();
         e.graphs.deinit(e.gpa);
@@ -240,7 +265,7 @@ pub const Engine = struct {
 
     fn view(e: *Engine, b: *fw.Buffers, out: *[1]fw.Rank) fw.Forward {
         out.* = .{.{ .w = &e.w, .st = &e.cur.st, .b = b }};
-        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = if (b == &e.bp) &e.pieces else null, .split = e.settings.split, .kda_wide = e.settings.kda_wide };
+        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = if (b == &e.bp) &e.pieces else null, .split = e.settings.split, .kda_wide = e.settings.kda_wide, .wave = if (b == &e.bd and e.wave != null) &e.wave.? else null };
     }
 
     /// Binds slot `slot`'s sequence for the steps that follow, making it (a zeroed state) on first use.
@@ -455,7 +480,7 @@ pub const Engine = struct {
         // Opt-in while the replay still diverges from eager by one input (deterministic since the
         // pinned staging + exact-nch keying; 161.8 tok/s vs 91.6 eager when running - the remaining
         // baked input is the next session's instrumented eager-vs-graph logits diff).
-        if (std.c.getenv("TF_GLM_GRAPHS") != null and dense_phase) {
+        if (std.c.getenv("TF_GLM_GRAPHS") != null and dense_phase and e.wave == null) {
             if (e.graphs.getPtr(key)) |g| {
                 if (g.nch == nch_now) { // exact: the indexer score path reads garbage for chunks past
                     // its own range, so a replay may only cover exactly the nch this round needs
