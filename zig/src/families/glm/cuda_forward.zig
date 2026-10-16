@@ -552,10 +552,12 @@ pub const Forward = struct {
         var cut: [max_pieces][2]usize = undefined;
         const pieces = if (f.pieces) |p| (if (f.ranks[0].b.prefill) ranges(R, p.count, &cut) else 0) else 0;
         f.ranks[0].st.last_wave = false;
+        if (std.c.getenv("TF_GLM_WAVE_DUMP") != null and !f.ranks[0].b.prefill) dumpBytesHost(f, @ptrCast(ids.ptr), R * 4, "ids");
         if (f.wave != null and pieces == 0 and !f.ranks[0].b.prefill and f.ranks[0].segs.len == 0 and R >= 4) {
             try f.wholeWave(f.wave.?, R);
         } else if (pieces > 1 or (pieces == 1 and f.splits(R))) try f.pieced(f.pieces.?, R, cut[0..pieces]) else try f.whole(R);
         try f.finish(R);
+        if (std.c.getenv("TF_GLM_WAVE_DUMP") != null and !f.ranks[0].b.prefill) dumpBytes(f, f.ranks[0].b.logits, R * f.ranks[0].w.share.vocab.len() * 2, "logits");
     }
 
     /// The two-group decode wavefront (docs/WAVEFRONT.md): clones of the rank with offset
@@ -612,6 +614,11 @@ pub const Forward = struct {
         fB.wave = null;
         var li: usize = 0;
         var di: usize = 0;
+        if (std.c.getenv("TF_GLM_WAVE_DUMP") != null) {
+            dump_layer = 0;
+            dump_rounds += 1;
+            std.log.info("LAYERDUMP round {d} wave R={d} a={d} br={d}", .{ dump_rounds, R, a, br });
+        }
         for (r0.w.layers, 0..) |_, j| {
             const l = r0.w.layers[j];
             try fA.pre(ranks_a[0], l.attn_hc, l.in_norm, a);
@@ -663,9 +670,50 @@ pub const Forward = struct {
                 .kda => li += 1,
                 .mla => di += 1,
             }
+            if (std.c.getenv("TF_GLM_WAVE_DUMP") != null and dump_rounds <= 60) {
+                dump(f, r0.b.x, R, "x");
+                dump_layer += 1;
+            }
         }
         try glue.streamMean(f.set(), f.stream, r0.b.x, r0.b.hidden, R, c.hidden, c.hc);
         r0.st.last_wave = R - a != R; // a lone full-window group writes the ring like eager
+    }
+
+    /// TF_GLM_WAVE_DUMP=1: xxhash of rows x [0..rows) of bf16 [rows][S*D] at `ptr` (a layer's
+    /// output or a gather site), logged per layer for the first few rounds. Diff the eager and
+    /// wave tables: the first differing (round, layer) names the diverging site.
+    var dump_rounds: usize = 0;
+    var dump_layer: usize = 0;
+    fn dump(f: *const Forward, ptr: u64, rows: usize, what: []const u8) void {
+        if (std.c.getenv("TF_GLM_WAVE_DUMP") == null) return;
+        if (dump_rounds >= 60) return;
+        const bytes = rows * 4096 * 4 * 2; // S=4 hc streams x D bf16
+        const host = std.c.malloc(bytes) orelse return;
+        defer std.c.free(host);
+        const st2 = f.d.api.cuMemcpyDtoHAsync_v2(host, ptr, bytes, f.stream.handle);
+        if (st2 != 0) return;
+        f.stream.synchronize() catch {};
+        const h = std.hash.XxHash64.hash(0, @as([*]const u8, @ptrCast(host))[0..bytes]);
+        std.log.info("LAYERDUMP r{d} l{d: >2} {s} {x: >16}", .{ dump_rounds, dump_layer, what, h });
+    }
+
+    fn dumpBytesHost(f: *const Forward, host_ptr: [*]const u8, bytes: usize, what: []const u8) void {
+        _ = f;
+        if (std.c.getenv("TF_GLM_WAVE_DUMP") == null) return;
+        if (dump_rounds > 60) return;
+        const h = std.hash.XxHash64.hash(0, host_ptr[0..bytes]);
+        std.log.info("LAYERDUMP r{d} -- {s} {x: >16}", .{ dump_rounds + 1, what, h });
+    }
+
+    fn dumpBytes(f: *const Forward, dev: u64, bytes: usize, what: []const u8) void {
+        if (std.c.getenv("TF_GLM_WAVE_DUMP") == null) return;
+        if (dump_rounds > 60) return;
+        const host = std.c.malloc(bytes) orelse return;
+        defer std.c.free(host);
+        if (f.d.api.cuMemcpyDtoHAsync_v2(host, dev, bytes, f.stream.handle) != 0) return;
+        f.stream.synchronize() catch {};
+        const h = std.hash.XxHash64.hash(0, @as([*]const u8, @ptrCast(host))[0..bytes]);
+        std.log.info("LAYERDUMP r{d} -- {s} {x: >16}", .{ dump_rounds, what, h });
     }
 
     fn waveGather(ex: Exchange, stream: cuda.Stream, send: u64, recv: u64, count: usize) !void {
@@ -754,6 +802,11 @@ pub const Forward = struct {
 
     /// The unpieced loop over the layers (and the stream mean): each site's partials whole, then the glue.
     fn whole(f: *const Forward, R: usize) !void {
+        if (std.c.getenv("TF_GLM_WAVE_DUMP") != null) {
+            dump_layer = 0;
+            dump_rounds += 1;
+            std.log.info("LAYERDUMP round {d} eager R={d}", .{ dump_rounds, R });
+        }
         const c = &f.ranks[0].w.config;
         var li: usize = 0;
         var di: usize = 0;
@@ -775,6 +828,10 @@ pub const Forward = struct {
             switch (f.ranks[0].w.layers[j].mixer) {
                 .kda => li += 1,
                 .mla => di += 1,
+            }
+            if (std.c.getenv("TF_GLM_WAVE_DUMP") != null and dump_rounds <= 60) {
+                dump(f, f.ranks[0].b.x, R, "x");
+                dump_layer += 1;
             }
         }
         for (f.ranks) |r| try glue.streamMean(f.set(), f.stream, r.b.x, r.b.hidden, R, c.hidden, c.hc);
@@ -830,6 +887,10 @@ pub const Forward = struct {
             try glue.rmsnorm(f.set(), f.stream, b.mx + (n - 1) * D * 2, D, m.norm, b.fnormed, D, b.fxs, c.eps, 1, D);
             if (b.prefill) continue;
             if (m.draft) |dq| try q4.matmul(&f.m.q4, f.stream, b.fnormed, D, b.fxs, dq, b.logits, 1) else try b16.proj(f.set(), f.stream, b.fnormed, D, r.w.head, b.logits, b.kda.mm_part, 1, r.w.share.vocab.len(), D, false);
+            if (std.c.getenv("TF_GLM_WAVE_DUMP") != null) {
+                dumpBytes(f, b.hin, n * D * 2, "mtp_hin");
+                dumpBytes(f, b.logits, r.w.share.vocab.len() * 2, "mtp_logits");
+            }
         }
     }
 
