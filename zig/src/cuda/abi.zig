@@ -8,6 +8,12 @@ pub const Context = ?*opaque {};
 pub const Module = ?*opaque {};
 pub const Function = ?*opaque {};
 pub const Stream = ?*opaque {};
+
+/// CUipcMemHandle: an opaque 64-byte token another process opens with cuIpcOpenMemHandle.
+pub const IpcMemHandle = extern struct { data: [64]u8 };
+
+pub const ipc_lazy_peer: c_uint = 1; // CU_IPC_MEM_LAZY_ENABLE_PEER_ACCESS
+pub const wait_geq: c_uint = 1; // CU_STREAM_WAIT_VALUE_GEQ
 pub const Event = ?*opaque {};
 pub const Graph = ?*opaque {};
 pub const GraphNode = ?*opaque {};
@@ -66,6 +72,26 @@ pub const LaunchAttributeId = enum(c_uint) {
 pub const cluster_scheduling_spread: c_int = 1;
 
 pub const Dim3 = extern struct { x: c_uint = 1, y: c_uint = 1, z: c_uint = 1 };
+
+/// CUDA_MEMCPY2D for device addresses (type 2): `height` rows of `width` bytes, each side's rows its pitch apart.
+pub const Memcpy2D = extern struct {
+    src_x: usize = 0,
+    src_y: usize = 0,
+    src_type: c_int = 2,
+    src_host: ?*const anyopaque = null,
+    src: DevicePtr,
+    src_array: ?*anyopaque = null,
+    src_pitch: usize,
+    dst_x: usize = 0,
+    dst_y: usize = 0,
+    dst_type: c_int = 2,
+    dst_host: ?*anyopaque = null,
+    dst: DevicePtr,
+    dst_array: ?*anyopaque = null,
+    dst_pitch: usize,
+    width: usize,
+    height: usize,
+};
 
 /// CUlaunchAttributeValue: a 64-byte union aligned for its pointer members.
 pub const LaunchAttributeValue = extern union {
@@ -155,6 +181,9 @@ pub const Api = struct {
     cuCtxSynchronize: *const fn () callconv(.c) R,
     cuMemGetInfo_v2: *const fn (*usize, *usize) callconv(.c) R,
     cuMemAlloc_v2: *const fn (*DevicePtr, usize) callconv(.c) R,
+    cuIpcGetMemHandle: *const fn (*IpcMemHandle, DevicePtr) callconv(.c) R,
+    cuIpcOpenMemHandle_v2: *const fn (*DevicePtr, IpcMemHandle, c_uint) callconv(.c) R,
+    cuStreamWaitValue32: *const fn (Stream, DevicePtr, c_uint, c_uint) callconv(.c) R,
     cuMemFree_v2: *const fn (DevicePtr) callconv(.c) R,
     cuMemHostAlloc: *const fn (*Ptr, usize, c_uint) callconv(.c) R,
     cuMemHostGetDevicePointer_v2: *const fn (*DevicePtr, Ptr, c_uint) callconv(.c) R,
@@ -167,6 +196,7 @@ pub const Api = struct {
     cuMemcpyHtoDAsync_v2: *const fn (DevicePtr, CPtr, usize, Stream) callconv(.c) R,
     cuMemcpyDtoHAsync_v2: *const fn (Ptr, DevicePtr, usize, Stream) callconv(.c) R,
     cuMemcpyDtoDAsync_v2: *const fn (DevicePtr, DevicePtr, usize, Stream) callconv(.c) R,
+    cuMemcpy2DAsync_v2: *const fn (*const Memcpy2D, Stream) callconv(.c) R,
     cuMemsetD8_v2: *const fn (DevicePtr, u8, usize) callconv(.c) R,
     cuMemsetD32_v2: *const fn (DevicePtr, c_uint, usize) callconv(.c) R,
     cuMemsetD8Async: *const fn (DevicePtr, u8, usize, Stream) callconv(.c) R,

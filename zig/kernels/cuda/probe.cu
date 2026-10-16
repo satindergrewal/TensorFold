@@ -60,3 +60,12 @@ extern "C" __global__ void tf_probe_pdl_step(unsigned long long* counter, unsign
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 #endif
 }
+
+
+// The IPC gather's waiter side on boxes without stream memops: one thread polls a locally
+// mapped flag until it reaches `until_` (the mover process raises it after its copies).
+extern "C" __global__ void tf_ipc_spin(volatile int* flag, int until_) {
+    while (*flag < until_) {
+    }
+    __threadfence();
+}

@@ -1,381 +1,637 @@
-//! GLM-5.3-Flash's weights on the GPU: the routed projections as EXL3 trellis
-//! weights (rate from the trellis shape, never config), everything else bf16 as
-//! stored. A load takes a device and a block range [lo, hi) of `layers + 1`
-//! blocks (the MTP block trails) - the full model is 146G, past one card, so
-//! the box serves it split; block 0's device takes the embedding, the last the
-//! head.
+//! A TP rank's GLM-5.3-Flash weights on CUDA (the Python family's weights.load, NVFP4 or EXL3), named by its paths.
 
 const std = @import("std");
 const cuda = @import("cuda");
-const exl3 = cuda.exl3;
 const core = @import("core");
-const Config = @import("config.zig").Config;
-const Driver = cuda.Driver;
+const cfg = @import("config.zig");
+const shard = @import("cuda_shard.zig");
+const X = cuda.experts.Nvfp4Experts;
+const kda_block = @import("cuda_kda_block.zig");
+const dsa_block = @import("cuda_dsa_block.zig");
+const mlp = @import("cuda_mlp.zig");
+const moe = @import("cuda_moe.zig");
+const quant = @import("cuda_quant.zig");
+const q4 = @import("cuda_q4.zig");
+const b16 = @import("cuda_b16.zig");
+const x3 = @import("cuda_weights_exl3.zig");
 
-const prefix = "model.language_model.";
-const McgMul: u32 = 0xCBAC1FED;
+const Tensor = core.checkpoint.Tensor;
+pub const prefix = "model.language_model.";
 
-pub const Hc = struct { fnp: u64, base: u64, scale: u64 };
+/// A hyper-connection site: fn bf16 [s (s + 2)][s d], base and scale widened to fp32.
+pub const Hc = struct { fn_w: u64, base: u64, scale: u64 };
 
-pub const Kda = struct {
-    q: u64,
-    k: u64,
-    v: u64,
-    q_conv: u64,
-    k_conv: u64,
-    v_conv: u64,
-    f_a: u64,
-    f_b: u64,
-    g_a: u64,
-    g_b: u64,
-    b: u64,
-    o: u64,
-    o_norm: u64,
-    a_log: u64,
-    a: u64, // exp(a_log), host-computed fp32
-    dt_bias: u64,
-};
+pub const Mixer = union(cfg.Kind) { kda: kda_block.Layer, mla: dsa_block.Layer };
+pub const Ffn = union(enum) { dense: mlp.Layer, moe: moe.Layer };
 
-pub const Mla = struct {
-    q_a: u64,
-    q_b: u64,
-    kv_a: u64,
-    kv_b: u64,
-    o: u64,
-    q_norm: u64,
-    kv_norm: u64,
-    wq_b: u64, // the indexer's queries
-    wk: u64,
-    wproj: u64, // indexer.weights_proj
-    ape: u64,
-    igate: u64, // index_kpool_compress_gate
-    k_norm_w: u64,
-    k_norm_b: u64,
-};
+pub const Layer = struct { index: u32, attn_hc: Hc, ffn_hc: Hc, in_norm: u64, post_norm: u64, mixer: Mixer, ffn: Ffn };
 
-pub const Dense = struct { gate: u64, up: u64, down: u64 };
+/// The MTP head (weights.MTPW): norms, eh_proj, a DSA + MoE layer, shared_head.norm, 4-bit draft head (EXL3: the head).
+pub const Mtp = struct { enorm: u64, hnorm: u64, eh: b16.Proj, norm: u64, layer: Layer, draft: ?q4.Q4 };
 
-pub const Moe = struct {
-    router: u64, // [experts, hidden] bf16
-    bias: u64, // [experts] f32
-    gate: []const exl3.Weight,
-    up: []const exl3.Weight,
-    down: []const exl3.Weight,
-    shared_gate: u64,
-    shared_up: u64,
-    shared_down: u64,
-};
+/// The kernels a load runs: affine4_pack's tf_pack_dense, and for the MTP head the quantizers and the 4-bit tiling.
+pub const Tools = struct { pack_dense: cuda.Function, quant: ?*const quant.Kernels = null, q4: ?*const q4.Kernels = null };
 
-pub const Attn = union(enum) { kda: Kda, mla: Mla };
-pub const Mlp = union(enum) { dense: Dense, moe: Moe };
-
-pub const Layer = struct {
-    in_norm: u64,
-    post_norm: u64,
-    hc_attn: ?Hc, // absent on the MTP block
-    hc_ffn: ?Hc,
-    attn: Attn,
-    mlp: Mlp,
-    eh_proj: u64 = 0, // the MTP block's extras
-    enorm: u64 = 0,
-    hnorm: u64 = 0,
-    shared_head_norm: u64 = 0,
-};
+/// A loaded tensor by the Python family's attribute path, for digests against its weights.
+pub const Named = struct { name: []u8, ptr: u64, len: usize };
 
 pub const Weights = struct {
     gpa: std.mem.Allocator,
-    config: Config,
-    embed: u64 = 0,
-    final_norm: u64 = 0,
-    head: u64 = 0,
-    blocks_lo: usize = 0,
-    blocks_hi: usize = 0,
-    layers: []Layer,
+    config: cfg.Config,
+    share: shard.Share,
+    embed: u64 = 0, // bf16 [vocab][dims]
+    layers: []Layer = &.{},
+    norm: u64 = 0,
+    head: b16.Proj = .{ .b16 = 0 }, // bf16 [share.vocab][dims], or EXL3
+    head_b16_for_draft: u64 = 0, // the bf16 head rows kept for the 4-bit draft head when the head itself is FP4
+    exl3: bool = false, // an EXL3 checkpoint: the attention, shared expert, dense MLP and head quantized
+    exl3_experts: bool = false, // routed experts EXL3 with bf16 attention (our hybrid)
+    mtp: ?Mtp = null,
     buffers: std.ArrayList(cuda.DeviceBuffer) = .empty,
+    named: std.ArrayList(Named) = .empty,
 
     pub fn deinit(w: *Weights) void {
         for (w.buffers.items) |*b| b.free();
+        for (w.named.items) |n| w.gpa.free(n.name);
         w.buffers.deinit(w.gpa);
-        for (w.layers) |l| {
-            switch (l.mlp) {
-                .moe => |m| {
-                    w.gpa.free(m.gate);
-                    w.gpa.free(m.up);
-                    w.gpa.free(m.down);
-                },
-                .dense => {},
-            }
-        }
-        if (w.layers.len > 0) w.gpa.free(w.layers);
+        w.named.deinit(w.gpa);
+        w.gpa.free(w.layers);
         w.* = undefined;
     }
 
-    pub fn moeBlocks(w: *const Weights) usize {
-        var n: usize = 0;
-        for (w.layers) |l| n += @intFromBool(l.mlp == .moe);
-        return n;
+    /// Whether the attention projections are quantized (an EXL3 checkpoint), so the KDA projection stages its rows.
+    pub fn quantizedAttention(w: *const Weights) bool {
+        return w.exl3;
+    }
+
+    /// The upload named `name` (the Python family's attribute path), or null.
+    pub fn find(w: *const Weights, name: []const u8) ?Named {
+        for (w.named.items) |n| if (std.mem.eql(u8, n.name, name)) return n;
+        return null;
     }
 };
 
-const Loader = struct {
+/// Host bf16 from fp32: round to nearest even (torch's float -> bfloat16), NaN kept quiet.
+fn toBf16(v: f32) u16 {
+    const b: u32 = @bitCast(v);
+    if (std.math.isNan(v)) return @intCast((b >> 16) | 0x40);
+    return @intCast((b + 0x7fff + ((b >> 16) & 1)) >> 16);
+}
+
+pub const Loader = struct {
     gpa: std.mem.Allocator,
-    d: *const Driver,
-    c: *const Config,
+    d: *const cuda.Driver,
+    stream: cuda.Stream,
+    pack_dense: cuda.Function,
+    tools: Tools,
     w: *Weights,
-    ck: *core.checkpoint.Checkpoint,
-    pbuf: [160]u8 = undefined, // the block prefix, stable across its fields
-    nb: [4][192]u8 = undefined, // name scratch by nesting depth; a name lives until the next at its level
+    ck: *core.Checkpoint,
+    host: std.ArrayList(u8) = .empty,
+    name_buf: [192]u8 = undefined,
 
-    fn pref(L: *Loader, blk: usize) []const u8 {
-        return std.fmt.bufPrint(&L.pbuf, "{s}layers.{d}", .{ prefix, blk }) catch unreachable;
+    pub fn get(L: *Loader, comptime fmt: []const u8, args: anytype) !Tensor {
+        const name = try std.fmt.bufPrint(&L.name_buf, prefix ++ fmt, args);
+        return L.ck.get(name);
     }
 
-    fn n(L: *Loader, depth: usize, comptime f: []const u8, args: anytype) []const u8 {
-        return std.fmt.bufPrint(&L.nb[depth], f, args) catch unreachable;
-    }
-
-    fn buf(L: *Loader, bytes: []const u8) !u64 {
-        var b = try cuda.DeviceBuffer.fromHost(L.d, bytes);
-        errdefer b.free();
-        const ptr = b.ptr;
+    /// The host bytes gathered so far uploaded as one tensor named `fmt`.
+    pub fn put(L: *Loader, comptime fmt: []const u8, args: anytype) !u64 {
+        const b = try cuda.DeviceBuffer.fromHost(L.d, L.host.items);
         try L.w.buffers.append(L.gpa, b);
-        return ptr;
+        try L.w.named.append(L.gpa, .{ .name = try std.fmt.allocPrint(L.gpa, fmt, args), .ptr = b.ptr, .len = b.len });
+        L.host.clearRetainingCapacity();
+        return b.ptr;
     }
 
-    fn bf16(L: *Loader, name: []const u8) !u64 {
-        const t = try L.ck.get(name);
-        if (t.dtype != .bf16) {
-            std.log.err("{s}: expected bf16, got {t}", .{ name, t.dtype });
-            return error.UnexpectedTensor;
+    /// Elements [lo, hi) of `t` flat as `to` (bf16 or fp32 from a bf16 or fp32 tensor; other dtypes only as stored).
+    fn add(L: *Loader, t: Tensor, lo: usize, hi: usize, to: core.checkpoint.DType) !void {
+        if (t.dtype == to) {
+            const size = t.bytes.len / t.numel();
+            return L.host.appendSlice(L.gpa, t.bytes[lo * size .. hi * size]);
         }
-        return L.buf(t.bytes);
-    }
-
-    /// Any dtype as stored.
-    fn raw(L: *Loader, name: []const u8) !u64 {
-        return L.buf((try L.ck.get(name)).bytes);
-    }
-
-    fn f32v(L: *Loader, name: []const u8) !u64 {
-        const t = try L.ck.get(name);
-        if (t.dtype != .f32) return error.UnexpectedTensor;
-        return L.buf(t.bytes);
-    }
-
-    /// One routed projection's EXL3 quad; the rate is the trellis's own.
-    /// `name` lives at depth 1; the quad's names build at depth 2.
-    fn routed(L: *Loader, name: []const u8) !exl3.Weight {
-        const trellis = try L.ck.get(L.n(2, "{s}.trellis", .{name}));
-        if (trellis.dtype != .i16 or trellis.rank != 3) return error.BadTrellis;
-        const words = trellis.dim(2);
-        if (words % 8 != 0 or words > 128) return error.BadTrellis;
-        const suh = try L.ck.get(L.n(2, "{s}.suh", .{name}));
-        const svh = try L.ck.get(L.n(2, "{s}.svh", .{name}));
-        const mcg = try L.ck.get(L.n(2, "{s}.mcg", .{name}));
-        if (suh.dtype != .f16 or svh.dtype != .f16) return error.BadSigns;
-        if (mcg.dtype == .i32 and mcg.dim(0) == 1) {
-            var m: u32 = 0;
-            @memcpy(std.mem.asBytes(&m), mcg.bytes[0..4]);
-            if (m != McgMul) return error.BadCodebook;
+        for (lo..hi) |i| {
+            const v: f32 = switch (t.dtype) {
+                .bf16 => @bitCast(@as(u32, std.mem.readInt(u16, t.bytes[2 * i ..][0..2], .little)) << 16),
+                .f32 => std.mem.bytesToValue(f32, t.bytes[4 * i ..][0..4]),
+                .f16 => @floatCast(std.mem.bytesToValue(f16, t.bytes[2 * i ..][0..2])),
+                else => return error.UnexpectedTensor,
+            };
+            switch (to) {
+                .f32 => try L.host.appendSlice(L.gpa, std.mem.asBytes(&v)),
+                .bf16 => try L.host.appendSlice(L.gpa, std.mem.asBytes(&toBf16(v))),
+                else => return error.UnexpectedTensor,
+            }
         }
-        const halves: u32 = @intCast(words / 8);
-        const k: u32 = @intCast(trellis.dim(0) * 16);
-        const nn: u32 = @intCast(trellis.dim(1) * 16);
-        if (suh.dim(0) != k or svh.dim(0) != nn) return error.SignShape;
-        return .{
-            .trellis = try L.buf(trellis.bytes),
-            .suh = try L.buf(suh.bytes),
-            .svh = try L.buf(svh.bytes),
-            .halves = halves,
-            .k = k,
-            .n = nn,
-        };
     }
 
-    /// The hyper-connection triple as stored (fp32 base/scale, bf16 or fp32 fn).
-    fn hc(L: *Loader, base: []const u8) !Hc {
-        const t = try L.ck.get(L.n(1, "{s}_fn", .{base}));
-        return .{
-            .fnp = try L.buf(t.bytes),
-            .base = try L.buf((try L.ck.get(L.n(1, "{s}_base", .{base}))).bytes),
-            .scale = try L.buf((try L.ck.get(L.n(1, "{s}_scale", .{base}))).bytes),
-        };
+    /// Rows [lo, hi) of `t`'s outermost axis (`total` long; a vector's elements): split.py's "row" cut.
+    pub fn rows(L: *Loader, t: Tensor, lo: usize, hi: usize, total: usize, to: core.checkpoint.DType) !void {
+        const per = t.numel() / total;
+        if (per * total != t.numel()) return error.UnexpectedTensor;
+        try L.add(t, lo * per, hi * per, to);
     }
 
-    /// exp(A_log) elementwise fp32, as the state step reads it; bf16 or f32 as stored.
-    fn expA(L: *Loader, name: []const u8) !u64 {
-        const t = try L.ck.get(name);
-        const count = t.numel();
-        const out = try L.gpa.alloc(f32, count);
-        defer L.gpa.free(out);
-        switch (t.dtype) {
-            .bf16 => {
-                const src = try L.gpa.alloc(u16, count);
-                defer L.gpa.free(src);
-                @memcpy(std.mem.sliceAsBytes(src), t.bytes[0 .. count * 2]);
-                for (src, out) |bits, *o| o.* = @exp(@as(f32, @floatCast(@as(f16, @bitCast(bits)))));
-            },
-            .f32 => {
-                const src = try L.gpa.alloc(f32, count);
-                defer L.gpa.free(src);
-                @memcpy(std.mem.sliceAsBytes(src), t.bytes[0 .. count * 4]);
-                for (src, out) |v, *o| o.* = @exp(v);
-            },
-            else => return error.UnexpectedTensor,
-        }
-        return L.buf(std.mem.sliceAsBytes(out));
+    pub fn whole(L: *Loader, t: Tensor, to: core.checkpoint.DType) !void {
+        try L.add(t, 0, t.numel(), to);
     }
 
-    fn kda(L: *Loader, pre: []const u8) !Kda {
-        const A = "{s}.self_attn.";
-        return .{
-            .q = try L.bf16(L.n(0, A ++ "q_proj.weight", .{pre})),
-            .k = try L.bf16(L.n(0, A ++ "k_proj.weight", .{pre})),
-            .v = try L.bf16(L.n(0, A ++ "v_proj.weight", .{pre})),
-            .q_conv = try L.bf16(L.n(0, A ++ "q_conv1d.weight", .{pre})),
-            .k_conv = try L.bf16(L.n(0, A ++ "k_conv1d.weight", .{pre})),
-            .v_conv = try L.bf16(L.n(0, A ++ "v_conv1d.weight", .{pre})),
-            .f_a = try L.bf16(L.n(0, A ++ "f_a_proj.weight", .{pre})),
-            .f_b = try L.bf16(L.n(0, A ++ "f_b_proj.weight", .{pre})),
-            .g_a = try L.bf16(L.n(0, A ++ "g_a_proj.weight", .{pre})),
-            .g_b = try L.bf16(L.n(0, A ++ "g_b_proj.weight", .{pre})),
-            .b = try L.bf16(L.n(0, A ++ "b_proj.weight", .{pre})),
-            .o = try L.bf16(L.n(0, A ++ "o_proj.weight", .{pre})),
-            .o_norm = try L.bf16(L.n(0, A ++ "o_norm.weight", .{pre})),
-            .a_log = try L.raw(L.n(0, A ++ "A_log", .{pre})),
-            .a = try L.expA(L.n(0, A ++ "A_log", .{pre})),
-            .dt_bias = try L.raw(L.n(0, A ++ "dt_bias", .{pre})),
-        };
+    /// Columns [lo, hi) of every row of a matrix: split.py's "col" cut.
+    pub fn cols(L: *Loader, t: Tensor, lo: usize, hi: usize, to: core.checkpoint.DType) !void {
+        if (t.rank != 2) return error.UnexpectedTensor;
+        const k = t.dim(1);
+        for (0..t.dim(0)) |r| try L.add(t, r * k + lo, r * k + hi, to);
     }
 
-    fn mla(L: *Loader, pre: []const u8) !Mla {
-        const A = "{s}.self_attn.";
-        const I = A ++ "indexer.";
-        return .{
-            .q_a = try L.bf16(L.n(0, A ++ "q_a_proj.weight", .{pre})),
-            .q_b = try L.bf16(L.n(0, A ++ "q_b_proj.weight", .{pre})),
-            .kv_a = try L.bf16(L.n(0, A ++ "kv_a_proj_with_mqa.weight", .{pre})),
-            .kv_b = try L.bf16(L.n(0, A ++ "kv_b_proj.weight", .{pre})),
-            .o = try L.bf16(L.n(0, A ++ "o_proj.weight", .{pre})),
-            .q_norm = try L.bf16(L.n(0, A ++ "q_a_layernorm.weight", .{pre})),
-            .kv_norm = try L.bf16(L.n(0, A ++ "kv_a_layernorm.weight", .{pre})),
-            .wq_b = try L.bf16(L.n(0, I ++ "wq_b.weight", .{pre})),
-            .wk = try L.bf16(L.n(0, I ++ "wk.weight", .{pre})),
-            .wproj = try L.bf16(L.n(0, I ++ "weights_proj.weight", .{pre})),
-            .ape = try L.bf16(L.n(0, I ++ "index_kpool_compress_ape", .{pre})),
-            .igate = try L.bf16(L.n(0, I ++ "index_kpool_compress_gate", .{pre})),
-            .k_norm_w = try L.bf16(L.n(0, I ++ "k_norm.weight", .{pre})),
-            .k_norm_b = try L.bf16(L.n(0, I ++ "k_norm.bias", .{pre})),
-        };
+    fn hc(L: *Loader, i: u32, comptime site: []const u8) !Hc {
+        try L.whole(try L.get("layers.{d}.hc_" ++ site ++ "_fn", .{i}), .bf16);
+        const f = try L.put("layers.{d}.{s}_hc.fn", .{ i, site });
+        try L.whole(try L.get("layers.{d}.hc_" ++ site ++ "_base", .{i}), .f32);
+        const base = try L.put("layers.{d}.{s}_hc.base", .{ i, site });
+        try L.whole(try L.get("layers.{d}.hc_" ++ site ++ "_scale", .{i}), .f32);
+        return .{ .fn_w = f, .base = base, .scale = try L.put("layers.{d}.{s}_hc.scale", .{ i, site }) };
     }
 
-    fn mlp(L: *Loader, blk: usize, pre: []const u8) !Mlp {
-        const P = "{s}.mlp.";
-        if (blk < L.c.dense_layers) {
-            return .{ .dense = .{
-                .gate = try L.bf16(L.n(0, P ++ "gate_proj.weight", .{pre})),
-                .up = try L.bf16(L.n(0, P ++ "up_proj.weight", .{pre})),
-                .down = try L.bf16(L.n(0, P ++ "down_proj.weight", .{pre})),
-            } };
-        }
-        const e = L.c.experts;
-        const gate = try L.gpa.alloc(exl3.Weight, e);
-        errdefer L.gpa.free(gate);
-        const up = try L.gpa.alloc(exl3.Weight, e);
-        errdefer L.gpa.free(up);
-        const down = try L.gpa.alloc(exl3.Weight, e);
-        errdefer L.gpa.free(down);
-        for (0..e) |ei| {
-            const epre = L.n(1, "{s}.mlp.experts.{d}.", .{ pre, ei });
-            // depth 0 held the last leaf; the expert prefix at 1, quads at 2
-            gate[ei] = try L.routed(L.n(0, "{s}gate_proj", .{epre}));
-            up[ei] = try L.routed(L.n(0, "{s}up_proj", .{epre}));
-            down[ei] = try L.routed(L.n(0, "{s}down_proj", .{epre}));
-        }
-        return .{ .moe = .{
-            .router = try L.bf16(L.n(0, P ++ "gate.weight", .{pre})),
-            .bias = try L.f32v(L.n(0, P ++ "gate.e_score_correction_bias", .{pre})),
-            .gate = gate,
-            .up = up,
-            .down = down,
-            .shared_gate = try L.bf16(L.n(0, P ++ "shared_experts.gate_proj.weight", .{pre})),
-            .shared_up = try L.bf16(L.n(0, P ++ "shared_experts.up_proj.weight", .{pre})),
-            .shared_down = try L.bf16(L.n(0, P ++ "shared_experts.down_proj.weight", .{pre})),
-        } };
+    /// weights.load's kda(i): [q | k | v | f_a | g_a | b], f_b/g_b by heads, o by columns, conv taps, A_log, dt_bias.
+    fn kda(L: *Loader, i: u32) !kda_block.Layer {
+        if (L.w.exl3) return x3.kda(L, i);
+        const c = &L.w.config;
+        const h = L.w.share.kda;
+        const dk = c.kda_dim;
+        const all = c.kda_heads * dk;
+        inline for (.{ "q", "k", "v" }) |x| try L.rows(try L.get("layers.{d}.self_attn." ++ x ++ "_proj.weight", .{i}), h.lo * dk, h.hi * dk, all, .bf16);
+        inline for (.{ "f_a", "g_a" }) |x| try L.whole(try L.get("layers.{d}.self_attn." ++ x ++ "_proj.weight", .{i}), .bf16);
+        try L.rows(try L.get("layers.{d}.self_attn.b_proj.weight", .{i}), h.lo, h.hi, c.kda_heads, .bf16);
+        const proj = try L.put("layers.{d}.kda.proj", .{i});
+        try L.rows(try L.get("layers.{d}.self_attn.f_b_proj.weight", .{i}), h.lo * dk, h.hi * dk, all, .bf16);
+        const fb = try L.put("layers.{d}.kda.fb", .{i});
+        try L.rows(try L.get("layers.{d}.self_attn.g_b_proj.weight", .{i}), h.lo * dk, h.hi * dk, all, .bf16);
+        const gb = try L.put("layers.{d}.kda.gb", .{i});
+        inline for (.{ "q", "k", "v" }) |x| try L.rows(try L.get("layers.{d}.self_attn." ++ x ++ "_conv1d.weight", .{i}), h.lo * dk, h.hi * dk, all, .f32);
+        const conv = try L.put("layers.{d}.kda.conv", .{i});
+        try L.rows(try L.get("layers.{d}.self_attn.A_log", .{i}), h.lo, h.hi, c.kda_heads, .f32);
+        const a_log = try L.put("layers.{d}.kda.a_log", .{i});
+        try L.rows(try L.get("layers.{d}.self_attn.dt_bias", .{i}), h.lo * dk, h.hi * dk, all, .f32);
+        const dt = try L.put("layers.{d}.kda.dt_bias", .{i});
+        try L.whole(try L.get("layers.{d}.self_attn.o_norm.weight", .{i}), .bf16);
+        const norm = try L.put("layers.{d}.kda.norm", .{i});
+        try L.cols(try L.get("layers.{d}.self_attn.o_proj.weight", .{i}), h.lo * dk, h.hi * dk, .bf16);
+        const o = try L.put("layers.{d}.kda.o", .{i});
+        return .{ .proj = proj, .fb = fb, .gb = gb, .o = .{ .b16 = o }, .conv_w = conv, .a_log = a_log, .dt_bias = dt, .norm_w = norm, .eps = c.eps, .lower = c.lower_bound, .heads = h.len(), .dims = c.hidden };
     }
 
-    fn block(L: *Loader, bi: usize) !Layer {
-        const pre = L.pref(bi);
-        const mtp = bi == L.c.layers; // the MTP block trails the backbone
-        var l: Layer = .{
-            .in_norm = try L.bf16(L.n(0, "{s}.input_layernorm.weight", .{pre})),
-            .post_norm = try L.bf16(L.n(0, "{s}.post_attention_layernorm.weight", .{pre})),
-            .hc_attn = null,
-            .hc_ffn = null,
-            .attn = undefined,
-            .mlp = undefined,
-        };
-        if (!mtp) {
-            l.hc_attn = try L.hc(L.n(0, "{s}.hc_attn", .{pre}));
-            l.hc_ffn = try L.hc(L.n(0, "{s}.hc_ffn", .{pre}));
+    /// weights.load's dsa(i) (latent): [q_a | kv_a], norms, q_b by heads, kv_b as wk/wv (AbsorbW), o by cols, indexer.
+    fn dsa(L: *Loader, i: u32) !dsa_block.Layer {
+        const c = &L.w.config;
+        const h = L.w.share.mla;
+        const qk = c.nope;
+        const ex = L.w.exl3;
+        var q_a: ?cuda.qlinear.Weight = null;
+        var kv_a: ?cuda.qlinear.Weight = null;
+        var proj: u64 = 0;
+        if (ex) {
+            q_a = try x3.whole(L, "layers.{d}.self_attn.q_a_proj", i);
+            kv_a = try x3.whole(L, "layers.{d}.self_attn.kv_a_proj_with_mqa", i);
         } else {
-            l.eh_proj = try L.bf16(L.n(0, "{s}.eh_proj.weight", .{pre}));
-            l.enorm = try L.bf16(L.n(0, "{s}.enorm.weight", .{pre}));
-            l.hnorm = try L.bf16(L.n(0, "{s}.hnorm.weight", .{pre}));
-            l.shared_head_norm = try L.bf16(L.n(0, "{s}.shared_head.norm.weight", .{pre}));
+            inline for (.{ "q_a_proj", "kv_a_proj_with_mqa" }) |x| try L.whole(try L.get("layers.{d}.self_attn." ++ x ++ ".weight", .{i}), .bf16);
+            proj = try L.put("layers.{d}.dsa.proj", .{i});
         }
-        l.attn = if (L.c.kind(@intCast(bi)) == .kda) .{ .kda = try L.kda(pre) } else .{ .mla = try L.mla(pre) };
-        l.mlp = try L.mlp(bi, pre);
-        return l;
+        try L.whole(try L.get("layers.{d}.self_attn.q_a_layernorm.weight", .{i}), .bf16);
+        const q_norm = try L.put("layers.{d}.dsa.q_norm", .{i});
+        try L.whole(try L.get("layers.{d}.self_attn.kv_a_layernorm.weight", .{i}), .bf16);
+        const kv_norm = try L.put("layers.{d}.dsa.kv_norm", .{i});
+        const q_b: b16.Proj = if (ex) .{ .q = try x3.layerMatrix(L, "layers.{d}.self_attn.q_b_proj", i, 0, 0, &.{.{ .lo = h.lo * qk, .hi = h.hi * qk }}) } else blk: {
+            try L.rows(try L.get("layers.{d}.self_attn.q_b_proj.weight", .{i}), h.lo * qk, h.hi * qk, c.mla_heads * qk, .bf16);
+            break :blk .{ .b16 = try L.put("layers.{d}.dsa.q_b", .{i}) };
+        };
+        const kv_b = try L.get("layers.{d}.self_attn.kv_b_proj.weight", .{i});
+        const per = qk + c.v_dim; // a head's kv_b rows: its keys, then its values
+        const total = c.mla_heads * per;
+        for (h.lo..h.hi) |head| try L.rows(kv_b, head * per, head * per + qk, total, .bf16);
+        const wk = try L.put("layers.{d}.dsa.absorb.wk", .{i});
+        for (h.lo..h.hi) |head| try L.rows(kv_b, head * per + qk, (head + 1) * per, total, .bf16);
+        const wv = try L.put("layers.{d}.dsa.absorb.wv", .{i});
+        const o: b16.Proj = if (ex) .{ .q = try x3.layerMatrix(L, "layers.{d}.self_attn.o_proj", i, h.lo * c.v_dim, h.hi * c.v_dim, &.{.{ .lo = 0, .hi = c.hidden }}) } else blk: {
+            try L.cols(try L.get("layers.{d}.self_attn.o_proj.weight", .{i}), h.lo * c.v_dim, h.hi * c.v_dim, .bf16);
+            break :blk .{ .b16 = try L.put("layers.{d}.dsa.o", .{i}) };
+        };
+        inline for (.{ "wk", "weights_proj" }) |x| try L.whole(try L.get("layers.{d}.self_attn.indexer." ++ x ++ ".weight", .{i}), .bf16);
+        const kw = try L.put("layers.{d}.dsa.index.kw", .{i});
+        const qb: b16.Proj = if (ex) .{ .q = try x3.whole(L, "layers.{d}.self_attn.indexer.wq_b", i) } else blk: {
+            try L.whole(try L.get("layers.{d}.self_attn.indexer.wq_b.weight", .{i}), .bf16);
+            break :blk .{ .b16 = try L.put("layers.{d}.dsa.index.qb", .{i}) };
+        };
+        try L.whole(try L.get("layers.{d}.self_attn.indexer.k_norm.weight", .{i}), .bf16);
+        const ln_w = try L.put("layers.{d}.dsa.index.ln_w", .{i});
+        try L.whole(try L.get("layers.{d}.self_attn.indexer.k_norm.bias", .{i}), .bf16);
+        const ln_b = try L.put("layers.{d}.dsa.index.ln_b", .{i});
+        try L.whole(try L.get("layers.{d}.self_attn.indexer.index_kpool_compress_gate", .{i}), .bf16);
+        const gate = try L.put("layers.{d}.dsa.index.gate", .{i});
+        try L.whole(try L.get("layers.{d}.self_attn.indexer.index_kpool_compress_ape", .{i}), .bf16);
+        const ape = try L.put("layers.{d}.dsa.index.ape", .{i});
+        return .{
+            .proj = proj,
+            .q_a = q_a,
+            .kv_a = kv_a,
+            .q_norm = q_norm,
+            .kv_norm = kv_norm,
+            .q_b = q_b,
+            .wk = wk,
+            .wv = wv,
+            .o = o,
+            .index = .{ .kw = kw, .gate = gate, .ln_w = ln_w, .ln_b = ln_b, .ape = ape, .qb = qb, .heads = c.i_heads, .d = c.i_dim },
+            .heads = h.len(),
+            .qk = qk,
+            .dv = c.v_dim,
+            .lw = c.kv_lora,
+            .q_lora = c.q_lora,
+            .dims = c.hidden,
+            .eps = c.eps,
+            .dense_limit = c.keyWidth(),
+        };
+    }
+
+    /// An NVFP4 linear's rows [lo, hi), inputs [klo, khi) as Fp4Linear.from_checkpoint (tf_pack_dense, packScales).
+    fn fp4(L: *Loader, comptime fmt: []const u8, i: u32, lo: usize, hi: usize, klo: usize, khi: usize) !cuda.qmmf.Weight {
+        const name = try std.fmt.bufPrint(&L.name_buf, prefix ++ fmt, .{i});
+        const l = try core.nvfp4.Linear.read(L.ck, name);
+        const n = hi - lo;
+        const k = khi - klo;
+        for (0..n) |r| try L.host.appendSlice(L.gpa, l.codes[(lo + r) * l.k / 2 + klo / 2 ..][0 .. k / 2]);
+        var src = try cuda.DeviceBuffer.fromHost(L.d, L.host.items);
+        defer src.free();
+        L.host.clearRetainingCapacity();
+        const npad = cuda.nvfp4.padded(n);
+        const kg = k / 64;
+        const total: u64 = @as(u64, npad / 64) * kg * 512;
+        const words = try cuda.DeviceBuffer.alloc(L.d, total * 4);
+        try L.w.buffers.append(L.gpa, words);
+        try L.w.named.append(L.gpa, .{ .name = try std.fmt.allocPrint(L.gpa, fmt ++ ".words", .{i}), .ptr = words.ptr, .len = words.len });
+        var args: cuda.Args = .{};
+        args.add(src.ptr);
+        for ([_]usize{ n, k / 8, kg }) |v| args.add(@as(c_int, @intCast(v)));
+        args.add(words.ptr);
+        args.add(@as(c_longlong, @intCast(total)));
+        try cuda.launch.launch(L.pack_dense, .{ .grid = .{ .x = @intCast((total + 255) / 256) }, .block = .{ .x = 256 } }, L.stream, &args);
+        try L.stream.synchronize();
+        const scales = try L.gpa.alloc(u8, n * k / 16);
+        defer L.gpa.free(scales);
+        for (0..n) |r| @memcpy(scales[r * k / 16 ..][0 .. k / 16], l.scales[(lo + r) * l.k / 16 + klo / 16 ..][0 .. k / 16]);
+        try L.host.resize(L.gpa, npad * k / 16);
+        cuda.nvfp4.packScales(L.host.items, scales, n, k);
+        const bs = try L.put(fmt ++ ".scales", .{i});
+        return cuda.nvfp4.weight(words.ptr, bs, l.global, n, k);
+    }
+
+    /// The hybrid checkpoint's dense MLP: BF16 gate/up cut by the rank's rows (a rows cut) or down by its
+    /// columns, repacked into qmmf's BF16 order on the host (packBf16), one qlinear.Weight.
+    fn bf16Dense(L: *Loader, comptime fmt: []const u8, i: u32, lo: usize, hi: usize, by_cols: bool, total: usize) !cuda.qlinear.Weight {
+        const t = try L.get("layers.{d}.mlp." ++ fmt ++ ".weight", .{i});
+        const src = std.mem.bytesAsSlice(u16, t.bytes);
+        const n: usize = if (by_cols) t.dim(0) else hi - lo;
+        const k: usize = if (by_cols) hi - lo else t.dim(1);
+        const npad = (n + 127) / 128 * 128;
+        const flat = try L.gpa.alloc(u16, npad * k);
+        defer L.gpa.free(flat);
+        @memset(flat, 0);
+        if (by_cols) {
+            for (0..n) |r| @memcpy(flat[r * k ..][0..k], src[r * total + lo ..][0..k]);
+        } else {
+            @memcpy(flat[0 .. n * k], src[lo * k ..][0 .. n * k]);
+        }
+        const out = try L.gpa.alloc(u16, npad * k);
+        defer L.gpa.free(out);
+        cuda.qmmf.packBf16(out, flat[0 .. n * k], n, k);
+        try L.host.appendSlice(L.gpa, std.mem.sliceAsBytes(out));
+        return .{ .bf16 = .{ .mode = .bf16, .codes = try L.put("layers.{d}.mlp." ++ fmt, .{i}), .scales = 0, .n = @intCast(n), .k = @intCast(k), .npad = @intCast(npad) } };
+    }
+
+    /// weights.load's mlp for a dense layer: gate and up by the rank's rows, down by its columns (NVFP4).
+    fn dense(L: *Loader, i: u32) !mlp.Layer {
+        const c = &L.w.config;
+        const s = L.w.share.dense;
+        const d = c.hidden;
+        if (L.w.exl3_experts) {
+            try L.cols(try L.get("layers.{d}.mlp.down_proj.weight", .{i}), s.lo, s.hi, .bf16);
+            const down = try L.put("layers.{d}.mlp.down_proj.b16", .{i});
+            return .{
+                .gate = try L.bf16Dense("gate_proj", i, s.lo, s.hi, false, c.dense_inter),
+                .up = try L.bf16Dense("up_proj", i, s.lo, s.hi, false, c.dense_inter),
+                .down_b16 = down,
+                .width = s.len(),
+                .dims = d,
+                .limit = c.swiglu_limit,
+            };
+        }
+        if (L.w.exl3) return .{
+            .gate = try x3.layerMatrix(L, "layers.{d}.mlp.gate_proj", i, 0, 0, &.{s}),
+            .up = try x3.layerMatrix(L, "layers.{d}.mlp.up_proj", i, 0, 0, &.{s}),
+            .down = try x3.layerMatrix(L, "layers.{d}.mlp.down_proj", i, s.lo, s.hi, &.{.{ .lo = 0, .hi = d }}),
+            .width = s.len(),
+            .dims = d,
+            .limit = c.swiglu_limit,
+        };
+        return .{
+            .gate = .{ .nvfp4 = try L.fp4("layers.{d}.mlp.gate_proj", i, s.lo, s.hi, 0, d) },
+            .up = .{ .nvfp4 = try L.fp4("layers.{d}.mlp.up_proj", i, s.lo, s.hi, 0, d) },
+            .down = .{ .nvfp4 = try L.fp4("layers.{d}.mlp.down_proj", i, 0, d, s.lo, s.hi) },
+            .width = s.len(),
+            .dims = d,
+            .limit = c.swiglu_limit,
+        };
+    }
+
+    /// One device allocation the loader frees itself (staging for the GPU's quantizers).
+    pub fn scratch(L: *Loader, n: usize) !cuda.DeviceBuffer {
+        return cuda.DeviceBuffer.alloc(L.d, n);
+    }
+
+    /// moe_nvfp4 of the MTP layer: BF16 experts cut to the rank, GPU-quantized 8 at a time, scale as weight_scale_2.
+    fn quantizedExperts(L: *Loader, i: u32, up: []u32, down: []u32, up_scale: []f32, down_scale: []f32) !void {
+        const qk = L.tools.quant orelse return error.NoQuantizer;
+        const c = &L.w.config;
+        const d: usize = c.hidden;
+        const cut = L.w.share.moe;
+        const ni = cut.len();
+        const up_len = X.bytes(1, ni, d, 2) / 4;
+        const down_len = X.bytes(1, d, ni, 1) / 4;
+        const chunk = 8;
+        var wb = try L.scratch(chunk * ni * d * 2);
+        defer wb.free();
+        var cb = try L.scratch(chunk * ni * d / 2);
+        defer cb.free();
+        var sb = try L.scratch(chunk * ni * d / 16);
+        defer sb.free();
+        var gb = try L.scratch(chunk * 4);
+        defer gb.free();
+        const codes = try L.gpa.alloc(u8, 3 * chunk * ni * d / 2); // gate, up and down apart: packGateUp takes both
+        defer L.gpa.free(codes);
+        const scales = try L.gpa.alloc(u8, 3 * chunk * ni * d / 16);
+        defer L.gpa.free(scales);
+        var g: [3][chunk]f32 = undefined;
+        var e0: usize = 0;
+        while (e0 < c.experts) : (e0 += chunk) {
+            const ec = @min(chunk, c.experts - e0);
+            inline for (.{ "gate_proj", "up_proj", "down_proj" }, 0..) |proj, m| {
+                const n = if (m < 2) ni else d; // gate and up: the rank's rows; down: every row, the rank's columns
+                const k = if (m < 2) d else ni;
+                for (e0..e0 + ec) |e| {
+                    const t = try L.get("layers.{d}.mlp.experts.{d}." ++ proj ++ ".weight", .{ i, e });
+                    if (m < 2) try L.rows(t, cut.lo, cut.hi, c.moe_inter, .bf16) else try L.cols(t, cut.lo, cut.hi, .bf16);
+                }
+                try wb.upload(0, L.host.items);
+                L.host.clearRetainingCapacity();
+                try quant.nvfp4(qk, L.stream, wb.ptr, ec, n, k, cb.ptr, sb.ptr, gb.ptr);
+                try L.stream.synchronize();
+                try cb.download(0, codes[m * chunk * n * k / 2 ..][0 .. ec * n * k / 2]);
+                try sb.download(0, scales[m * chunk * n * k / 16 ..][0 .. ec * n * k / 16]);
+                try gb.download(0, std.mem.sliceAsBytes(g[m][0..ec]));
+            }
+            const mc = chunk * ni * d / 2; // one matrix's codes for the chunk; scales an eighth of that
+            for (0..ec) |j| {
+                const e = e0 + j;
+                const one = ni * d;
+                var cs: [3][]const u8 = undefined;
+                var ss: [3][]const u8 = undefined;
+                for (0..3) |m| {
+                    cs[m] = codes[m * mc + j * one / 2 ..][0 .. one / 2];
+                    ss[m] = scales[m * mc / 8 + j * one / 16 ..][0 .. one / 16];
+                }
+                X.packGateUp(up[e * up_len ..][0..up_len], .{ cs[0], ss[0] }, .{ cs[1], ss[1] }, ni, d);
+                X.packOne(down[e * down_len ..][0..down_len], cs[2], ss[2], d, ni);
+                up_scale[e * 2] = g[0][j];
+                up_scale[e * 2 + 1] = g[1][j];
+                down_scale[e] = g[2][j];
+            }
+        }
+    }
+
+    /// weights.load's moe(i) on NVFP4: router and bias, routed experts as Experts4, the BF16 shared expert's share.
+    fn moeLayer(L: *Loader, i: u32) !moe.Layer {
+        if (L.w.exl3) return x3.moe(L, i);
+        if (L.w.exl3_experts) return x3.moeHybrid(L, i);
+        const c = &L.w.config;
+        const d: usize = c.hidden;
+        const cut = L.w.share.moe;
+        const ni = cut.len();
+        try L.whole(try L.get("layers.{d}.mlp.gate.weight", .{i}), .bf16);
+        const router = try L.put("layers.{d}.moe.router", .{i});
+        try L.whole(try L.get("layers.{d}.mlp.gate.e_score_correction_bias", .{i}), .f32);
+        const bias = try L.put("layers.{d}.moe.bias", .{i});
+        const count: usize = c.experts;
+        const up_len = X.bytes(1, ni, d, 2) / 4;
+        const down_len = X.bytes(1, d, ni, 1) / 4;
+        const up = try L.gpa.alloc(u32, count * up_len);
+        defer L.gpa.free(up);
+        const down = try L.gpa.alloc(u32, count * down_len);
+        defer L.gpa.free(down);
+        const up_scale = try L.gpa.alloc(f32, count * 2);
+        defer L.gpa.free(up_scale);
+        const down_scale = try L.gpa.alloc(f32, count);
+        defer L.gpa.free(down_scale);
+        const codes = try L.gpa.alloc(u8, d * ni / 2);
+        defer L.gpa.free(codes);
+        const scales = try L.gpa.alloc(u8, d * ni / 16);
+        defer L.gpa.free(scales);
+        if (i == c.layers) try L.quantizedExperts(i, up, down, up_scale, down_scale) else for (0..count) |e| {
+            var ls: [3]core.nvfp4.Linear = undefined;
+            inline for (.{ "gate_proj", "up_proj", "down_proj" }, 0..) |proj, m| {
+                const name = try std.fmt.bufPrint(&L.name_buf, prefix ++ "layers.{d}.mlp.experts.{d}." ++ proj, .{ i, e });
+                ls[m] = try core.nvfp4.Linear.read(L.ck, name);
+            }
+            // gate and up: the rank's rows; down: every row, the rank's columns
+            const gate = .{ ls[0].codes[cut.lo * d / 2 ..][0 .. ni * d / 2], ls[0].scales[cut.lo * d / 16 ..][0 .. ni * d / 16] };
+            const upm = .{ ls[1].codes[cut.lo * d / 2 ..][0 .. ni * d / 2], ls[1].scales[cut.lo * d / 16 ..][0 .. ni * d / 16] };
+            X.packGateUp(up[e * up_len ..][0..up_len], gate, upm, ni, d);
+            const l = ls[2];
+            for (0..d) |r| {
+                @memcpy(codes[r * ni / 2 ..][0 .. ni / 2], l.codes[r * l.k / 2 + cut.lo / 2 ..][0 .. ni / 2]);
+                @memcpy(scales[r * ni / 16 ..][0 .. ni / 16], l.scales[r * l.k / 16 + cut.lo / 16 ..][0 .. ni / 16]);
+            }
+            X.packOne(down[e * down_len ..][0..down_len], codes, scales, d, ni);
+            up_scale[e * 2] = ls[0].global;
+            up_scale[e * 2 + 1] = ls[1].global;
+            down_scale[e] = l.global;
+        }
+        var ptrs: [4]u64 = undefined;
+        for (&ptrs, [_][]const u8{ std.mem.sliceAsBytes(up), std.mem.sliceAsBytes(down), std.mem.sliceAsBytes(up_scale), std.mem.sliceAsBytes(down_scale) }, [_][]const u8{ "up", "down", "up_scale", "down_scale" }) |*p, bytes, what| {
+            try L.host.appendSlice(L.gpa, bytes);
+            p.* = try L.put("layers.{d}.moe.experts.{s}", .{ i, what });
+        }
+        const sh = L.w.share.shared;
+        inline for (.{ "gate_proj", "up_proj" }) |x| try L.rows(try L.get("layers.{d}.mlp.shared_experts." ++ x ++ ".weight", .{i}), sh.lo, sh.hi, c.shared_inter, .bf16);
+        const gu = try L.put("layers.{d}.moe.shared.gu", .{i});
+        try L.cols(try L.get("layers.{d}.mlp.shared_experts.down_proj.weight", .{i}), sh.lo, sh.hi, .bf16);
+        const sd = try L.put("layers.{d}.moe.shared.down", .{i});
+        return .{
+            .router = router,
+            .bias = bias,
+            .routed = .{ .format = .nvfp4, .up = ptrs[0], .down = ptrs[1], .up_scale = ptrs[2], .down_scale = ptrs[3], .width = ni, .dims = d, .experts = count, .limit = c.swiglu_limit },
+            .count = count,
+            .shared_gu = gu,
+            .shared_down = .{ .b16 = sd },
+            .shared = sh.len(),
+            .top_k = c.topk,
+            .scale = c.routed_scale,
+            .norm = c.norm_topk,
+        };
+    }
+
+    /// weights.load's MTPW: layer `layers` as plain DSA + MoE, norms, eh_proj, draft head from the rank's head rows.
+    fn mtp(L: *Loader) !Mtp {
+        const c = &L.w.config;
+        const i = c.layers;
+        try L.whole(try L.get("layers.{d}.input_layernorm.weight", .{i}), .bf16);
+        const in_norm = try L.put("layers.{d}.in_norm", .{i});
+        try L.whole(try L.get("layers.{d}.post_attention_layernorm.weight", .{i}), .bf16);
+        const post_norm = try L.put("layers.{d}.post_norm", .{i});
+        const none: Hc = .{ .fn_w = 0, .base = 0, .scale = 0 };
+        const layer_w: Layer = .{ .index = i, .attn_hc = none, .ffn_hc = none, .in_norm = in_norm, .post_norm = post_norm, .mixer = .{ .mla = try L.dsa(i) }, .ffn = .{ .moe = try L.moeLayer(i) } };
+        L.ck.release();
+        if (L.w.exl3) {
+            var o3: [3]u64 = undefined;
+            for (&o3, [_][]const u8{ "enorm.weight", "hnorm.weight", "shared_head.norm.weight" }, [_][]const u8{ "enorm", "hnorm", "norm" }) |*p, name, what| {
+                try L.whole(try L.ck.get(try std.fmt.bufPrint(&L.name_buf, prefix ++ "layers.{d}.{s}", .{ i, name })), .bf16);
+                p.* = try L.put("mtp.{s}", .{what});
+            }
+            return .{ .enorm = o3[0], .hnorm = o3[1], .eh = .{ .q = try x3.whole(L, "layers.{d}.eh_proj", i) }, .norm = o3[2], .layer = layer_w, .draft = null };
+        }
+        var out: [4]u64 = undefined;
+        for (&out, [_][]const u8{ "enorm.weight", "hnorm.weight", "eh_proj.weight", "shared_head.norm.weight" }, [_][]const u8{ "enorm", "hnorm", "eh", "norm" }) |*p, name, what| {
+            try L.whole(try L.ck.get(try std.fmt.bufPrint(&L.name_buf, prefix ++ "layers.{d}.{s}", .{ i, name })), .bf16);
+            p.* = try L.put("mtp.{s}", .{what});
+        }
+        // the draft head: quantize4 of the BF16 head's rows, then make_q4's tiling
+        const qk = L.tools.quant orelse return error.NoQuantizer;
+        const tk = L.tools.q4 orelse return error.NoQuantizer;
+        const n = L.w.share.vocab.len();
+        const k: usize = c.hidden;
+        var raw: [3]cuda.DeviceBuffer = undefined;
+        var made: usize = 0;
+        defer for (raw[0..made]) |*b| b.free();
+        for (&raw, [_]usize{ n * k / 2, n * k / 32, n * k / 32 }) |*b, size| {
+            b.* = try L.scratch(size);
+            made += 1;
+        }
+        try quant.q4(qk, L.stream, if (L.w.head_b16_for_draft != 0) L.w.head_b16_for_draft else L.w.head.b16, n, k, raw[0].ptr, raw[1].ptr, raw[2].ptr);
+        var tiled: [3]u64 = undefined;
+        for (&tiled, q4.bytes(n, k), [_][]const u8{ "words", "scales", "biases" }) |*p, size, what| {
+            const b = try cuda.DeviceBuffer.alloc(L.d, size);
+            try L.w.buffers.append(L.gpa, b);
+            try L.w.named.append(L.gpa, .{ .name = try std.fmt.allocPrint(L.gpa, "draft_head.{s}", .{what}), .ptr = b.ptr, .len = b.len });
+            p.* = b.ptr;
+        }
+        const draft: q4.Q4 = .{ .w = tiled[0], .s = tiled[1], .b = tiled[2], .n = n, .k = k, .npad = q4.npadOf(n) };
+        try q4.pack(tk, L.stream, raw[0].ptr, raw[1].ptr, raw[2].ptr, draft);
+        try L.stream.synchronize();
+        return .{ .enorm = out[0], .hnorm = out[1], .eh = .{ .b16 = out[2] }, .norm = out[3], .layer = layer_w, .draft = draft };
+    }
+
+    fn layer(L: *Loader, i: u32) !Layer {
+        const c = &L.w.config;
+        try L.whole(try L.get("layers.{d}.input_layernorm.weight", .{i}), .bf16);
+        const in_norm = try L.put("layers.{d}.in_norm", .{i});
+        try L.whole(try L.get("layers.{d}.post_attention_layernorm.weight", .{i}), .bf16);
+        const post_norm = try L.put("layers.{d}.post_norm", .{i});
+        return .{
+            .index = i,
+            .attn_hc = try L.hc(i, "attn"),
+            .ffn_hc = try L.hc(i, "ffn"),
+            .in_norm = in_norm,
+            .post_norm = post_norm,
+            .mixer = switch (c.kind(i)) {
+                .kda => .{ .kda = try L.kda(i) },
+                .mla => .{ .mla = try L.dsa(i) },
+            },
+            .ffn = if (c.isMoe(i)) .{ .moe = try L.moeLayer(i) } else .{ .dense = try L.dense(i) },
+        };
     }
 };
 
-/// A half-open range of the `layers + 1` blocks; `hi` past the end clamps.
-pub const Range = struct { lo: usize = 0, hi: usize = 1 << 16 };
-
-/// Loads the embedding (with block 0), final norm and head (with the last), and
-/// blocks [lo, hi) onto the calling context's device.
-pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const Driver, dir: []const u8, range: Range) !*Weights {
-    const path = try std.fmt.allocPrint(gpa, "{s}/config.json", .{dir});
-    defer gpa.free(path);
-    const text = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 20));
-    defer gpa.free(text);
-    const c = try @import("config.zig").parse(gpa, text);
-
-    const w = try gpa.create(Weights);
-    errdefer {
-        w.deinit();
-        gpa.destroy(w);
-    }
-    w.* = .{ .gpa = gpa, .config = c, .layers = &.{} };
-
-    var ck = try core.checkpoint.Checkpoint.openModel(gpa, io, dir);
+/// weights.load without the MTP head: embedding, layers, final norm, the rank's BF16 head rows; `pack_dense`.
+pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, stream: cuda.Stream, tools: Tools, dir: []const u8, c: cfg.Config, share: shard.Share, layers: []const u32, with_mtp: bool) !Weights {
+    var w: Weights = .{ .gpa = gpa, .config = c, .share = share };
+    errdefer w.deinit();
+    var ck = try core.Checkpoint.openModelPrefix(gpa, io, dir, prefix);
     defer ck.close();
-    var L: Loader = .{ .gpa = gpa, .d = d, .c = &w.config, .w = w, .ck = &ck };
-
-    const blocks = c.layers + 1;
-    const lo = @min(range.lo, blocks);
-    const hi = @min(@max(range.hi, lo + 1), blocks);
-    w.blocks_lo = lo;
-    w.blocks_hi = hi;
-
+    var head_ck = try core.Checkpoint.openModelPrefix(gpa, io, dir, "lm_head.");
+    defer head_ck.close();
+    var L: Loader = .{ .gpa = gpa, .d = d, .stream = stream, .pack_dense = tools.pack_dense, .tools = tools, .w = &w, .ck = &ck };
+    defer L.host.deinit(gpa);
+    w.exl3 = ck.has(prefix ++ "layers.0.self_attn.qkv_proj.trellis");
     {
-        // the embedding now loads on BOTH split devices: the MTP draft head
-        // re-embeds its own last pick (one-ahead drafts for verify), which the
-        // head-side engine needs locally.
-        const t = try ck.get(prefix ++ "embed_tokens.weight");
-        if (t.dim(0) != c.vocab or t.dim(1) != c.hidden) return error.BadEmbed;
-        w.embed = try L.bf16(prefix ++ "embed_tokens.weight");
+        var nbf: [192]u8 = undefined;
+        const moe0 = try std.fmt.bufPrint(&nbf, "{s}layers.{d}.mlp.experts.0.gate_proj.trellis", .{ prefix, c.dense_layers });
+        w.exl3_experts = ck.has(moe0);
     }
-    // the head and final norm always load (the split's last device owns them
-    // exclusively; small enough to double-load during bring-up)
-    w.final_norm = try L.bf16(prefix ++ "norm.weight");
-    const ht = try ck.get("lm_head.weight");
-    if (ht.dim(1) != c.hidden) return error.BadHead;
-    w.head = try L.bf16("lm_head.weight");
-
-    const layers = try gpa.alloc(Layer, hi - lo);
-    for (lo..hi) |bi| layers[bi - lo] = try L.block(bi);
-    w.layers = layers;
+    w.layers = try gpa.alloc(Layer, layers.len);
+    for (layers, w.layers) |i, *l| {
+        if (i >= c.layers) return error.BadLayer;
+        l.* = try L.layer(i);
+        ck.release(); // a rank reads about half the checkpoint: its pages would crowd the GPU's allocations out
+    }
+    try L.whole(try L.get("embed_tokens.weight", .{}), .bf16);
+    w.embed = try L.put("embed", .{});
+    try L.whole(try L.get("norm.weight", .{}), .bf16);
+    w.norm = try L.put("norm", .{});
+    if (w.exl3) {
+        w.head = .{ .q = try x3.matrix(&L, &head_ck, "lm_head", 0, 0, &.{.{ .lo = share.vocab.lo, .hi = share.vocab.hi }}) };
+        // EXL3 keeps the MTP layer in mtp.safetensors or, in some quants, in the shards
+        if (with_mtp and c.mtp > 0) ck.add(dir, "mtp.safetensors") catch |e| if (e != error.FileNotFound) return e;
+    } else {
+        try L.rows(try head_ck.get("lm_head.weight"), share.vocab.lo, share.vocab.hi, c.vocab, .bf16);
+        if (blk: {
+            const v0 = std.c.getenv("TF_GLM_HEAD_FP4");
+            break :blk v0 == null or !std.mem.eql(u8, std.mem.span(v0.?), "0");
+        }) {
+            // the head GPU-quantized to NVFP4 at load (the MTP layer's recipe, fp4()'s lane packing): 4x fewer
+            // head bytes a verify reads; TF_GLM_HEAD_FP4=0 keeps BF16.
+            {
+                const qk = L.tools.quant orelse return error.NoQuantizer;
+                const n = share.vocab.len();
+                const k = c.hidden;
+                var wb = try L.scratch(n * k * 2);
+                defer wb.free();
+                try wb.upload(0, L.host.items);
+                L.w.head_b16_for_draft = try L.put("head.b16.draft", .{}); // mtp()'s 4-bit draft head reads the bf16 rows
+                var cb = try L.scratch(n * k / 2);
+                defer cb.free();
+                var sb = try L.scratch(n * k / 16);
+                defer sb.free();
+                var gb = try L.scratch(4);
+                defer gb.free();
+                try quant.nvfp4(qk, L.stream, wb.ptr, 1, n, k, cb.ptr, sb.ptr, gb.ptr);
+                const npad = cuda.nvfp4.padded(n);
+                const kg = k / 64;
+                const total: u64 = @as(u64, npad / 64) * kg * 512;
+                const words = try cuda.DeviceBuffer.alloc(L.d, total * 4);
+                try L.w.buffers.append(L.gpa, words);
+                try L.w.named.append(L.gpa, .{ .name = try std.fmt.allocPrint(L.gpa, "head.words", .{}), .ptr = words.ptr, .len = words.len });
+                var args: cuda.Args = .{};
+                args.add(cb.ptr);
+                for ([_]usize{ n, k / 8, kg }) |v| args.add(@as(c_int, @intCast(v)));
+                args.add(words.ptr);
+                args.add(@as(c_longlong, @intCast(total)));
+                try cuda.launch.launch(L.pack_dense, .{ .grid = .{ .x = @intCast((total + 255) / 256) }, .block = .{ .x = 256 } }, L.stream, &args);
+                const scales = try L.gpa.alloc(u8, n * k / 16);
+                defer L.gpa.free(scales);
+                try sb.download(0, scales);
+                try L.host.resize(L.gpa, npad * k / 16);
+                cuda.nvfp4.packScales(L.host.items, scales, n, k);
+                const bs = try L.put("head.fp4.scales", .{});
+                var g4: [4]u8 = undefined;
+                try gb.download(0, g4[0..4]);
+                const gs: f32 = @bitCast(std.mem.readInt(u32, g4[0..4], .little));
+                w.head = .{ .q = .{ .nvfp4 = cuda.nvfp4.weight(words.ptr, bs, gs, n, k) } };
+            }
+        } else w.head = .{ .b16 = try L.put("head", .{}) };
+    }
+    if (with_mtp and c.mtp > 0) w.mtp = try L.mtp();
     return w;
+}
+
+test "bf16 rounding of fp32 is to nearest even" {
+    try std.testing.expectEqual(@as(u16, 0x3f80), toBf16(1.0));
+    try std.testing.expectEqual(@as(u16, 0x3f80), toBf16(@bitCast(@as(u32, 0x3f808000)))); // a tie to even (down)
+    try std.testing.expectEqual(@as(u16, 0x3f82), toBf16(@bitCast(@as(u32, 0x3f818000)))); // a tie to even (up)
+    try std.testing.expectEqual(@as(u16, 0x3f81), toBf16(@bitCast(@as(u32, 0x3f808001))));
 }

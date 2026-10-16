@@ -47,6 +47,12 @@ pub const Stacks = struct {
 pub const Experts = struct {
     mod: Module,
     decode_fn: Function, // every width and codebook
+    mma_rot_in_fn: Function = undefined, // the mixed-width mma decode pass (ported skeleton)
+    mma_grouped16_fn: Function = undefined,
+    mma_grouped64_fn: Function = undefined,
+    mma_grouped32_fn: Function = undefined,
+    mma_gateup_fn: Function = undefined,
+    mma_down_fn: Function = undefined,
     prompt_fn: Function, // prompt rows on the tensor units
     resident: [2]usize, // blocks the grid may hold, decode and prompt: per SM times SMs
 
@@ -56,7 +62,27 @@ pub const Experts = struct {
         errdefer mod.unload();
         const decode = try mod.function("tf_exl3_experts");
         const prompt = try mod.function("tf_exl3_experts_prompt");
-        const e: Experts = .{ .mod = mod, .decode_fn = decode, .prompt_fn = prompt, .resident = .{ @max(1, try decode.occupancy(256, 0)) * sms, @max(1, try prompt.occupancy(256, 0)) * sms } };
+        // the mixed-width mma decode pass (the same fatbin; tf_exl3m_* in exl3_experts.cu)
+        const mma: struct { rot: Function, g: Function, g64: Function, g32: Function, gu: Function, dn: Function } = .{
+            .rot = try mod.function("tf_exl3m_rot_in"),
+            .g = try mod.function("tf_exl3m_grouped16"),
+            .g64 = try mod.function("tf_exl3m_grouped64"),
+            .g32 = try mod.function("tf_exl3m_grouped32"),
+            .gu = try mod.function("tf_exl3m_gateup"),
+            .dn = try mod.function("tf_exl3m_down"),
+        };
+        const e: Experts = .{
+            .mod = mod,
+            .decode_fn = decode,
+            .prompt_fn = prompt,
+            .resident = .{ @max(1, try decode.occupancy(256, 0)) * sms, @max(1, try prompt.occupancy(256, 0)) * sms },
+            .mma_rot_in_fn = mma.rot,
+            .mma_grouped16_fn = mma.g,
+            .mma_grouped64_fn = mma.g64,
+            .mma_grouped32_fn = mma.g32,
+            .mma_gateup_fn = mma.gu,
+            .mma_down_fn = mma.dn,
+        };
         return e;
     }
 
@@ -93,6 +119,99 @@ pub const Experts = struct {
     /// Per-matrix mixed-width descriptors (our fork); 0 = uniform (their behavior).
     pub fn runMixed(e: *const Experts, s: Stream, epi: experts.Epi, in: experts.Rows, l: experts.Layer, p: grouped.Plan, out: u64, items: usize, skip: i32, mats_desc: u64) !void {
         return e.runInner(s, epi, in, l, p, out, items, skip, false, mats_desc);
+    }
+
+    /// The mma pass's item shape: 16 pairs (the default), 32 or 64 (TF_GLM_MMA_MT).
+pub const MmaTile = enum { mt16, mt32, mt64 };
+
+/// The mixed-width mma decode pass (the skeleton of pr/glm-flash-cuda @ 3c6ed009's glm/exl3.cu, our tiles):
+    /// X rows -> the pairs' gate and up rotations, both mma passes, the gate/up epilogue with the down input
+    /// rotation, and the down epilogue into the ey slot rows. SK K-splits a pass.
+    pub fn mmaMixed(e: *const Experts, s: Stream, x: u64, x_stride: usize, rows: usize, slots: usize, pick: u64, suh_g: u64, suh_u: u64, svh_g: u64, svh_u: u64, suh_d: u64, svh_d: u64, mats_up: u64, mats_down: u64, plan: grouped.Plan, items: usize, z: u64, xg: u64, xu: u64, xd: u64, ey: u64, width: usize, dims: usize, limit: f32, book: c_uint, skip: i32, wide: MmaTile) !void {
+                // SK=8 measured best at ALL stream counts (adaptive-SK to 2 at multi-stream dropped
+        // aggregate 40-47%: the expert kernel needs the split parallelism even at high rows)
+        const sk: usize = if (std.c.getenv("TF_GLM_MMA_SK") != null) blk: {
+            const v = std.c.getenv("TF_GLM_MMA_SK").?;
+            break :blk std.fmt.parseInt(usize, std.mem.span(v), 10) catch 8;
+        } else 8;
+        const p = rows * slots;
+        {
+            var a: launch_.Args = .{};
+            a.add(x);
+            a.add(@as(i32, @intCast(x_stride)));
+            a.add(@as(i32, @intCast(slots)));
+            a.add(pick);
+            a.add(suh_g);
+            a.add(suh_u);
+            a.add(xg);
+            a.add(xu);
+            a.add(@as(i32, @intCast(dims)));
+            a.add(skip);
+            try launch_.launch(e.mma_rot_in_fn, .{ .grid = .{ .x = @intCast(p), .y = @intCast(dims / 128), .z = 2 }, .block = .{ .x = 32 } }, s, &a);
+        }
+        {
+            var a: launch_.Args = .{};
+            a.add(xg);
+            a.add(xu);
+            a.add(mats_up);
+            a.add(plan.items);
+            a.add(plan.counts);
+            a.add(plan.members);
+            a.add(z);
+            a.add(@as(i32, @intCast(width)));
+            a.add(@as(i32, @intCast(p)));
+            a.add(@as(c_int, @intCast(sk)));
+            a.add(skip);
+            a.add(@as(c_uint, book));
+            a.add(@as(c_int, 2));
+            if (wide == .mt32) try launch_.launch(e.mma_grouped32_fn, .{ .grid = .{ .x = @intCast(items), .y = @intCast(width / 32), .z = @intCast(2 * sk) }, .block = .{ .x = 128 }, .shared = 32 * 4 + 4 * 32 * 32 * 4 }, s, &a) else if (wide == .mt64) try launch_.launch(e.mma_grouped64_fn, .{ .grid = .{ .x = @intCast(items), .y = @intCast(width / 16), .z = @intCast(2 * sk) }, .block = .{ .x = 128 }, .shared = 64 * 4 + 4 * 64 * 16 * 4 }, s, &a) else try launch_.launch(e.mma_grouped16_fn, .{ .grid = .{ .x = @intCast(items), .y = @intCast(width / 128), .z = @intCast(2 * sk) }, .block = .{ .x = 128 }, .shared = 16 * 4 + 4 * 16 * 128 * 4 }, s, &a);
+        }
+        {
+            var a: launch_.Args = .{};
+            a.add(z);
+            a.add(pick);
+            a.add(svh_g);
+            a.add(svh_u);
+            a.add(suh_d);
+            a.add(xd);
+            a.add(@as(i32, @intCast(p)));
+            a.add(@as(i32, @intCast(width)));
+            a.add(@as(c_int, @intCast(sk)));
+            a.add(limit);
+            a.add(skip);
+            try launch_.launch(e.mma_gateup_fn, .{ .grid = .{ .x = @intCast(p), .y = @intCast(width / 128) }, .block = .{ .x = 32 } }, s, &a);
+        }
+        {
+            var a: launch_.Args = .{};
+            a.add(xd);
+            a.add(xd);
+            a.add(mats_down);
+            a.add(plan.items);
+            a.add(plan.counts);
+            a.add(plan.members);
+            a.add(z);
+            a.add(@as(i32, @intCast(dims)));
+            a.add(@as(i32, @intCast(p)));
+            a.add(@as(c_int, @intCast(sk)));
+            a.add(skip);
+            a.add(@as(c_uint, book));
+            a.add(@as(c_int, 1));
+            if (wide == .mt32) try launch_.launch(e.mma_grouped32_fn, .{ .grid = .{ .x = @intCast(items), .y = @intCast(dims / 32), .z = @intCast(sk) }, .block = .{ .x = 128 }, .shared = 32 * 4 + 4 * 32 * 32 * 4 }, s, &a) else if (wide == .mt64) try launch_.launch(e.mma_grouped64_fn, .{ .grid = .{ .x = @intCast(items), .y = @intCast(dims / 16), .z = @intCast(sk) }, .block = .{ .x = 128 }, .shared = 64 * 4 + 4 * 64 * 16 * 4 }, s, &a) else try launch_.launch(e.mma_grouped16_fn, .{ .grid = .{ .x = @intCast(items), .y = @intCast(dims / 128), .z = @intCast(sk) }, .block = .{ .x = 128 }, .shared = 16 * 4 + 4 * 16 * 128 * 4 }, s, &a);
+        }
+        {
+            var a: launch_.Args = .{};
+            a.add(z);
+            a.add(pick);
+            a.add(svh_d);
+            a.add(ey);
+            a.add(@as(i32, @intCast(p)));
+            a.add(@as(i32, @intCast(dims)));
+            a.add(@as(c_int, @intCast(sk)));
+            a.add(@as(i32, @intCast(slots)));
+            a.add(@as(i32, @intCast(slots)));
+            a.add(skip);
+            try launch_.launch(e.mma_down_fn, .{ .grid = .{ .x = @intCast(p), .y = @intCast(dims / 128) }, .block = .{ .x = 32 } }, s, &a);
+        }
     }
 
     pub fn run(e: *const Experts, s: Stream, epi: experts.Epi, in: experts.Rows, l: experts.Layer, p: grouped.Plan, out: u64, items: usize, skip: i32, prompt: bool) !void {
