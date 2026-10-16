@@ -628,6 +628,7 @@ pub const Forward = struct {
             const l = r0.w.layers[j];
             try fA.pre(ranks_a[0], l.attn_hc, l.in_norm, a);
             if (a > 0) try fA.mixer(ranks_a[0], l, li, di, a, nch_a, slot(ranks_a[0], a));
+            if (std.c.getenv("TF_GLM_WAVE_DUMP") != null and dump_rounds == 1 and j == 0 and a > 0) kdaDump(f, &ranks_a[0], li, "A");
             if (w.sync) {
                 // bisect: identical ops to the danced path, but ordered on one stream - if this
                 // matches eager the bug is the event choreography; if not, the scratch or clones
@@ -667,6 +668,7 @@ pub const Forward = struct {
                     try fB.post(ranks_b[0], br);
                 }
             }
+            if (std.c.getenv("TF_GLM_WAVE_DUMP") != null and dump_rounds == 1 and j == 0 and br > 0) kdaDump(f, &ranks_b[0], li, "B");
             try f.pre(r0, l.ffn_hc, l.post_norm, R);
             try f.ffn(r0, l, R, slot(r0, R));
             try f.gather(R);
@@ -721,6 +723,24 @@ pub const Forward = struct {
         f.stream.synchronize() catch {};
         const h = std.hash.XxHash64.hash(0, @as([*]const u8, @ptrCast(host))[0..bytes]);
         std.log.info("LAYERDUMP r{d} -- {s} {x: >16}", .{ dump_rounds, what, h });
+    }
+
+    /// Layer-0 KDA fingerprint after a group's mixer: saves, conv state, both ring halves.
+    fn kdaDump(f: *const Forward, r: *const Rank, li: usize, tag: []const u8) void {
+        const st = r.st;
+        const h = st.heads;
+        const dk = 128; // kda.dk
+        const kv = li * window_rows * h * dk;
+        var buf: [16]u8 = undefined;
+        const t = std.fmt.bufPrint(&buf, "kda{s}", .{tag}) catch return;
+        dumpBytes(f, st.save_k + kv * 4, window_rows * h * dk * 4, t);
+        dumpBytes(f, st.save_v + kv * 2, window_rows * h * dk * 2, t);
+        dumpBytes(f, st.save_g + kv * 4, window_rows * h * dk * 4, t);
+        dumpBytes(f, st.save_b + li * window_rows * h * 4, window_rows * h * 4, t);
+        dumpBytes(f, st.conv + li * 3 * st.conv_c * 2, 3 * st.conv_c * 2, t);
+        dumpBytes(f, st.recAt(0, li), st.rec_layer, t);
+        dumpBytes(f, st.recAt(1, li), st.rec_layer, t);
+        std.log.info("LAYERDUMP kdastate {s} li={d} cur={} rec_layer={d}", .{ tag, li, st.cur[li], st.rec_layer });
     }
 
     fn waveGather(ex: Exchange, stream: cuda.Stream, send: u64, recv: u64, count: usize) !void {
@@ -822,6 +842,7 @@ pub const Forward = struct {
                 const l = r.w.layers[j];
                 try f.pre(r, l.attn_hc, l.in_norm, R);
                 if (r.segs.len > 0) try shared.mixer(f, r, l, li, di, R, slot(r, R)) else try f.mixer(r, l, li, di, R, @min(latent.chunksFor(r.st.pos + R), r.b.nch), slot(r, R));
+                if (std.c.getenv("TF_GLM_WAVE_DUMP") != null and dump_rounds == 1 and j == 0) kdaDump(f, &r, li, "E");
             }
             try f.gather(R);
             for (f.ranks) |r| {
