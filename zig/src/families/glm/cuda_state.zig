@@ -236,7 +236,9 @@ pub const State = struct {
     gpa: std.mem.Allocator,
     capacity: usize,
     pos: usize = 0,
-    pending: usize = 0, // rows of the last forward, until its commit
+    pending: usize = 0,
+    last_wave: bool = false, // the last window ran the two-group wave: commit keeps its ring parity
+    wave_preserve: u64 = 0, // that round preserved its pre-round ring half here for commit's replay // rows of the last forward, until its commit
     prompt: bool = false, // whether that forward was a prompt chunk
     pos_dev: u64, // i32
     conv: u64, // bf16 [kda layers][3][3 heads 128]
