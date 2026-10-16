@@ -211,7 +211,7 @@ pub const Forward = struct {
             .shm => |sh| {
                 const r = f.ranks[0];
                 const count = rows * c.hidden;
-                if (r.segs.len > 1 and count > rows_one_stream and count <= sh.slot_units) { // segs.len: a 9-row solo window also passes the size test, and that path corrupts
+                if (count <= sh.slot_units) { // any decode-sized payload: the old solo-corruption was the split-exchange bug (fixed), not this kernel
                     // multi-stream only: the engine's single-stream shm path corrupts (deterministic;
                     // the standalone kernel + graph test passes, so it's the engine integration)
                     var a: cuda.Args = .{};

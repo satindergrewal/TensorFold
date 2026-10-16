@@ -47,7 +47,7 @@ const Seq = struct {
     rows_at: u64 = 0, // its last verify's final-norm rows (bf16 [rows][hidden]), which the next draft reads
 };
 
-const GraphKey = struct { slot: u32, rows: u8 };
+const GraphKey = struct { slot: u32, rows: u8, parity: u8 };
 const VerifyGraph = struct { exec: cuda.graph.Exec, nch: usize };
 
 /// One rank's copy of a kept prompt state: the state arena's bytes and the host fields beside them.
@@ -446,12 +446,16 @@ pub const Engine = struct {
     /// A verify window: `ids` (pending token, then drafts) at the committed position; `out[r]` drawn at pos + 1 + r.
     pub fn verify(e: *Engine, ids: []const u32, out: []u32) !void {
         if (ids.len == 0 or ids.len > fw.window_rows) return error.WindowTooWide;
-        const key: GraphKey = .{ .slot = e.slot, .rows = @intCast(ids.len) };
         const nch_now = @min(latent.chunksFor(e.cur.st.pos + ids.len), e.bd.nch);
+        // graphs cover the dense phase only: pos + rows below the key width, where no layer runs
+        // its sparse indexer and every grid is static (the sparse phase's branch and pool grid
+        // depend on the position as host values, which a capture would bake)
+        const dense_phase = e.cur.st.pos + ids.len < e.c.keyWidth();
+        const key: GraphKey = .{ .slot = e.slot, .rows = @intCast(ids.len), .parity = @as(u8, e.cur.st.cur[0]) };
         // Opt-in while the replay still diverges from eager by one input (deterministic since the
         // pinned staging + exact-nch keying; 161.8 tok/s vs 91.6 eager when running - the remaining
         // baked input is the next session's instrumented eager-vs-graph logits diff).
-        if (std.c.getenv("TF_GLM_GRAPHS") != null) {
+        if (std.c.getenv("TF_GLM_GRAPHS") != null and dense_phase) {
             if (e.graphs.getPtr(key)) |g| {
                 if (g.nch == nch_now) { // exact: the indexer score path reads garbage for chunks past
                     // its own range, so a replay may only cover exactly the nch this round needs
