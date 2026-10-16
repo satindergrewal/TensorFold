@@ -168,6 +168,8 @@ pub const Shm = struct {
 pub const Wave = struct {
     scratch: u64,
     pos2: u64,
+    split: usize, // TF_GLM_WAVE_SPLIT: group A's rows (0: R/2); R skips group B entirely (bisect)
+    sync: bool = false, // TF_GLM_WAVE_SYNC=1: gathers on the main stream, no events (bisect the dance)
     preserve: u64, // the round's pre-round KDA ring half, saved for commit's partial-keep replay
     preserve_len: usize,
     side: cuda.Stream,
@@ -562,23 +564,30 @@ pub const Forward = struct {
     /// The ffn site stays whole in v1. The KDA ring recurrence stays ordered by launching
     /// A before B on the main stream.
     fn wholeWave(f: *const Forward, w: *const Wave, R: usize) !void {
+        if (std.c.getenv("TF_GLM_WAVE_QUIET") == null) std.log.info("wave round: {d} rows", .{R});
         const c = &f.ranks[0].w.config;
         const r0 = f.ranks[0];
         const D = c.hidden;
-        const a = R / 2;
+        var a = R / 2;
+        if (w.split != 0) a = @min(w.split, R);
         const br = R - a;
         // a memset, never an async copy from a stack word: the copy could outlive this frame
-        const p2v: u32 = @bitCast(@as(i32, @intCast(r0.st.pos + a)));
-        try f.d.check(f.d.api.cuMemsetD32Async(w.pos2, p2v, 1, f.stream.handle), "Memset pos2");
+        if (R - a < R) {
+            const p2v: u32 = @bitCast(@as(i32, @intCast(r0.st.pos + a)));
+            try f.d.check(f.d.api.cuMemsetD32Async(w.pos2, p2v, 1, f.stream.handle), "Memset pos2");
+        } // A-only bisect: no group B, so pos2 stays untouched - the entry ops are then no-ops
         // the wave's second launch overwrites BOTH ring halves: keep the pre-round half for the
-        // partial-keep replay commit may need (rejections are common)
-        const half_bytes = r0.st.kda_layers * r0.st.rec_layer;
-        if (half_bytes > w.preserve_len) {
-            std.log.err("wave: preserve buffer {d} < half {d} (layers {d}, rec_layer {d})", .{ w.preserve_len, half_bytes, r0.st.kda_layers, r0.st.rec_layer });
-            return error.WavePreserveTooSmall;
+        // partial-keep replay commit may need (rejections are common). A single-group wave writes
+        // the ring exactly like eager, so the preserve and the wave parity only apply to two groups.
+        if (R - a < R) {
+            const half_bytes = r0.st.kda_layers * r0.st.rec_layer;
+            if (half_bytes > w.preserve_len) {
+                std.log.err("wave: preserve buffer {d} < half {d} (layers {d}, rec_layer {d})", .{ w.preserve_len, half_bytes, r0.st.kda_layers, r0.st.rec_layer });
+                return error.WavePreserveTooSmall;
+            }
+            try f.d.check(f.d.api.cuMemcpyDtoDAsync_v2(w.preserve, r0.st.recAt(r0.st.cur[0], 0), half_bytes, f.stream.handle), "preserve ring");
+            r0.st.wave_preserve = w.preserve;
         }
-        try f.d.check(f.d.api.cuMemcpyDtoDAsync_v2(w.preserve, r0.st.recAt(r0.st.cur[0], 0), half_bytes, f.stream.handle), "preserve ring");
-        r0.st.wave_preserve = w.preserve;
         var flipped: [128]u1 = undefined;
         for (r0.st.cur, 0..) |v, i| { if (i < flipped.len) flipped[i] = 1 - v; }
         const nch_a = @min(latent.chunksFor(r0.st.pos + a), r0.b.nch);
@@ -586,7 +595,8 @@ pub const Forward = struct {
         const hl = r0.st.caches.len;
         const part_b = a * nch_b * hl * c.kv_lora * 4; // bytes: group B's partials past A's
         var bA = r0.b.*;
-        bA.gathered = w.scratch;
+        if (R - a < R) bA.gathered = w.scratch; // a lone full-window group keeps the real gathered:
+        // bisect - if A-only still differs from eager with the real buffer, the bug is outside wholeWave
         var bB = groupBuffers(f, r0.b, a, w.scratch + 2 * a * D * 4, part_b);
         var stA = r0.st.*;
         var stB = groupState(r0.st, a, w.pos2, &flipped);
@@ -605,21 +615,46 @@ pub const Forward = struct {
         for (r0.w.layers, 0..) |_, j| {
             const l = r0.w.layers[j];
             try fA.pre(ranks_a[0], l.attn_hc, l.in_norm, a);
-            try fA.mixer(ranks_a[0], l, li, di, a, nch_a, slot(ranks_a[0], a));
-            try w.ev[0].record(f.stream);
-            try fB.pre(ranks_b[0], l.attn_hc, l.in_norm, br);
-            try fB.mixer(ranks_b[0], l, li, di, br, nch_b, slot(ranks_b[0], br));
-            try w.ev[2].record(f.stream);
-            try w.side.wait(w.ev[0]);
-            try waveGather(f.exchange, w, w.scratch + r0.w.share.rank * a * D * 4, w.scratch, a * D);
-            try w.ev[1].record(w.side);
-            try w.side.wait(w.ev[2]);
-            try waveGather(f.exchange, w, w.scratch + 2 * a * D * 4 + r0.w.share.rank * br * D * 4, w.scratch + 2 * a * D * 4, br * D);
-            try w.ev[3].record(w.side);
-            try f.stream.wait(w.ev[1]);
-            try fA.post(ranks_a[0], a);
-            try f.stream.wait(w.ev[3]);
-            try fB.post(ranks_b[0], br);
+            if (a > 0) try fA.mixer(ranks_a[0], l, li, di, a, nch_a, slot(ranks_a[0], a));
+            if (w.sync) {
+                // bisect: identical ops to the danced path, but ordered on one stream - if this
+                // matches eager the bug is the event choreography; if not, the scratch or clones
+                if (a > 0) {
+                    try waveGather(f.exchange, f.stream, bA.gathered + r0.w.share.rank * a * D * 4, bA.gathered, a * D);
+                    try fA.post(ranks_a[0], a);
+                }
+                if (br > 0) {
+                    try fB.pre(ranks_b[0], l.attn_hc, l.in_norm, br);
+                    try fB.mixer(ranks_b[0], l, li, di, br, nch_b, slot(ranks_b[0], br));
+                    try waveGather(f.exchange, f.stream, w.scratch + 2 * a * D * 4 + r0.w.share.rank * br * D * 4, w.scratch + 2 * a * D * 4, br * D);
+                    try fB.post(ranks_b[0], br);
+                }
+            } else {
+                try w.ev[0].record(f.stream);
+                if (br > 0) {
+                    try fB.pre(ranks_b[0], l.attn_hc, l.in_norm, br);
+                    try fB.mixer(ranks_b[0], l, li, di, br, nch_b, slot(ranks_b[0], br));
+                }
+                try w.ev[2].record(f.stream);
+                try w.side.wait(w.ev[0]);
+                if (a > 0) {
+                    try waveGather(f.exchange, w.side, bA.gathered + r0.w.share.rank * a * D * 4, bA.gathered, a * D);
+                    try w.ev[1].record(w.side);
+                }
+                try w.side.wait(w.ev[2]);
+                if (br > 0) {
+                    try waveGather(f.exchange, w.side, w.scratch + 2 * a * D * 4 + r0.w.share.rank * br * D * 4, w.scratch + 2 * a * D * 4, br * D);
+                    try w.ev[3].record(w.side);
+                }
+                if (a > 0) {
+                    try f.stream.wait(w.ev[1]);
+                    try fA.post(ranks_a[0], a);
+                }
+                if (br > 0) {
+                    try f.stream.wait(w.ev[3]);
+                    try fB.post(ranks_b[0], br);
+                }
+            }
             try f.pre(r0, l.ffn_hc, l.post_norm, R);
             try f.ffn(r0, l, R, slot(r0, R));
             try f.gather(R);
@@ -630,14 +665,14 @@ pub const Forward = struct {
             }
         }
         try glue.streamMean(f.set(), f.stream, r0.b.x, r0.b.hidden, R, c.hidden, c.hc);
-        r0.st.last_wave = true;
+        r0.st.last_wave = R - a != R; // a lone full-window group writes the ring like eager
     }
 
-    fn waveGather(ex: Exchange, w: *const Wave, send: u64, recv: u64, count: usize) !void {
+    fn waveGather(ex: Exchange, stream: cuda.Stream, send: u64, recv: u64, count: usize) !void {
         switch (ex) {
             .local => return error.WaveNeedsExchange,
-            .nccl => |x| try x.lib.check(x.lib.api.ncclAllGather(send, recv, count, .f32, x.comm, w.side.handle), "waveGather"),
-            .shm => |x| try x.lib.check(x.lib.api.ncclAllGather(send, recv, count, .f32, x.comm, w.side.handle), "waveGather"),
+            .nccl => |x| try x.lib.check(x.lib.api.ncclAllGather(send, recv, count, .f32, x.comm, stream.handle), "waveGather"),
+            .shm => |x| try x.lib.check(x.lib.api.ncclAllGather(send, recv, count, .f32, x.comm, stream.handle), "waveGather"),
         }
     }
 
@@ -684,7 +719,7 @@ pub const Forward = struct {
         b.dsa.q = src.dsa.q + off * mla_heads * mla_qk * 2;
         b.dsa.ikr = src.dsa.ikr + off * (c.i_dim + c.i_heads) * 2;
         b.dsa.igr = src.dsa.igr + off * c.i_dim * 4;
-        b.dsa.router_part = src.dsa.router_part + off * 128 * 4;
+        b.dsa.router_part = src.dsa.router_part + off * @max(c.experts, c.i_dim) * 4; // the row stride is the expert count (288), not i_dim
         b.dsa.qa = src.dsa.qa + off * mla_heads * lw * 2;
         b.dsa.ol = src.dsa.ol + off * mla_heads * lw * 2;
         b.dsa.vn = src.dsa.vn + off * mla_heads * mla_dv * 2;
