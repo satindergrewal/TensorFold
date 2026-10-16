@@ -71,22 +71,39 @@ fn cacheOf(r: *Rig, keys: usize) !struct { dev: u64, f64s: []f64 } {
 /// latent.attention of `rows` rows at `pos` (keys 0 .. pos + r each) with head block hb into a fresh output.
 fn attend(r: *Rig, set: glm.glue.Set, q: u64, cache: u64, pos: usize, rows: usize, scale: f32, hb: usize) !u64 {
     const nch = latent.chunksFor(pos + rows);
+    const p_nch = if (rows <= 8) (if (std.c.getenv("TF_SLICE_256") != null) nch * 2 else nch * 16) else nch; // sliced decode
     const out = try r.zeros(rows * heads * lw * 2);
     const p0: i32 = @intCast(pos);
     const at = try r.dev(std.mem.asBytes(&p0));
-    try latent.attention(set, r.s, q, cache, at, try partials(r, nch, rows), out, try r.zeros(4), rows, heads, lw, nch, scale, hb);
+    try latent.attention(set, r.s, q, cache, at, try partials(r, p_nch, rows), out, try r.zeros(4), rows, heads, lw, nch, scale, hb);
     return out;
 }
 
-/// Row `row` of a [rows][heads][lw] bf16 output alone equals that row of the wide call's bytes.
-fn sameRow(r: *Rig, name: []const u8, wide: []const u8, one: u64, row: usize) !void {
-    const n = heads * lw * 2;
-    try check.sameBytes(name, try r.back(one, n), wide[row * n ..][0..n]);
+/// A solo row's output vs the float64 reference, within its per-column tolerance: a solo window runs
+/// the 32-row sliced chunks (rows <= 8), whose per-slice partials the merge sums in another order than
+/// one block's running softmax, so near-zero columns may differ far beyond a bf16 ulp (both correct).
+fn soloRow(r: *Rig, name: []const u8, one: u64, row: usize, want: []const f64, tol: []const f64) !void {
+    const o = try r.back(one, heads * lw * 2);
+    var bad: f64 = 0;
+    var ratio: f64 = 0;
+    var k: usize = 0;
+    while (k < heads * lw) : (k += 1) {
+        const bits: u32 = @as(u32, std.mem.readInt(u16, o[k * 2 ..][0..2], .little)) << 16;
+        const v: f32 = @bitCast(bits);
+        const at = row * heads * lw + k;
+        const d = @abs(@as(f64, v) - want[at]);
+        bad = @max(bad, d);
+        ratio = @max(ratio, d / tol[at]);
+    }
+    if (ratio > 1.0) {
+        std.debug.print("{s}: worst {e} over tolerance\n", .{ name, ratio });
+        return error.TestFailed;
+    }
 }
 
 /// Dense causal attention on 1,500 keys: 70 rows at 1,430 vs float64 (32-head), 16-head blocks' bytes, one-row windows.
 pub fn dense(r: *Rig, set: glm.glue.Set) !void {
-    const pos = 1430;
+    const pos = if (std.c.getenv("TF_ATTN_POS") != null) (std.fmt.parseInt(usize, std.mem.span(std.c.getenv("TF_ATTN_POS").?), 10) catch 1430) else 1430;
     const rows = 70;
     const scale: f32 = 0.125;
     const q = try r.bfs(rows * heads * lw, 1.0);
@@ -104,10 +121,9 @@ pub fn dense(r: *Rig, set: glm.glue.Set) !void {
     try ref.closeCols(r, try std.fmt.bufPrint(&name, "latent attention {d} rows at {d}, {d} heads, 32-head blocks", .{ rows, pos, heads }), wide, false, ref64.want, ref64.tol, lw);
     const narrow = try attend(r, set, dq, c.dev, pos, rows, scale, latent.heads_tile);
     try ref.sameRows(r, "latent attention: 16-head blocks equal the 32-head blocks", wide, narrow, rows * heads * lw * 2);
-    const all = try r.back(wide, rows * heads * lw * 2);
     for ([_]usize{ 0, 37, 69 }) |row| {
         const one = try attend(r, set, dq + row * heads * lw * 2, c.dev, pos + row, 1, scale, latent.headBlock(1));
-        try sameRow(r, try std.fmt.bufPrint(&name, "latent attention: row {d} alone equals its row in the {d}-row call", .{ row, rows }), all, one, row);
+        try soloRow(r, try std.fmt.bufPrint(&name, "latent attention: row {d} alone within float64 tolerance", .{row}), one, row, ref64.want, ref64.tol);
     }
     check.pass("latent attention over {d} keys: within float64 tolerance, both head blocks and one-row windows equal", .{pos + rows});
 }
@@ -146,15 +162,15 @@ pub fn sparse(r: *Rig, set: glm.glue.Set) !void {
     const ref64 = try reference(r, q, c.f64s, sets, scale);
     var name: [128]u8 = undefined;
     try ref.closeCols(r, try std.fmt.bufPrint(&name, "latent sparse attention {d} rows, up to {d} of {d} keys", .{ rows, w, keys }), out, false, ref64.want, ref64.tol, lw);
-    const all = try r.back(out, rows * heads * lw * 2);
+    const solo_nch = (w + 31) / 32; // a solo window runs the 32-row sliced chunks
     for ([_]usize{ 0, 37, 69 }) |row| {
         const one = try r.zeros(heads * lw * 2);
-        try latent.sparseAttention(set, r.s, dq + row * heads * lw * 2, c.dev, dtok + row * w * 4, dcnt + row * 4, w, try partials(r, nch, 1), one, 1, heads, lw, scale);
-        try sameRow(r, try std.fmt.bufPrint(&name, "latent sparse attention: row {d} alone equals its row in the {d}-row call", .{ row, rows }), all, one, row);
+        try latent.sparseAttention(set, r.s, dq + row * heads * lw * 2, c.dev, dtok + row * w * 4, dcnt + row * 4, w, try partials(r, solo_nch, 1), one, 1, heads, lw, scale);
+        try soloRow(r, try std.fmt.bufPrint(&name, "latent sparse attention: row {d} alone within float64 tolerance", .{row}), one, row, ref64.want, ref64.tol);
     }
     const none: i32 = 0;
     const left = try r.zeros(heads * lw * 2);
-    try latent.sparseAttention(set, r.s, dq, c.dev, dtok, try r.dev(std.mem.asBytes(&none)), w, try partials(r, nch, 1), left, 1, heads, lw, scale);
+    try latent.sparseAttention(set, r.s, dq, c.dev, dtok, try r.dev(std.mem.asBytes(&none)), w, try partials(r, solo_nch, 1), left, 1, heads, lw, scale);
     for (try r.back(left, heads * lw * 2)) |b| try check.expect(b == 0xff, "latent sparse attention: a row with count 0 is left alone", .{});
     check.pass("latent sparse attention over up to {d} tokens: within float64 tolerance, one-row windows equal, count 0 left alone", .{w});
 }

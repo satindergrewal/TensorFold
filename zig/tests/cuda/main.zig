@@ -48,6 +48,7 @@ const usage =
     \\  nccl                      one-rank NCCL all-reduce and all-gather
     \\  rank-scatter <rank> <n> [id]  rank-order reduce-scatter (NCCL_COMM_ID or an id file) against an all-gather
     \\  nccl-pair <rank> <world> <idfile>  one rank of a multi-host communicator: send/recv with every peer, all-reduce, all-gather
+  \\  ipc-pair <rank> <world> <idfile>  two ranks map each other's buffers over cuIpc: slice copies + flag + wait-value
     \\  gdn-replay <dir>          replay_kernel bits against the Python oracle's fixture
     \\  gdn-tree <dir>            tree_kernel bits against the Python oracle's fixture
     \\  triton <dir>              a Triton cubin's bits against the Python oracle's fixture
@@ -128,6 +129,13 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "nccl")) return libs_tests.nccl(gpu);
     if (std.mem.eql(u8, cmd, "rank-scatter")) return rank_scatter_tests.run(gpu, try std.fmt.parseInt(usize, try arg(rest, 0), 10), try std.fmt.parseInt(usize, try arg(rest, 1), 10), if (rest.len > 2) rest[2] else null);
     if (std.mem.eql(u8, cmd, "nccl-pair")) return libs_tests.ncclPair(gpu, try std.fmt.parseInt(c_int, try arg(rest, 0), 10), try std.fmt.parseInt(c_int, try arg(rest, 1), 10), try arg(rest, 2));
+    if (std.mem.eql(u8, cmd, "mm16-check")) {
+        const n2 = try std.fmt.parseInt(usize, try arg(rest, 0), 10);
+        const k2 = try std.fmt.parseInt(usize, try arg(rest, 1), 10);
+        const m2 = try std.fmt.parseInt(usize, try arg(rest, 2), 10);
+        return libs_tests.mm16Check(gpu, n2, k2, m2);
+    }
+    if (std.mem.eql(u8, cmd, "ipc-pair")) return libs_tests.ipcPair(gpu, try std.fmt.parseInt(c_int, try arg(rest, 0), 10), try std.fmt.parseInt(c_int, try arg(rest, 1), 10), try arg(rest, 2));
     if (std.mem.eql(u8, cmd, "gdn-replay")) return oracle_tests.gdnReplay(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "gdn-tree")) return oracle_tests.gdnTree(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "triton")) return oracle_tests.tritonKernel(gpu, try arg(rest, 0));

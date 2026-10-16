@@ -49,8 +49,21 @@ template <int HB>
 constexpr int wide_smem() {
   return (HB * LW + 2 * KT * LW + HB * KT) * 2 + (HB * 4 + 2 * HB) * 4;
 }
-
+// NVFP4 adds a double-buffered staging tile of the packed e2m1 halves (256 bytes per row; the 32
+// bytes of e4m3 scales stay in global and convert reads them: sm_120's 99KB budget fits +16KB, not +18KB).
 template <int HB>
+constexpr int nvfp4_smem() {
+  return wide_smem<HB>() + 2 * KT * (LW / 2);
+}
+
+
+// NVFP4 helpers (TF_GLM_KV_NVFP4): e2m1's 8 magnitudes
+__device__ __forceinline__ float nvfp4_mag(unsigned char code) {
+  const float vals[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+  return (code & 8) ? -vals[code & 7] : vals[code & 7];
+}
+
+template <int HB, bool NVFP4 = false, int CHW = CH>
 __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* pos, const int* tok,
                             const int* cnt, float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w,
                             float scale, int sparse) {
@@ -61,20 +74,59 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
   __nv_bfloat16* ps = kvs + 2 * KT * LW;
   float* red = reinterpret_cast<float*>(ps + HB * KT);
   float* stat = red + HB * 4;
+  unsigned char* staging = reinterpret_cast<unsigned char*>(stat + 2 * HB);  // e2m1 tiles, 16B-aligned end
   const int t = threadIdx.x, lane = t & 31, warp = t >> 5, g = lane >> 2, q = lane & 3;
   const int kg = warp & 3, hh = warp >> 2;
   const int64_t r = blockIdx.x, h0 = (int64_t)blockIdx.y * HB, c = blockIdx.z;
-  const int64_t n = sparse ? cnt[r] : 0, limit = sparse ? 0 : (int64_t)pos[0] + r, start = c * CH;
+  const int64_t n = sparse ? cnt[r] : 0, limit = sparse ? 0 : (int64_t)pos[0] + r, start = c * CHW;
   const bool live = sparse ? start < n : start <= limit;
   auto load_kv = [&](int tile) {
     __nv_bfloat16* dst = kvs + (tile & 1) * KT * LW;
     const int64_t first = start + tile * KT;
-    for (int idx = t; idx < KT * (LW / 8); idx += blockDim.x) {
-      const int key = idx / (LW / 8), u = idx % (LW / 8);
-      const int64_t ki = first + key;
+    if (NVFP4) {
+      // Stage 1: cp.async the packed e2m1 halves (256B per row) into staging; the pipeline overlaps
+      // them with the previous tile's attention math. Source stride is the full 288-B cache row.
+      constexpr int RB = LW / 2 + LW / 16;  // cache row stride: 256 packed + 32 scale bytes
+      constexpr int RB8 = LW / 2;           // staged span: the packed bytes only
+      constexpr int CHUNKS = RB8 / 16;      // 16 x 16B per row
+      unsigned char* stage = staging + (tile & 1) * KT * RB8;
+      const unsigned char* lc8 = reinterpret_cast<const unsigned char*>(lc);
+      for (int idx = t; idx < KT * CHUNKS; idx += blockDim.x) {
+        const int key = idx / CHUNKS, chunk = idx % CHUNKS;
+        const int64_t ki = first + key;
+        const bool ok = sparse ? ki < n : ki <= limit;
+        const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
+        cp16(stage + key * RB8 + chunk * 16, lc8 + src * RB + chunk * 16, ok);
+      }
+    } else {
+      for (int idx = t; idx < KT * (LW / 8); idx += blockDim.x) {
+        const int key = idx / (LW / 8), u = idx % (LW / 8);
+        const int64_t ki = first + key;
+        const bool ok = sparse ? ki < n : ki <= limit;
+        const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
+        cp16(dst + wide(key, u), lc + src * LW + u * 8, ok);
+      }
+    }
+  };
+  // NVFP4 stage 2: after the cp.async wait, convert staged e2m1+scales to bf16 in the swizzled layout.
+  auto convert_kv = [&](int tile) {
+    constexpr int RB = LW / 2 + LW / 16;  // cache row stride
+    constexpr int RB8 = LW / 2;           // staged span
+    __nv_bfloat16* dst = kvs + (tile & 1) * KT * LW;
+    const unsigned char* stage = staging + (tile & 1) * KT * RB8;
+    const unsigned char* lc8 = reinterpret_cast<const unsigned char*>(lc);
+    const int64_t cfirst = start + tile * KT;
+    for (int idx = t; idx < KT * LW; idx += blockDim.x) {
+      const int key = idx / LW, u = idx % LW;
+      const int64_t ki = cfirst + key;
       const bool ok = sparse ? ki < n : ki <= limit;
       const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
-      cp16(dst + wide(key, u), lc + src * LW + u * 8, ok);
+      const unsigned char* row = stage + key * RB8;
+      __nv_fp8_e4m3 s8;
+      *reinterpret_cast<unsigned char*>(&s8) = *(lc8 + src * RB + (LW >> 1) + (u >> 4));
+      const float sc = __half2float(__half(s8));
+      const unsigned char code = (u & 1) ? (row[u >> 1] >> 4) & 0xF : row[u >> 1] & 0xF;
+      dst[wide(key, u >> 3) + (u & 7)] = __float2bfloat16_rn(nvfp4_mag(code) * sc);
     }
   };
   float m[MT][2], l[MT][2], o[MT][8][4];
@@ -83,7 +135,7 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
   for (int i = 0; i < MT; ++i)
     for (int j = 0; j < 8; ++j)
       for (int e = 0; e < 4; ++e) o[i][j][e] = 0.0f;
-  constexpr int tiles = CH / KT;
+  constexpr int tiles = CHW / KT;
   if (live) {
     for (int idx = t; idx < HB * (LW / 8); idx += blockDim.x) {
       const int hd = idx / (LW / 8), u = idx % (LW / 8);
@@ -96,11 +148,12 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
     commit();
   }
   for (int tile = 0; live && tile < tiles; ++tile) {
-    if (tile + 1 < tiles)
-      wait<1>();
-    else
-      wait<0>();
+    if (tile + 1 < tiles) wait<1>(); else wait<0>();
     __syncthreads();
+    if (NVFP4) {
+      convert_kv(tile);
+      __syncthreads();
+    }
     const __nv_bfloat16* kv = kvs + (tile & 1) * KT * LW;
     const int64_t first = start + tile * KT;
     float sc[4];
@@ -182,8 +235,11 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
     __syncthreads();
     for (int i = 0; i < MT; ++i)
       for (int hf = 0; hf < 2; ++hf) l[i][hf] = __fmaf_rn(l[i][hf], alpha[i][hf], stat[HB + i * 16 + hf * 8 + g]);
-    if (tile + 2 < tiles) load_kv(tile + 2);
-    commit();
+    if (tile + 2 < tiles) {
+      if (!NVFP4) __syncthreads();  // bf16 only: cp.async lands in kvs, P*V reads must be done
+      load_kv(tile + 2);
+      commit();
+    }
   }
   for (int i = 0; i < MT; ++i)
     for (int e = 0; e < 4; ++e) {
@@ -320,4 +376,36 @@ extern "C" __global__ void __launch_bounds__(128)
         if (g == 0 && p < np) out[r * np + p] = p < npool ? s : -INFINITY;
       }
   }
+}
+
+// NVFP4 variants (TF_GLM_KV_NVFP4): the same kernel with the e2m1 load path.
+extern "C" __global__ void __launch_bounds__(256)
+    tf_glm_chunks16_nvfp4(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* pos, const int* tok, const int* cnt,
+                           float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w, float scale, int sparse) {
+  glm_attn::chunks_wide<16, true>(qa, lc, pos, tok, cnt, po, pm, pl, rows, heads, w, scale, sparse);
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+    tf_glm_chunks32_nvfp4(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* pos, const int* tok, const int* cnt,
+                           float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w, float scale, int sparse) {
+  glm_attn::chunks_wide<32, true>(qa, lc, pos, tok, cnt, po, pm, pl, rows, heads, w, scale, sparse);
+}
+
+// Sliced forms (CHW = 32): one 32-row tile a z-block, for solo decode windows whose 512-chunk grids
+// would run a handful of blocks each walking 16 tiles serially (a ~280 us latency chain at 3% of the
+// SMs). Empty slices write -inf partials the merge already skips, so the launch may over-cover.
+extern "C" __global__ void __launch_bounds__(256)
+    tf_glm_chunks_16_s32(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* pos, const int* tok, const int* cnt,
+                          float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w, float scale, int sparse) {
+#ifdef TF_SLICE_256
+  glm_attn::chunks_wide<16, false, 256>(qa, lc, pos, tok, cnt, po, pm, pl, rows, heads, w, scale, sparse);
+#else
+  glm_attn::chunks_wide<16, false, 32>(qa, lc, pos, tok, cnt, po, pm, pl, rows, heads, w, scale, sparse);
+#endif
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+    tf_glm_chunks16_nvfp4_s32(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* pos, const int* tok, const int* cnt,
+                               float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w, float scale, int sparse) {
+  glm_attn::chunks_wide<16, true, 32>(qa, lc, pos, tok, cnt, po, pm, pl, rows, heads, w, scale, sparse);
 }

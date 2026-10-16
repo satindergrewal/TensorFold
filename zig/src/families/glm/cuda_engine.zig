@@ -21,13 +21,15 @@ pub const Options = struct {
 pub const Cancel = struct { ptr: ?*anyopaque, check: *const fn (?*anyopaque) bool };
 
 /// The most drafts a chain holds (decode.DepthPolicy's top depth).
-pub const max_drafts = 3;
+/// The draft chain depth: round time barely grows with window rows (weights dominate), so
+/// deeper chains amortize the weight reads. 7 default (was 3).
+pub const max_drafts = 7;
 
 /// A prompt pass's chunk rows (decode.prefill's).
 pub const prompt_rows = fw.prefill_rows;
 
 /// A shared verify's max rows and streams: under hc_pre's 64-row block change, 8 streams of 4 rows.
-pub const shared_rows = 32;
+pub const shared_rows = 128; // 8+ streams x 8+ rows: the cap was splitting multi-stream windows
 pub const max_shared = 8;
 
 /// One stream's window of a shared verify: its slot, its ids, and its drawn tokens.
@@ -62,6 +64,8 @@ pub const Engine = struct {
     spans: []shard.Span, // every rank's vocabulary span
     lib: *const cuda.nccl.Library,
     comm: cuda.nccl.Comm,
+    shm: ?fw.Shm = null, // liumorrisclaw's host-staged gather arena (TF_GLM_SHM_GATHER=1)
+    shm_seq: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
     settings: ranks.Settings,
     m: fw.Modules,
     stream: cuda.Stream,
@@ -131,6 +135,7 @@ pub const Engine = struct {
         e.pairs = try cuda.DeviceBuffer.alloc(d, 8 * world);
         errdefer e.pairs.free();
         e.smp = try sampler.Sampler.init(d, c.vocab, fw.window_rows);
+        @import("cuda_latent.zig").setDriver(d);
         errdefer e.smp.deinit();
         e.shared_buf = try cuda.DeviceBuffer.alloc(d, 8);
         try e.stream.synchronize();
@@ -163,7 +168,55 @@ pub const Engine = struct {
     }
 
     fn exchange(e: *const Engine) fw.Exchange {
+        if (e.shm) |s| return .{ .shm = .{
+            .base = s.base,
+            .seq = s.seq,
+            .gather_fn = s.gather_fn,
+            .rank = @intCast(e.share.rank),
+            .slot_units = s.slot_units,
+            .lib = e.lib,
+            .comm = e.comm,
+        } };
         return .{ .nccl = .{ .lib = e.lib, .comm = e.comm } };
+    }
+
+    /// The host-staged gather arena (liumorrisclaw's protocol; credit: fork shm-allgather):
+    /// one /dev/shm segment, both ranks mmap + cudaHostRegister(Mapped). Call after the comm
+    /// is up on every rank (the Link exchange acts as the rendezvous).
+    pub fn initShm(e: *Engine) !void {
+        const cid = std.c.getenv("NCCL_COMM_ID") orelse return error.NoCommId;
+        var h: u64 = 5381;
+        for (std.mem.span(cid)) |ch| h = (h *% 33) +% ch;
+        var nb: [64]u8 = undefined;
+        const path = try std.fmt.bufPrint(&nb, "/dev/shm/tf_glm_shm_{x}\x00", .{h});
+        const slot_units: usize = 64 * e.c.hidden; // 8 streams x 8 rows: the multi-stream payload
+        const arena_len: usize = 256 + 2 * 2 * slot_units * 4; // ShmLayout (256B) + 2 stages x 2 ranks
+        const fd = std.c.open(@ptrCast(path.ptr), .{ .ACCMODE = .RDWR, .CREAT = true }, @as(c_uint, 0o600));
+        if (fd < 0) return error.ShmOpenFailed;
+        defer _ = std.c.close(fd);
+        _ = std.c.ftruncate(fd, @intCast(arena_len));
+        const mapped = try std.posix.mmap(null, arena_len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, fd, 0);
+        var dev_ptr: cuda.abi.DevicePtr = 0;
+        const flags: c_uint = 0x1 | 0x2; // cudaHostRegisterPortable | Mapped
+        try e.d.check(e.d.api.cuMemHostRegister_v2(mapped.ptr, arena_len, flags), "cuMemHostRegister");
+        errdefer _ = e.d.api.cuMemHostUnregister(mapped.ptr);
+        try e.d.check(e.d.api.cuMemHostGetDevicePointer_v2(&dev_ptr, mapped.ptr, 0), "cuMemHostGetDevicePointer");
+        var seq = try cuda.DeviceBuffer.alloc(e.d, 16);
+        errdefer seq.free();
+        var z: [16]u8 = @splat(0);
+        try seq.upload(0, &z);
+        const fnp = try e.m.mods[6].function("tf_shm_gather_f32");
+        e.shm = .{
+            .base = dev_ptr,
+            .seq = seq.ptr,
+            .gather_fn = fnp,
+            .rank = @intCast(e.share.rank),
+            .slot_units = slot_units,
+            .lib = e.lib,
+            .comm = e.comm,
+        };
+        e.shm_seq = seq;
+        std.log.info("glm: shm gather arena ready (slot {d} units, dev {x})", .{ slot_units, dev_ptr });
     }
 
     fn view(e: *Engine, b: *fw.Buffers, out: *[1]fw.Rank) fw.Forward {

@@ -14,6 +14,14 @@ const ring = 1024;
 /// The widest verify window: the pending token and a full draft chain (glm-decode-check's, the AOT row variants).
 pub const max_rows = 1 + engine.max_drafts;
 
+/// This engine's verify round by width, ms: one row ~17, each further row ~0.4 (weights-bound at TP2 over
+/// NCCL SHM). Depth-rule seeds only - observeCost replaces them with measured round times as depths are tried.
+const window_costs: [max_rows]lanes.config.Cost = blk: {
+    var c: [max_rows]lanes.config.Cost = undefined;
+    for (&c, 0..) |*x, i| x.* = .{ .width = i + 1, .ms = 17.0 + 0.4 * @as(f64, @floatFromInt(i)) };
+    break :blk c;
+};
+
 /// A stream's place in the backend: its sequence's slot, the rows its last verify left uncommitted, its held drafts.
 const Lane = struct {
     slot: u32,
@@ -57,6 +65,9 @@ pub const Lanes = struct {
     };
 
     /// Round loop facts: windows up to max_rows, drafts with the head loaded, shared windows unless TF_GLM_SHARED=0.
+    /// Window costs seed the depth rule from this engine's own 2x RTX PRO 6000 measurements (a verify round is
+    /// weights-bound: 17 ms at one row, ~0.4 ms a row more); the rule replaces them with each round's measured
+    /// wall time as it probes, but without seeds it cannot price an untried depth and never drafts past one.
     pub fn facts(self: *const Lanes) lanes.Model {
         const drafting = self.x.e.mtp;
         const sharing = drafting and !self.alone;
@@ -70,6 +81,10 @@ pub const Lanes = struct {
             .hidden_rows = sharing,
             .batch_rows = if (sharing) engine.shared_rows else 0,
             .max_streams = if (sharing) engine.max_shared else 1,
+            .plain_guard = drafting, // a draft row rides the same weights-bound round a plain row does
+            .window_costs = if (drafting) &window_costs else &.{},
+            .shared_costs = if (drafting) &window_costs else &.{},
+            .mtp_step_ms = if (drafting) 0.6 else 0.0,
         };
     }
 

@@ -143,6 +143,23 @@ pub const Pieces = struct {
 pub const Exchange = union(enum) {
     local,
     nccl: struct { lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm },
+    /// liumorrisclaw's host-staged one-shot gather (fork branch shm-allgather): one /dev/shm
+    /// segment both ranks mmap and cudaHostRegister(Mapped); decode-sized payloads take the
+    /// kernel, larger ones stay on NCCL
+    shm: Shm,
+};
+
+/// one stream's max window rows (7 drafts + 1): shm only activates ABOVE this (multi-stream)
+const rows_one_stream: usize = 8 * 4096;
+
+pub const Shm = struct {
+    base: u64, // the device view of the shared, host-registered arena
+    seq: u64, // per-block generation counters (device u32[4], the kernel advances them)
+    gather_fn: cuda.Function,
+    rank: u32,
+    slot_units: usize, // one rank's stage slot in fp32 units
+    lib: *const cuda.nccl.Library, // the NCCL fallback above the slot
+    comm: cuda.nccl.Comm,
 };
 
 /// One rank of the forward: its weights, its sequence's caches, the window's buffers.
@@ -190,6 +207,26 @@ pub const Forward = struct {
                 const r = f.ranks[0];
                 const count = rows * c.hidden;
                 try n.lib.check(n.lib.api.ncclAllGather(r.b.gathered + r.w.share.rank * bytes, r.b.gathered, count, .f32, n.comm, f.stream.handle), "ncclAllGather");
+            },
+            .shm => |sh| {
+                const r = f.ranks[0];
+                const count = rows * c.hidden;
+                if (count > rows_one_stream and count <= sh.slot_units) {
+                    // multi-stream only: the engine's single-stream shm path corrupts (deterministic;
+                    // the standalone kernel + graph test passes, so it's the engine integration)
+                    var a: cuda.Args = .{};
+                    a.add(r.b.gathered + r.w.share.rank * bytes);
+                    a.add(r.b.gathered);
+                    a.add(sh.base);
+                    a.add(sh.seq);
+                    a.add(@as(c_int, @intCast(sh.rank)));
+                    a.add(@as(i64, @intCast(count)));
+                    a.add(@as(i64, @intCast(sh.slot_units)));
+                    a.add(@as(c_longlong, 2_000_000_000));
+                    try cuda.launch.launch(sh.gather_fn, .{ .grid = .{ .x = 4 }, .block = .{ .x = 256 } }, f.stream, &a);
+                } else {
+                    try sh.lib.check(sh.lib.api.ncclAllGather(r.b.gathered + r.w.share.rank * bytes, r.b.gathered, count, .f32, sh.comm, f.stream.handle), "ncclAllGather");
+                }
             },
         }
     }
@@ -317,6 +354,10 @@ pub const Forward = struct {
             try p.side.wait(p.filled[q]);
             const bytes = n * D * 4;
             if (!split) switch (f.exchange) {
+                .shm => |x| {
+                    const r = f.ranks[0];
+                    try x.lib.check(x.lib.api.ncclAllGather(room(r, lo) + r.w.share.rank * bytes, room(r, lo), n * D, .f32, x.comm, p.side.handle), "ncclAllGather");
+                },
                 .local => for (f.ranks) |to| for (f.ranks) |from| {
                     if (to.w.share.rank == from.w.share.rank) continue;
                     const off = from.w.share.rank * bytes;
@@ -327,6 +368,11 @@ pub const Forward = struct {
                     try x.lib.check(x.lib.api.ncclAllGather(room(r, lo) + r.w.share.rank * bytes, room(r, lo), n * D, .f32, x.comm, p.side.handle), "ncclAllGather");
                 },
             } else switch (f.exchange) {
+                .shm => |x| {
+                    const r = f.ranks[0];
+                    const mine = share(n, world, r.w.share.rank);
+                    try x.lib.check(x.lib.api.ncclAllGather(r.b.part, r.b.part, (mine[1] - mine[0]) * D, .f32, x.comm, p.side.handle), "ncclAllGather");
+                },
                 .local => for (f.ranks) |to| {
                     const mine = share(n, world, to.w.share.rank);
                     const own = mine[1] - mine[0];
@@ -402,6 +448,12 @@ pub const Forward = struct {
             try p.glues[q].record(f.stream);
             try p.side.wait(p.glues[q]);
             switch (f.exchange) {
+                .shm => |x| {
+                    const r = f.ranks[0];
+                    const mine = share(n, world, r.w.share.rank);
+                    const bytes2 = (mine[1] - mine[0]) * D * 2;
+                    try x.lib.check(x.lib.api.ncclAllGather((if (last) r.b.hidden else r.b.normed) + (lo + mine[0]) * D * 2, (if (last) r.b.hidden else r.b.normed) + lo * D * 2, bytes2 / 2, .bf16, x.comm, p.side.handle), "ncclAllGather");
+                },
                 .local => for (f.ranks) |from| {
                     const mine = share(n, world, from.w.share.rank);
                     const bytes = (mine[1] - mine[0]) * D * 2;

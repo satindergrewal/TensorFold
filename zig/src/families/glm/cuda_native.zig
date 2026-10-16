@@ -93,6 +93,9 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     errdefer own.e.deinit();
     own.link = try follow.Link.init(gpa, ctx.d, &own.lib, own.comm, own.e.stream, cap);
     errdefer own.link.deinit();
+    if (std.c.getenv("TF_GLM_SHM_GATHER") != null and p.world > 1) own.e.initShm() catch |err| {
+        std.log.info("glm: shm gather off ({s}); NCCL carries the exchanges", .{@errorName(err)});
+    };
     if (p.rank != 0) { // a follower never serves: it runs rank 0's steps, then leaves the process
         follow.follow(own.e, &own.link) catch |err| {
             std.log.err("rank {d}: following rank 0 stopped ({s})", .{ p.rank, @errorName(err) });

@@ -30,6 +30,8 @@ pub const Layer = struct {
     limit: f32 = 0.0, // fp8g, nvfp4: the SwiGLU clamp, 0 for none
     relu2: bool = false, // nvfp4: up is one projection under relu^2 (Nemotron), not SwiGLU's gate and up
     exl3: exl3.Widths = .{}, // exl3: the layer's trellis widths and codebook
+    mats_up: u64 = 0, // exl3 mixed widths (our fork): per-expert MatDesc table for the up (gate,up) matrices
+    mats_down: u64 = 0, // exl3 mixed widths: per-expert MatDesc table for the down matrices
 };
 
 /// A call's epilogue: up with its format's activation (affine4 relu^2, else SwiGLU), down to fp32 or to bf16 sums.
@@ -59,7 +61,12 @@ pub const Grouped = struct {
             },
             .fp8g => return (g.fp8g orelse return error.FormatNotLoaded).run(s, epi, in, l, p, false, out, items, skip),
             .nvfp4 => return (g.nvfp4 orelse return error.FormatNotLoaded).run(s, epi, in, l, p, out, items, skip),
-            .exl3 => return (g.exl3 orelse return error.FormatNotLoaded).run(s, epi, in, l, p, out, items, skip, false),
+            .exl3 => {
+                const x = g.exl3 orelse return error.FormatNotLoaded;
+                if (epi == .up and l.mats_up != 0) return x.runMixed(s, epi, in, l, p, out, items, skip, l.mats_up);
+                if (epi != .up and l.mats_down != 0) return x.runMixed(s, epi, in, l, p, out, items, skip, l.mats_down);
+                return x.run(s, epi, in, l, p, out, items, skip, false);
+            },
         }
     }
 
@@ -77,7 +84,13 @@ pub const Grouped = struct {
             },
             .fp8g => return (g.fp8g orelse return error.FormatNotLoaded).run(s, epi, in, l, p, true, out, items, skip),
             .nvfp4 => return (g.nvfp4 orelse return error.FormatNotLoaded).runPrompt(s, epi, in, l, p, out, items, skip),
-            .exl3 => return (g.exl3 orelse return error.FormatNotLoaded).run(s, epi, in, l, p, out, items, skip, true),
+            .exl3 => {
+                const x = g.exl3 orelse return error.FormatNotLoaded;
+                // mixed widths take the decode kernel over any plan's items (a row's bits are its path's at every plan)
+                if (epi == .up and l.mats_up != 0) return x.runMixed(s, epi, in, l, p, out, items, skip, l.mats_up);
+                if (epi != .up and l.mats_down != 0) return x.runMixed(s, epi, in, l, p, out, items, skip, l.mats_down);
+                return x.run(s, epi, in, l, p, out, items, skip, true);
+            },
         }
     }
 };

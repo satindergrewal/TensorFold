@@ -72,6 +72,14 @@ pub const Sampler = struct {
         }
         switch (exchange) {
             .local => {},
+            .shm => |x| { // logits draws keep NCCL broadcasts (bf16 slices, a different shape each)
+                try x.lib.check(x.lib.api.ncclGroupStart(), "ncclGroupStart");
+                for (0..rows) |row| for (spans, 0..) |span, q| {
+                    const at = s.full.ptr + (row * V + span.lo) * 2;
+                    try x.lib.check(x.lib.api.ncclBroadcast(at, at, span.len(), .bf16, @intCast(q), x.comm, stream.handle), "ncclBroadcast");
+                };
+                try x.lib.check(x.lib.api.ncclGroupEnd(), "ncclGroupEnd");
+            },
             .nccl => |x| { // each rank's columns of each row from that rank (spans may differ in width: TP=3)
                 try x.lib.check(x.lib.api.ncclGroupStart(), "ncclGroupStart");
                 for (0..rows) |row| for (spans, 0..) |span, q| {

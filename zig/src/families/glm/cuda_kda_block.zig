@@ -39,6 +39,7 @@ pub fn block(set: glue.Set, ks: *const kda.Kernels, stream: cuda.Stream, l: Laye
 /// forward.out_proj's fill for the KDA block: o_proj of rows lo..hi (s.saves.out) into out [hi - lo][dims] fp32.
 pub fn fill(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, lo: usize, hi: usize, out: u64) !void {
     const n = l.heads * kda.dk;
+    // the kda out_proj through Mm16 REGRESSED (128.4 single vs 160.7, GSM 3/8): b16 keeps it
     try b16.proj(set, stream, s.saves.out + lo * n * 2, n, l.o, out, s.mm_part, hi - lo, l.dims, n, true);
 }
 

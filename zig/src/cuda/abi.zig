@@ -8,6 +8,12 @@ pub const Context = ?*opaque {};
 pub const Module = ?*opaque {};
 pub const Function = ?*opaque {};
 pub const Stream = ?*opaque {};
+
+/// CUipcMemHandle: an opaque 64-byte token another process opens with cuIpcOpenMemHandle.
+pub const IpcMemHandle = extern struct { data: [64]u8 };
+
+pub const ipc_lazy_peer: c_uint = 1; // CU_IPC_MEM_LAZY_ENABLE_PEER_ACCESS
+pub const wait_geq: c_uint = 1; // CU_STREAM_WAIT_VALUE_GEQ
 pub const Event = ?*opaque {};
 pub const Graph = ?*opaque {};
 pub const GraphNode = ?*opaque {};
@@ -175,6 +181,9 @@ pub const Api = struct {
     cuCtxSynchronize: *const fn () callconv(.c) R,
     cuMemGetInfo_v2: *const fn (*usize, *usize) callconv(.c) R,
     cuMemAlloc_v2: *const fn (*DevicePtr, usize) callconv(.c) R,
+    cuIpcGetMemHandle: *const fn (*IpcMemHandle, DevicePtr) callconv(.c) R,
+    cuIpcOpenMemHandle_v2: *const fn (*DevicePtr, IpcMemHandle, c_uint) callconv(.c) R,
+    cuStreamWaitValue32: *const fn (Stream, DevicePtr, c_uint, c_uint) callconv(.c) R,
     cuMemFree_v2: *const fn (DevicePtr) callconv(.c) R,
     cuMemHostAlloc: *const fn (*Ptr, usize, c_uint) callconv(.c) R,
     cuMemHostGetDevicePointer_v2: *const fn (*DevicePtr, Ptr, c_uint) callconv(.c) R,

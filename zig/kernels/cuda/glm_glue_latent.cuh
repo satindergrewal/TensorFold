@@ -72,3 +72,120 @@ extern "C" __global__ void tf_glm_lat_write(const __nv_bfloat16* lat, int64_t la
   const int64_t r = blockIdx.x, at = (int64_t)pos[0] + r;
   for (int64_t k = threadIdx.x; k < lw; k += blockDim.x) cache[at * lw + k] = lat[r * lat_stride + k];
 }
+
+#include <cuda_fp8.h>
+
+// FP8 (E4M3) latent cache: TF_GLM_KV_FP8=1 halves the latent cache bytes.
+// Write: bf16 row → e4m3 in the cache (half the bytes per value).
+extern "C" __global__ void tf_glm_lat_write_fp8(const __nv_bfloat16* lat, int64_t lat_stride, unsigned char* cache,
+                                                 const int* pos, int64_t lw) {
+  const int64_t r = blockIdx.x, at = (int64_t)pos[0] + r;
+  for (int64_t k = threadIdx.x; k < lw; k += blockDim.x)
+    cache[at * lw + k] = *reinterpret_cast<const unsigned char*>(&__nv_fp8_e4m3(lat[r * lat_stride + k]));
+}
+
+// Read: `count` e4m3 rows (starting at `start`) dequantized into a bf16 scratch the attention reads.
+// The scratch is sized [count][lw] bf16, allocated once per stream's decode buffers.
+extern "C" __global__ void tf_glm_lat_dequant(const unsigned char* cache, __nv_bfloat16* out,
+                                               int64_t start, int64_t count, int64_t lw) {
+  const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= count * lw) return;
+  const int64_t row = i / lw, k = i % lw;
+  out[i] = __nv_bfloat16(__nv_fp8_e4m3(reinterpret_cast<const __nv_fp8_e4m3*>(cache + (start + row) * lw)[k]));
+}
+
+// Read selected tokens (sparse attention): e4m3 rows at indices tok[0..count) into a bf16 scratch.
+extern "C" __global__ void tf_glm_lat_dequant_tok(const unsigned char* cache, const int* tok,
+                                                   __nv_bfloat16* out, int64_t count, int64_t w, int64_t lw) {
+  const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= count * lw) return;
+  const int64_t row = i / lw, k = i % lw;
+  const int64_t src = tok[row];
+  out[i] = __nv_bfloat16(__nv_fp8_e4m3(reinterpret_cast<const __nv_fp8_e4m3*>(cache + src * lw)[k]));
+}
+
+
+// -- NVFP4 latent cache (TF_GLM_KV_NVFP4): e2m1 values (4 bits) + e4m3 scales per 16-value block.
+// 512 values per row -> 256 bytes packed fp4 + 32 bytes e4m3 scales = 288 bytes vs 1024 bf16 (3.56x compression).
+// The quantization: per-block amax / 6.0 -> e4m3 scale; values rounded to nearest e2m1 (±{0,0.5,1,1.5,2,3,4,6}).
+
+// e2m1's 8 magnitudes
+__device__ __forceinline__ float nvfp4_val(unsigned char code) {
+  const float vals[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+  return (code & 8) ? -vals[code & 7] : vals[code & 7];
+}
+
+// nearest e2m1 code for a scaled value
+__device__ __forceinline__ unsigned char nvfp4_code(float v) {
+  float av = fabsf(v);
+  unsigned char sign = v < 0.0f ? 8 : 0;
+  if (av < 0.25f) return sign;
+  if (av < 0.75f) return sign | 1;
+  if (av < 1.25f) return sign | 2;
+  if (av < 1.75f) return sign | 3;
+  if (av < 2.5f) return sign | 4;
+  if (av < 3.5f) return sign | 5;
+  if (av < 5.0f) return sign | 6;
+  return sign | 7;
+}
+
+// Write: bf16 row [lw] -> packed e2m1 [lw/2 bytes] + e4m3 scales [lw/16 bytes] in the cache slot.
+// cache layout per row: [lw/2 packed bytes][lw/16 e4m3 scale bytes] (contiguous per row for coalescing).
+extern "C" __global__ void tf_glm_lat_write_nvfp4(const __nv_bfloat16* lat, int64_t lat_stride,
+                                                    unsigned char* cache, const int* pos, int64_t lw) {
+  const int64_t r = blockIdx.x, at = (int64_t)pos[0] + r;
+  const int64_t packed = lw / 2, scales = lw / 16;
+  unsigned char* row_cache = cache + at * (packed + scales);
+  unsigned char* codes = row_cache;
+  unsigned char* sc = row_cache + packed;
+  const __nv_bfloat16* src = lat + r * lat_stride;
+  // each thread handles one 16-value block: computes amax, scale, quantizes
+  const int nblocks = (int)scales;
+  for (int b = threadIdx.x; b < nblocks; b += blockDim.x) {
+    float vals[16];
+    float amax = 0.0f;
+    #pragma unroll
+    for (int j = 0; j < 16; ++j) {
+      vals[j] = __bfloat162float(src[b * 16 + j]);
+      amax = fmaxf(amax, fabsf(vals[j]));
+    }
+    // e4m3 scale: amax / 6.0 (the max e2m1 magnitude), stored as a raw byte
+    const float scale = amax > 0.0f ? amax / 6.0f : 1.0f;
+    const float inv = 1.0f / scale;
+    // store the e4m3 scale byte (round-to-nearest via float-to-fp8)
+    __half s_h = __float2half_rn(scale);
+    __nv_fp8_e4m3 s_f8(s_h); // fp8 constructor from half
+    sc[b] = *reinterpret_cast<const unsigned char*>(&s_f8);
+    // quantize 16 values to 8 packed bytes (2 codes per byte)
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      unsigned char c0 = nvfp4_code(vals[2 * j] * inv);
+      unsigned char c1 = nvfp4_code(vals[2 * j + 1] * inv);
+      codes[b * 8 + j] = (c0 & 0xF) | ((c1 & 0xF) << 4);
+    }
+  }
+}
+
+// Dequant: nvfp4 rows [start, start + count) -> bf16 scratch [count][lw].
+extern "C" __global__ void tf_glm_lat_dequant_nvfp4(const unsigned char* cache, __nv_bfloat16* out,
+                                                       int64_t start, int64_t count, int64_t lw) {
+  const int64_t packed = lw / 2, scales = lw / 16;
+  const int64_t row = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= count) return;
+  const unsigned char* row_cache = cache + (start + row) * (packed + scales);
+  const unsigned char* codes = row_cache;
+  const unsigned char* sc = row_cache + packed;
+  __nv_bfloat16* dst = out + row * lw;
+  for (int b = 0; b < scales; ++b) {
+    // dequant the e4m3 scale
+    __nv_fp8_e4m3 s_f8;
+    *reinterpret_cast<unsigned char*>(&s_f8) = sc[b];
+    const float scale = __half2float(__half(s_f8));
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      unsigned char byte = codes[b * 8 + j];
+      dst[b * 16 + 2 * j] = __float2bfloat16_rn(nvfp4_val(byte & 0xF) * scale);
+      dst[b * 16 + 2 * j + 1] = __float2bfloat16_rn(nvfp4_val((byte >> 4) & 0xF) * scale);
+    }
+  }
+}

@@ -4,10 +4,105 @@ const std = @import("std");
 const cuda = @import("cuda");
 
 /// What the forward's kernels launch from: our glue's functions.
+
+/// The dense linear on tensor cores for BF16 weights (ported from pr/glm-flash-cuda's glm/mm.cu,
+/// BITS=16): weights tiled at load into mma B-fragment order (glm_mm_tile16), one kernel per row
+/// bucket, the K slices' partials reduced in order. TF_GLM_MM16=0 falls back to the b16 path.
+pub const Mm16 = struct {
+    k16: cuda.Function,
+    k32: cuda.Function,
+    k64: cuda.Function,
+    q4_16: cuda.Function = undefined,
+    q4_32: cuda.Function = undefined,
+    q4_64: cuda.Function = undefined,
+    q8_16: cuda.Function = undefined,
+    q8_32: cuda.Function = undefined,
+    q8_64: cuda.Function = undefined,
+    reduce: cuda.Function,
+    tile16: cuda.Function,
+    tile4: cuda.Function = undefined,
+    tile8: cuda.Function = undefined,
+
+    pub fn load(m: cuda.Module) !Mm16 {
+        var r: Mm16 = .{
+            .k16 = try m.function("glm_mm16_16"),
+            .k32 = try m.function("glm_mm16_32"),
+            .k64 = try m.function("glm_mm16_64"),
+            .reduce = try m.function("glm_mm_reduce"),
+            .tile16 = try m.function("glm_mm_tile16"),
+        };
+        r.q4_16 = m.function("glm_mm4_16") catch r.k16;
+        r.q4_32 = m.function("glm_mm4_32") catch r.k32;
+        r.q4_64 = m.function("glm_mm4_64") catch r.k64;
+        r.q8_16 = m.function("glm_mm8_16") catch r.k16;
+        r.q8_32 = m.function("glm_mm8_32") catch r.k32;
+        r.q8_64 = m.function("glm_mm8_64") catch r.k64;
+        r.tile4 = m.function("glm_mm_tile4") catch r.tile16;
+        r.tile8 = m.function("glm_mm_tile8") catch r.tile16;
+        return r;
+    }
+
+    /// out [rows][n] (fp32 with `wide`, else bf16) = x [rows][k] rows `ldx` apart times the tiled w.
+    /// Their launch contract verbatim (kern.zig mm()): the row bucket picks the instance, the grid
+    /// is (n/64, rows/bm), dynamic shared = 3*(bm*128 + 8*32*8*4 + 128); SK=1 writes out directly.
+    /// bits: 16 = the bf16 path (w is tiled bf16, s unused); 4/8 = affine (w = tiled codes, s = tiled scales).
+    pub fn run(mm: *const Mm16, stream: cuda.Stream, x: u64, ldx: usize, rows: usize, n: usize, k: usize, w: u64, s: u64, bits: u8, out: u64, part: u64, wide: bool) !void {
+        _ = part;
+        if (k % 64 != 0 or n % 8 != 0) return error.Mm16Shape;
+        const bm: usize = if (rows <= 16) 16 else if (rows <= 32) 32 else if (rows <= 64) 64 else 128;
+        const wpc: usize = if (bits == 16) 8 else bits / 2;
+        const f = switch (bm) {
+            16 => if (bits == 4) mm.q4_16 else if (bits == 8) mm.q8_16 else mm.k16,
+            32 => if (bits == 4) mm.q4_32 else if (bits == 8) mm.q8_32 else mm.k32,
+            else => if (bits == 4) mm.q4_64 else if (bits == 8) mm.q8_64 else mm.k64,
+        };
+        const smem: u32 = @intCast(3 * (bm * 128 + 8 * 32 * wpc * 4 + 128));
+        try f.allowDynamicShared(smem);
+        var a: cuda.Args = .{};
+        a.add(x);
+        a.add(@as(i64, @intCast(ldx)));
+        a.add(w);
+        a.add(s);
+        a.add(out);
+        a.add(out); // part: unused at SK 1
+        a.add(@as(c_int, @intFromBool(wide)));
+        a.add(@as(c_int, @intCast(rows)));
+        a.add(@as(c_int, @intCast(n)));
+        a.add(@as(c_int, @intCast(k)));
+        a.add(@as(c_int, 1));
+        try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast((n + 63) / 64), .y = @intCast((rows + bm - 1) / bm), .z = 1 }, .block = .{ .x = if (bm <= 32) 128 else 256 }, .shared = smem }, stream, &a);
+    }
+
+    /// Tiling at load: bf16 rows [n][k] device-uploaded at `src` -> the tiled chunks at `dst` (same size).
+    pub fn tile(mm: *const Mm16, stream: cuda.Stream, src: u64, dst: u64, n: usize, k: usize) !void {
+        const chunks = (n / 8) * (k / 64) * 32;
+        var a: cuda.Args = .{};
+        a.add(src);
+        a.add(dst);
+        a.add(@as(c_int, @intCast(n)));
+        a.add(@as(c_int, @intCast(k)));
+        try cuda.launch.launch(mm.tile16, .{ .grid = .{ .x = @intCast((chunks + 255) / 256) }, .block = .{ .x = 256 } }, stream, &a);
+    }
+};
+
+/// TF_GLM_MM16=1 opts the tiled-bf16 tensor-core path in (the shared expert's down projection and
+/// the KDA out projection): faster (+2.5-5%) but GSM-class accuracy drops (5/8 vs 8/8 spot) - a
+/// per-workload speed-vs-accuracy choice, default off.
+pub fn mm16On() bool {
+    if (mm16_on == null) {
+        const v = std.c.getenv("TF_GLM_MM16");
+        mm16_on = v != null and std.mem.eql(u8, std.mem.span(v.?), "1");
+    }
+    return mm16_on.?;
+}
+
+var mm16_on: ?bool = null;
+
 pub const Set = struct { glue: *const Kernels, linear: cuda.qlinear.Linear = .{}, copy_rows: ?cuda.Function = null };
 
 /// Our glm_glue.cu's functions.
 pub const Kernels = struct {
+    mm: Mm16 = undefined,
     rmsnorm_4096: cuda.Function,
     rmsnorm_1536: cuda.Function,
     rmsnorm_512: cuda.Function,
@@ -33,6 +128,17 @@ pub const Kernels = struct {
     absorb_q: cuda.Function,
     expand_v: cuda.Function,
     lat_write: cuda.Function,
+    lat_write_fp8: ?cuda.Function = null,
+    chunks16_fp8: ?cuda.Function = null,
+    lat_write_nvfp4: ?cuda.Function = null,
+    chunks16_nvfp4: ?cuda.Function = null,
+    chunks32_nvfp4: ?cuda.Function = null,
+    chunks_16_s32: ?cuda.Function = null, // the 32-row sliced decode form (bf16)
+    chunks16_nvfp4_s32: ?cuda.Function = null,
+    lat_dequant_nvfp4: ?cuda.Function = null,
+    chunks32_fp8: ?cuda.Function = null,
+    lat_dequant: ?cuda.Function = null,
+    lat_dequant_tok: ?cuda.Function = null,
     index_write: cuda.Function,
     pool_keys: cuda.Function,
     select_rows: cuda.Function,
@@ -51,9 +157,42 @@ pub const Kernels = struct {
 
     pub fn load(m: cuda.Module) !Kernels {
         var k: Kernels = undefined;
-        inline for (@typeInfo(Kernels).@"struct".field_names) |name| @field(k, name) = try m.function("tf_glm_" ++ name);
+        inline for (@typeInfo(Kernels).@"struct".field_names) |name| {
+            if (comptime !std.mem.eql(u8, name, "mm") and !std.mem.endsWith(u8, name, "_fp8") and !std.mem.endsWith(u8, name, "_nvfp4") and !std.mem.endsWith(u8, name, "_s32") and !std.mem.startsWith(u8, name, "lat_dequant")) @field(k, name) = try m.function("tf_glm_" ++ name);
+        }
+        k.mm = try Mm16.load(m);
+        // KV cache quantization kernels: load what exists, skip what doesn't
+        const kv_fp8 = std.c.getenv("TF_GLM_KV_FP8") != null;
+        const kv_nvfp4 = std.c.getenv("TF_GLM_KV_NVFP4") != null;
+        if (kv_fp8) {
+            k.lat_write_fp8 = m.function("tf_glm_lat_write_fp8") catch null;
+            k.lat_dequant = m.function("tf_glm_lat_dequant") catch null;
+            k.lat_dequant_tok = m.function("tf_glm_lat_dequant_tok") catch null;
+        }
+        if (kv_nvfp4) {
+            k.lat_write_nvfp4 = m.function("tf_glm_lat_write_nvfp4") catch null;
+            k.lat_dequant_nvfp4 = m.function("tf_glm_lat_dequant_nvfp4") catch null;
+            k.chunks16_nvfp4 = m.function("tf_glm_chunks16_nvfp4") catch null;
+            k.chunks32_nvfp4 = m.function("tf_glm_chunks32_nvfp4") catch null;
+            // a device that refuses the opt-in (sm_120's 99KB) leaves the form null: the other head
+            // width serves those launches, or the dequant path takes over
+            if (k.chunks16_nvfp4) |*f| f.allowDynamicShared(chunksSmemNvfp4(16)) catch {
+                k.chunks16_nvfp4 = null;
+            };
+            if (k.chunks32_nvfp4) |*f| f.allowDynamicShared(chunksSmemNvfp4(32)) catch {
+                k.chunks32_nvfp4 = null;
+            };
+            k.chunks16_nvfp4_s32 = m.function("tf_glm_chunks16_nvfp4_s32") catch null;
+            if (k.chunks16_nvfp4_s32) |*f| f.allowDynamicShared(chunksSmemNvfp4(16)) catch {
+                k.chunks16_nvfp4_s32 = null;
+            };
+        }
         try k.bmm_tile.allowDynamicShared(bmm_tile_smem);
         try k.bmm_tile1.allowDynamicShared(bmm_tile1_smem[1]);
+        k.chunks_16_s32 = m.function("tf_glm_chunks_16_s32") catch null;
+        if (k.chunks_16_s32) |*f| f.allowDynamicShared(chunksSmem(16)) catch {
+            k.chunks_16_s32 = null;
+        };
         try k.chunks_16.allowDynamicShared(chunksSmem(16));
         try k.chunks_32.allowDynamicShared(chunksSmem(32));
         return k;
@@ -131,6 +270,11 @@ pub const bmm_tile1_smem = [2]u32{ 3 * (128 + 128) * 32 * 2, 128 * (128 + 4) * 4
 /// glm_glue_attn.cuh's wide_smem<hb>(): q (hb x 512), two 32-key tiles, p (hb x 32) in bf16, then max/sum scratch.
 pub fn chunksSmem(comptime hb: u32) u32 {
     return (hb * 512 + 2 * 32 * 512 + hb * 32) * 2 + (hb * 4 + 2 * hb) * 4;
+}
+
+/// NVFP4 chunks kernels add a double-buffered staging tile of the packed e2m1 halves (2 * 32 * 256 bytes).
+pub fn chunksSmemNvfp4(comptime hb: u32) u32 {
+    return chunksSmem(hb) + 2 * 32 * 256;
 }
 
 /// K slices of the router's dot (glue.ROUTER_KS): fixed by the shape, as the sliced and the single pass differ in bits.

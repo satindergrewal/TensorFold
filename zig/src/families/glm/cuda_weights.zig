@@ -43,7 +43,9 @@ pub const Weights = struct {
     layers: []Layer = &.{},
     norm: u64 = 0,
     head: b16.Proj = .{ .b16 = 0 }, // bf16 [share.vocab][dims], or EXL3
+    head_b16_for_draft: u64 = 0, // the bf16 head rows kept for the 4-bit draft head when the head itself is FP4
     exl3: bool = false, // an EXL3 checkpoint: the attention, shared expert, dense MLP and head quantized
+    exl3_experts: bool = false, // routed experts EXL3 with bf16 attention (our hybrid)
     mtp: ?Mtp = null,
     buffers: std.ArrayList(cuda.DeviceBuffer) = .empty,
     named: std.ArrayList(Named) = .empty,
@@ -134,7 +136,7 @@ pub const Loader = struct {
     }
 
     /// Columns [lo, hi) of every row of a matrix: split.py's "col" cut.
-    fn cols(L: *Loader, t: Tensor, lo: usize, hi: usize, to: core.checkpoint.DType) !void {
+    pub fn cols(L: *Loader, t: Tensor, lo: usize, hi: usize, to: core.checkpoint.DType) !void {
         if (t.rank != 2) return error.UnexpectedTensor;
         const k = t.dim(1);
         for (0..t.dim(0)) |r| try L.add(t, r * k + lo, r * k + hi, to);
@@ -280,11 +282,46 @@ pub const Loader = struct {
         return cuda.nvfp4.weight(words.ptr, bs, l.global, n, k);
     }
 
+    /// The hybrid checkpoint's dense MLP: BF16 gate/up cut by the rank's rows (a rows cut) or down by its
+    /// columns, repacked into qmmf's BF16 order on the host (packBf16), one qlinear.Weight.
+    fn bf16Dense(L: *Loader, comptime fmt: []const u8, i: u32, lo: usize, hi: usize, by_cols: bool, total: usize) !cuda.qlinear.Weight {
+        const t = try L.get("layers.{d}.mlp." ++ fmt ++ ".weight", .{i});
+        const src = std.mem.bytesAsSlice(u16, t.bytes);
+        const n: usize = if (by_cols) t.dim(0) else hi - lo;
+        const k: usize = if (by_cols) hi - lo else t.dim(1);
+        const npad = (n + 127) / 128 * 128;
+        const flat = try L.gpa.alloc(u16, npad * k);
+        defer L.gpa.free(flat);
+        @memset(flat, 0);
+        if (by_cols) {
+            for (0..n) |r| @memcpy(flat[r * k ..][0..k], src[r * total + lo ..][0..k]);
+        } else {
+            @memcpy(flat[0 .. n * k], src[lo * k ..][0 .. n * k]);
+        }
+        const out = try L.gpa.alloc(u16, npad * k);
+        defer L.gpa.free(out);
+        cuda.qmmf.packBf16(out, flat[0 .. n * k], n, k);
+        try L.host.appendSlice(L.gpa, std.mem.sliceAsBytes(out));
+        return .{ .bf16 = .{ .mode = .bf16, .codes = try L.put("layers.{d}.mlp." ++ fmt, .{i}), .scales = 0, .n = @intCast(n), .k = @intCast(k), .npad = @intCast(npad) } };
+    }
+
     /// weights.load's mlp for a dense layer: gate and up by the rank's rows, down by its columns (NVFP4).
     fn dense(L: *Loader, i: u32) !mlp.Layer {
         const c = &L.w.config;
         const s = L.w.share.dense;
         const d = c.hidden;
+        if (L.w.exl3_experts) {
+            try L.cols(try L.get("layers.{d}.mlp.down_proj.weight", .{i}), s.lo, s.hi, .bf16);
+            const down = try L.put("layers.{d}.mlp.down_proj.b16", .{i});
+            return .{
+                .gate = try L.bf16Dense("gate_proj", i, s.lo, s.hi, false, c.dense_inter),
+                .up = try L.bf16Dense("up_proj", i, s.lo, s.hi, false, c.dense_inter),
+                .down_b16 = down,
+                .width = s.len(),
+                .dims = d,
+                .limit = c.swiglu_limit,
+            };
+        }
         if (L.w.exl3) return .{
             .gate = try x3.layerMatrix(L, "layers.{d}.mlp.gate_proj", i, 0, 0, &.{s}),
             .up = try x3.layerMatrix(L, "layers.{d}.mlp.up_proj", i, 0, 0, &.{s}),
@@ -304,7 +341,7 @@ pub const Loader = struct {
     }
 
     /// One device allocation the loader frees itself (staging for the GPU's quantizers).
-    fn scratch(L: *Loader, n: usize) !cuda.DeviceBuffer {
+    pub fn scratch(L: *Loader, n: usize) !cuda.DeviceBuffer {
         return cuda.DeviceBuffer.alloc(L.d, n);
     }
 
@@ -371,6 +408,7 @@ pub const Loader = struct {
     /// weights.load's moe(i) on NVFP4: router and bias, routed experts as Experts4, the BF16 shared expert's share.
     fn moeLayer(L: *Loader, i: u32) !moe.Layer {
         if (L.w.exl3) return x3.moe(L, i);
+        if (L.w.exl3_experts) return x3.moeHybrid(L, i);
         const c = &L.w.config;
         const d: usize = c.hidden;
         const cut = L.w.share.moe;
@@ -474,7 +512,7 @@ pub const Loader = struct {
             b.* = try L.scratch(size);
             made += 1;
         }
-        try quant.q4(qk, L.stream, L.w.head.b16, n, k, raw[0].ptr, raw[1].ptr, raw[2].ptr);
+        try quant.q4(qk, L.stream, if (L.w.head_b16_for_draft != 0) L.w.head_b16_for_draft else L.w.head.b16, n, k, raw[0].ptr, raw[1].ptr, raw[2].ptr);
         var tiled: [3]u64 = undefined;
         for (&tiled, q4.bytes(n, k), [_][]const u8{ "words", "scales", "biases" }) |*p, size, what| {
             const b = try cuda.DeviceBuffer.alloc(L.d, size);
@@ -520,6 +558,11 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, stream: c
     var L: Loader = .{ .gpa = gpa, .d = d, .stream = stream, .pack_dense = tools.pack_dense, .tools = tools, .w = &w, .ck = &ck };
     defer L.host.deinit(gpa);
     w.exl3 = ck.has(prefix ++ "layers.0.self_attn.qkv_proj.trellis");
+    {
+        var nbf: [192]u8 = undefined;
+        const moe0 = try std.fmt.bufPrint(&nbf, "{s}layers.{d}.mlp.experts.0.gate_proj.trellis", .{ prefix, c.dense_layers });
+        w.exl3_experts = ck.has(moe0);
+    }
     w.layers = try gpa.alloc(Layer, layers.len);
     for (layers, w.layers) |i, *l| {
         if (i >= c.layers) return error.BadLayer;
@@ -536,7 +579,51 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, stream: c
         if (with_mtp and c.mtp > 0) ck.add(dir, "mtp.safetensors") catch |e| if (e != error.FileNotFound) return e;
     } else {
         try L.rows(try head_ck.get("lm_head.weight"), share.vocab.lo, share.vocab.hi, c.vocab, .bf16);
-        w.head = .{ .b16 = try L.put("head", .{}) };
+        if (blk: {
+            const v0 = std.c.getenv("TF_GLM_HEAD_FP4");
+            break :blk v0 == null or !std.mem.eql(u8, std.mem.span(v0.?), "0");
+        }) {
+            // the head GPU-quantized to NVFP4 at load (the MTP layer's recipe, fp4()'s lane packing): 4x fewer
+            // head bytes a verify reads; TF_GLM_HEAD_FP4=0 keeps BF16.
+            {
+                const qk = L.tools.quant orelse return error.NoQuantizer;
+                const n = share.vocab.len();
+                const k = c.hidden;
+                var wb = try L.scratch(n * k * 2);
+                defer wb.free();
+                try wb.upload(0, L.host.items);
+                L.w.head_b16_for_draft = try L.put("head.b16.draft", .{}); // mtp()'s 4-bit draft head reads the bf16 rows
+                var cb = try L.scratch(n * k / 2);
+                defer cb.free();
+                var sb = try L.scratch(n * k / 16);
+                defer sb.free();
+                var gb = try L.scratch(4);
+                defer gb.free();
+                try quant.nvfp4(qk, L.stream, wb.ptr, 1, n, k, cb.ptr, sb.ptr, gb.ptr);
+                const npad = cuda.nvfp4.padded(n);
+                const kg = k / 64;
+                const total: u64 = @as(u64, npad / 64) * kg * 512;
+                const words = try cuda.DeviceBuffer.alloc(L.d, total * 4);
+                try L.w.buffers.append(L.gpa, words);
+                try L.w.named.append(L.gpa, .{ .name = try std.fmt.allocPrint(L.gpa, "head.words", .{}), .ptr = words.ptr, .len = words.len });
+                var args: cuda.Args = .{};
+                args.add(cb.ptr);
+                for ([_]usize{ n, k / 8, kg }) |v| args.add(@as(c_int, @intCast(v)));
+                args.add(words.ptr);
+                args.add(@as(c_longlong, @intCast(total)));
+                try cuda.launch.launch(L.pack_dense, .{ .grid = .{ .x = @intCast((total + 255) / 256) }, .block = .{ .x = 256 } }, L.stream, &args);
+                const scales = try L.gpa.alloc(u8, n * k / 16);
+                defer L.gpa.free(scales);
+                try sb.download(0, scales);
+                try L.host.resize(L.gpa, npad * k / 16);
+                cuda.nvfp4.packScales(L.host.items, scales, n, k);
+                const bs = try L.put("head.fp4.scales", .{});
+                var g4: [4]u8 = undefined;
+                try gb.download(0, g4[0..4]);
+                const gs: f32 = @bitCast(std.mem.readInt(u32, g4[0..4], .little));
+                w.head = .{ .q = .{ .nvfp4 = cuda.nvfp4.weight(words.ptr, bs, gs, n, k) } };
+            }
+        } else w.head = .{ .b16 = try L.put("head", .{}) };
     }
     if (with_mtp and c.mtp > 0) w.mtp = try L.mtp();
     return w;

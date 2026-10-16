@@ -46,7 +46,7 @@ fn arena(d: *const cuda.Driver, sizes: []const usize, out: []u64) !Arena {
 }
 
 /// A rank's B16 matmul shapes ([n, k]) whose split-K partials the buffers hold.
-fn b16Shapes(w: *const weights.Weights) [11][2]usize {
+fn b16Shapes(w: *const weights.Weights) [12][2]usize {
     const c = &w.config;
     const s = &w.share;
     const n = s.kda.len() * c.kda_dim;
@@ -57,6 +57,7 @@ fn b16Shapes(w: *const weights.Weights) [11][2]usize {
         .{ c.i_heads * c.i_dim, c.q_lora },  .{ c.hidden, s.mla.len() * c.v_dim }, .{ 2 * s.shared.len(), c.hidden },
         .{ c.hidden, 2 * c.hidden }, // the MTP head's eh_proj
         .{ 2 * c.kda_dim + s.kda.len(), c.hidden }, // EXL3: [f_a | g_a | b] apart from qkv
+        .{ c.hidden, s.dense.len() }, // the hybrid checkpoint's BF16 dense MLP down projection
     };
 }
 
@@ -119,7 +120,9 @@ pub const Buffers = struct {
         const lw: usize = c.kv_lora;
         const part_rows = if (prefill) @min(rows, dsa_block.prompt_att_rows) else seg;
         const nch = latent.chunksFor(@min(capacity, dense_reach) + seg);
-        const partial_rows = @max(nch * part_rows, latent.chunksFor(sparse.width) * seg); // dense calls, or one sparse
+        // dense calls, or one sparse; the 32-row sliced decode forms over-cover the same ranges (their
+        // empty slices write -inf partials) only at rows <= window_rows, never on the big prefill grids
+        const partial_rows = @max(@max(nch * part_rows, latent.chunksFor(sparse.width) * seg), @max(16 * nch, (sparse.width + latent.chunk - 1) / 32) * @min(seg, window_rows));
         const np_max = capacity / sparse.pool;
         var mm: usize = 4;
         // windows under rows_from rows keep their K slices apart (a prompt's tail chunk on the prefill buffers too)
@@ -162,6 +165,10 @@ pub const Buffers = struct {
             rows * D * 2, rows * D * 2, rows * 2 * D * 2, rows * D * 2, // hin, me, mcat, mx
             rows * D * 4, // part: this rank's fp32 partial rows a split exchange sends from
             if (w.quantizedAttention()) rows * 3 * n * 2 else 4, // the KDA projection's staging (EXL3)
+            if (prefill) 0 else pairs * D * 2, // mma_xg: the mixed-width mma decode pass's rotations
+            if (prefill) 0 else pairs * D * 2, // mma_xu
+            if (prefill) 0 else pairs * mw * 2, // mma_xd
+            if (prefill) 0 else pairs * 16 * (2 * mw + D) * 4, // mma_z: [mats][SK][pairs][n] fp32, both passes (sized for SK up to 16)
         };
         var p: [sizes.len]u64 = undefined;
         const a = try arena(d, &sizes, &p);
@@ -203,8 +210,8 @@ pub const Buffers = struct {
                 .mm_part = p[42],
                 .at = p[43],
             },
-            .dense = .{ .tmp = p[44], .gu = p[45], .act = p[46], .xs_act = p[47] },
-            .moe = .{ .mlog = p[48], .router_part = p[26], .pick = p[49], .wts = p[50], .plan = .{ .members = p[51], .items = p[52], .counts = p[53], .rank = p[54], .hist = p[55] }, .eact = p[56], .ey = p[57], .sgu = p[58], .sact = p[59], .sxs = p[60], .sy = p[61], .mm_part = p[42] },
+            .dense = .{ .tmp = p[44], .gu = p[45], .act = p[46], .xs_act = p[47], .mm_part = p[42] },
+            .moe = .{ .mlog = p[48], .router_part = p[26], .pick = p[49], .wts = p[50], .plan = .{ .members = p[51], .items = p[52], .counts = p[53], .rank = p[54], .hist = p[55] }, .eact = p[56], .ey = p[57], .sgu = p[58], .sact = p[59], .sxs = p[60], .sy = p[61], .mm_part = p[42] , .mma_xg = p[72], .mma_xu = p[73], .mma_xd = p[74], .mma_z = p[75] },
             .hidden = p[62],
             .fnormed = p[63],
             .fxs = p[64],
@@ -267,7 +274,12 @@ pub const State = struct {
         defer sizes.deinit(gpa);
         try sizes.appendSlice(gpa, &.{ 4, nk * 3 * 3 * n * 2, 2 * nk * s.kda.len() * kda.dk * kda.dv * 4, nk * window_rows * kw * 2 });
         try sizes.appendSlice(gpa, &.{ nk * window_rows * n * 4, nk * window_rows * n * 2, nk * window_rows * n * 4, nk * window_rows * s.kda.len() * 4 });
-        for (0..nd + 1) |_| try sizes.appendSlice(gpa, &.{ capacity * c.kv_lora * 2, capacity * c.i_dim * 2, capacity * c.i_dim * 2, pk_rows * c.i_dim * 2 });
+        const lat_bytes: usize = blk: {
+            if (std.c.getenv("TF_GLM_KV_NVFP4") != null) break :blk capacity * (c.kv_lora / 2 + c.kv_lora / 16); // 288 B/row
+            if (std.c.getenv("TF_GLM_KV_FP8") != null) break :blk capacity * c.kv_lora; // 512 B/row
+            break :blk capacity * c.kv_lora * 2; // 1024 B/row (bf16)
+        };
+        for (0..nd + 1) |_| try sizes.appendSlice(gpa, &.{ lat_bytes, capacity * c.i_dim * 2, capacity * c.i_dim * 2, pk_rows * c.i_dim * 2 });
         try sizes.append(gpa, 4); // the MTP head's position
         const p = try gpa.alloc(u64, sizes.items.len);
         defer gpa.free(p);

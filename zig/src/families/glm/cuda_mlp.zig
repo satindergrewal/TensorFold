@@ -3,12 +3,13 @@
 const std = @import("std");
 const cuda = @import("cuda");
 const glue = @import("cuda_glue.zig");
+const b16 = @import("cuda_b16.zig");
 
 /// One dense layer on a rank: gate and up [width][dims] and down [dims][width], NVFP4 (Fp4Linear's) or EXL3.
-pub const Layer = struct { gate: cuda.qlinear.Weight, up: cuda.qlinear.Weight, down: cuda.qlinear.Weight, width: usize, dims: usize, limit: f32 };
+pub const Layer = struct { gate: cuda.qlinear.Weight, up: cuda.qlinear.Weight, down: ?cuda.qlinear.Weight = null, down_b16: u64 = 0, width: usize, dims: usize, limit: f32 };
 
 /// The block's scratch for up to `rows` rows: one projection's rows, the [gate | up] rows, the activation and its sums.
-pub const Scratch = struct { tmp: u64, gu: u64, act: u64, xs_act: u64 };
+pub const Scratch = struct { tmp: u64, gu: u64, act: u64, xs_act: u64, mm_part: u64 = 0 };
 
 pub const Kernels = struct { set: glue.Set, linear: cuda.qlinear.Linear, copy_rows: cuda.Function };
 
@@ -30,7 +31,8 @@ pub fn block(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_st
 
 /// forward.out_proj's fill for the dense MLP: down of rows lo..hi (s.act) into out [hi - lo][dims] fp32.
 pub fn fill(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, lo: usize, hi: usize, prompt: bool, out: u64) !void {
-    try mm(k, stream, l.down, s.act + lo * l.width * 2, l.width, hi - lo, out, true, prompt);
+    if (l.down_b16 != 0) return b16.matmul(k.set, stream, s.act + lo * l.width * 2, l.width, l.down_b16, out, s.mm_part, hi - lo, l.dims, l.width, true);
+    try mm(k, stream, l.down.?, s.act + lo * l.width * 2, l.width, hi - lo, out, true, prompt);
 }
 
 /// The block up to its down projection: [gate | up] and SwiGLU into s.act.
