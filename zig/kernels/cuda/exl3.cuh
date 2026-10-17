@@ -41,6 +41,15 @@ template <int K>
 __device__ __forceinline__ uint4 tf_exl3_words(const uint32_t* tile, unsigned lane) {
   constexpr unsigned ring = 256 * K, words = 8 * K;
   const unsigned i0 = ((8 * lane * K + K + ring - 16) % ring) / 32;
+  // one 16-byte nc vector load when the four words sit together (the python engine's dec kernel loads
+  // this way, jayleaton/glm53-tensorfold-spark 0580's ld.global.nc.L1::no_allocate: a quarter the load
+  // instructions and no L1 allocation for read-once trellis words); the ring wrap falls back to scalars
+  if (i0 % 4 == 0 && i0 + 3 < words) {
+    uint4 v;
+    asm volatile("ld.global.nc.v4.u32 {%0, %1, %2, %3}, [%4];"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(tile + i0));
+    return v;
+  }
   return make_uint4(tile[i0], tile[(i0 + 1) % words], tile[(i0 + 2) % words], tile[(i0 + 3) % words]);
 }
 

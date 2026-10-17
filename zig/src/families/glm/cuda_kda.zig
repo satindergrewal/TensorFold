@@ -72,7 +72,7 @@ pub fn chain(ks: *const Kernels, stream: cuda.Stream, c: Chain, rows: usize, s: 
         b.add(@as(c_int, @intCast(rows)));
         b.add(w.y);
         b.add(s.state_out);
-        try cuda.launch.launch(ks.step, .{ .grid = .{ .x = @intCast(c.heads), .y = dv / 4 / 8 }, .block = .{ .x = 8 * 32 } }, stream, &b);
+        try cuda.launch.launch(ks.step, .{ .grid = .{ .x = @intCast(c.heads), .y = dv / 4 / 4 }, .block = .{ .x = 4 * 32 } }, stream, &b);
         var o: cuda.Args = .{};
         o.add(h);
         o.add(w.y);
