@@ -248,6 +248,26 @@ extern "C" __global__ void __launch_bounds__(1024) tf_glm_top1_rows(const unsign
   }
 }
 
+// The host greedy pick (largest value, ties to the lower id, NaN never wins) as a device kernel, so a
+// drafted chain never returns to the host: the winner goes straight into the MTP head's ids slot
+// (the same rule greedyRows' host loop applies; credit: Justin Casey's TensorFold decode graphs).
+extern "C" __global__ void __launch_bounds__(32) tf_glm_pick_greedy(const unsigned* all, int world,
+                                                                     int* token_out, int* ids_slot) {
+  __shared__ unsigned sh[32][2];
+  const int t = threadIdx.x;
+  if (t < world) { sh[t][0] = all[2 * t]; sh[t][1] = all[2 * t + 1]; }
+  __syncthreads();
+  if (t != 0) return;
+  unsigned bv = sh[0][0], bi = sh[0][1];
+  for (int w = 1; w < world; ++w) {
+    const float v = __int_as_float(static_cast<int>(sh[w][0]));
+    const float b = __int_as_float(static_cast<int>(bv));
+    if (v > b || (v == b && sh[w][1] < bi)) { bv = sh[w][0]; bi = sh[w][1]; }
+  }
+  token_out[0] = static_cast<int>(bi);
+  if (ids_slot) ids_slot[0] = static_cast<int>(bi);
+}
+
 // The leader's step for the other ranks, written to the link's buffer from launch arguments (cuda_follow's Link.send).
 struct tf_glm_words {
   unsigned w[96];

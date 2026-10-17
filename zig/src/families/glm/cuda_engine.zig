@@ -83,6 +83,7 @@ pub const Engine = struct {
     hold: cuda.DeviceBuffer, // the prompt's last row's hidden (decode's e.last_hidden), the first draft's source
     pairs: cuda.DeviceBuffer, // every rank's (value, id) of a greedy draw (the send slices)
     pairs_all: cuda.DeviceBuffer, // the all-gather's destination: a separate buffer, out-of-place on every rank
+    draft_tokens: cuda.DeviceBuffer, // the device-resident draft chain's picked tokens (TF_GLM_DRAFT_DEV)
     smp: sampler.Sampler,
     seqs: std.ArrayList(?*Seq) = .empty, // every stream's sequence by slot (the lane backend's), slot 0 made at init
     cur: *Seq = undefined, // the bound slot's: every step below runs on it
@@ -140,7 +141,7 @@ pub const Engine = struct {
         if (o.settings.layers > c.layers) return error.BadLayers;
         const layers = try a.alloc(u32, if (o.settings.layers > 0) o.settings.layers else c.layers);
         for (layers, 0..) |*l, i| l.* = @intCast(i);
-        e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = o.settings.heat, .root = heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .settings = o.settings, .m = m, .stream = stream, .pieces = pieces, .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .bm = undefined, .hold = undefined, .pairs = undefined, .pairs_all = undefined, .smp = undefined, .mtp = o.mtp };
+        e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = o.settings.heat, .root = heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .settings = o.settings, .m = m, .stream = stream, .pieces = pieces, .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .bm = undefined, .hold = undefined, .pairs = undefined, .pairs_all = undefined, .draft_tokens = undefined, .smp = undefined, .mtp = o.mtp };
         e.w = try weights.load(gpa, io, d, stream, e.m.tools(), checkpoint, c, share, layers, o.mtp);
         errdefer e.w.deinit();
         try e.bind(0);
@@ -160,6 +161,7 @@ pub const Engine = struct {
         errdefer e.hold.free();
         e.pairs = try cuda.DeviceBuffer.alloc(d, 8 * world * fw.window_rows);
         e.pairs_all = try cuda.DeviceBuffer.alloc(d, 8 * world * fw.window_rows);
+        e.draft_tokens = try cuda.DeviceBuffer.alloc(d, 4 * max_drafts);
         errdefer e.pairs.free();
         e.smp = try sampler.Sampler.init(d, c.vocab, fw.window_rows);
         @import("cuda_latent.zig").setDriver(d);
@@ -219,6 +221,7 @@ pub const Engine = struct {
         e.smp.deinit();
         e.pairs.free();
         e.pairs_all.free();
+        e.draft_tokens.free();
         e.hold.free();
         if (e.bs) |*b| b.deinit();
         e.bm.deinit();
@@ -734,6 +737,23 @@ pub const Engine = struct {
             try f.mtp(part, &.{hidden + s0 * D * 2});
             try e.cur.st.setMtpLen(e.stream, e.cur.st.mtp_len + part.len);
         }
+        if (e.cur.sampling == null and std.c.getenv("TF_GLM_DRAFT_DEV") != null) {
+            // the device-resident chain (TF_GLM_DRAFT_DEV): each greedy pick resolves on the device into
+            // the head's ids slot (tf_glm_pick_greedy applies greedyRows' host rule), so no draft token
+            // crosses the host until one sync and one download at the end - the profile showed the chain's
+            // per-draft all-gather + synchronize round trips dominated the round's non-GPU time.
+            for (0..depth) |j| {
+                try e.pickDev(e.bm.logits, e.bm.ids, e.draft_tokens.ptr + j * 4);
+                if (j + 1 < depth) {
+                    try f.mtpDev(&.{e.bm.fnormed});
+                    try e.cur.st.setMtpLen(e.stream, e.cur.st.mtp_len + 1);
+                    e.cur.in_head += 1;
+                }
+            }
+            try e.stream.synchronize();
+            try e.d.check(e.d.api.cuMemcpyDtoH_v2(out.ptr, e.draft_tokens.ptr, depth * 4), "cuMemcpyDtoH");
+            return;
+        }
         for (0..depth) |j| {
             try e.draw(e.bm.logits, 1, e.cur.st.pos + 1 + j, out[j..][0..1]);
             if (j + 1 < depth) {
@@ -742,6 +762,25 @@ pub const Engine = struct {
                 e.cur.in_head += 1;
             }
         }
+    }
+
+    /// One greedy pick that never returns to the host: top-1 into this rank's pairs slot, one count-2
+    /// all-gather, then tf_glm_pick_greedy writes the winner to the head's ids slot and the token log.
+    fn pickDev(e: *Engine, logits: u64, ids_slot: u64, token_out: u64) !void {
+        const world = e.share.world;
+        var a: cuda.Args = .{};
+        a.add(logits);
+        a.add(@as(i64, @intCast(e.share.vocab.len())));
+        a.add(@as(u32, @intCast(e.share.vocab.lo)));
+        a.add(e.pairs.ptr + e.share.rank * 8);
+        try cuda.launch.launch(e.m.glue.top1, .{ .grid = .{ .x = 1 }, .block = .{ .x = 1024 } }, e.stream, &a);
+        try e.lib.check(e.lib.api.ncclAllGather(e.pairs.ptr + e.share.rank * 8, e.pairs_all.ptr, 2, .u32, e.comm, e.stream.handle), "ncclAllGather");
+        var p: cuda.Args = .{};
+        p.add(e.pairs_all.ptr);
+        p.add(@as(c_int, @intCast(world)));
+        p.add(token_out);
+        p.add(ids_slot);
+        try cuda.launch.launch(e.m.glue.pick_greedy, .{ .grid = .{ .x = 1 }, .block = .{ .x = 32 } }, e.stream, &p);
     }
 
     /// `rows` logits rows of this rank's vocabulary -> the tokens at positions first, first + 1, ...

@@ -982,6 +982,47 @@ pub const Forward = struct {
         }
     }
 
+    /// mtp with the ids already on the device (the drafted chain's picked token sits in b.ids): one row.
+    /// The device-side draft loop (TF_GLM_DRAFT_DEV) feeds each pick straight into the head without a
+    /// host round trip; everything but the ids upload is mtp's own body.
+    pub fn mtpDev(f: *const Forward, hidden: []const u64) !void {
+        const c = &f.ranks[0].w.config;
+        const D: usize = c.hidden;
+        const n: usize = 1;
+        for (f.ranks, hidden) |r, h| {
+            if (r.w.mtp == null) return error.NoMtpHead;
+            if (r.st.mtp_len + n > r.st.capacity) return error.PastCapacity;
+            if (h != r.b.hin) try f.d.check(f.d.api.cuMemcpyDtoDAsync_v2(r.b.hin, h, n * D * 2, f.stream.handle), "cuMemcpyDtoDAsync");
+            const m = r.w.mtp.?;
+            const b = r.b;
+            try glue.embedB16(f.set(), f.stream, b.ids, r.w.embed, b.me, n, D, 1);
+            if (r.st.mtp_len == 0) try f.d.check(f.d.api.cuMemsetD8Async(b.me, 0, D * 2, f.stream.handle), "cuMemsetD8Async"); // position 0's embedding is zeroed
+            try glue.rmsnorm(f.set(), f.stream, b.me, D, m.enorm, b.mcat, 2 * D, null, c.eps, n, D);
+            try glue.rmsnorm(f.set(), f.stream, b.hin, D, m.hnorm, b.mcat + D * 2, 2 * D, null, c.eps, n, D);
+            try b16.proj(f.set(), f.stream, b.mcat, 2 * D, m.eh, b.mx, b.kda.mm_part, n, D, 2 * D, false);
+            try glue.rmsnorm(f.set(), f.stream, b.mx, D, m.layer.in_norm, b.normed, D, b.xs, c.eps, n, D);
+            const nch = @min(latent.chunksFor(r.st.mtp_len + n), b.nch);
+            try dsa_block.block(.{ .set = f.set(), .ops = f.m.ops() }, f.stream, m.layer.mixer.mla, r.st.mtp_caches, b.dsa, b.normed, D, n, r.st.mtp_pos_dev, r.st.mtp_len, nch, b.part_rows, slot(r, n));
+        }
+        try f.gather(n);
+        for (f.ranks) |r| {
+            const m = r.w.mtp.?;
+            const b = r.b;
+            try glue.residualAdd(f.set(), f.stream, b.mx, b.mx, b.gathered, n, D, r.w.share.world);
+            try glue.rmsnorm(f.set(), f.stream, b.mx, D, m.layer.post_norm, b.normed, D, b.xs, c.eps, n, D);
+            try f.ffn(r, m.layer, n, slot(r, n));
+        }
+        try f.gather(n);
+        for (f.ranks) |r| {
+            const m = r.w.mtp.?;
+            const b = r.b;
+            try glue.residualAdd(f.set(), f.stream, b.mx, b.mx, b.gathered, n, D, r.w.share.world);
+            try glue.rmsnorm(f.set(), f.stream, b.mx + (n - 1) * D * 2, D, m.norm, b.fnormed, D, b.fxs, c.eps, 1, D);
+            if (b.prefill) continue;
+            if (m.draft) |dq| try q4.matmul(&f.m.q4, f.stream, b.fnormed, D, b.fxs, dq, b.logits, 1) else try b16.proj(f.set(), f.stream, b.fnormed, D, r.w.head, b.logits, b.kda.mm_part, 1, r.w.share.vocab.len(), D, false);
+        }
+    }
+
     /// forward.commit: keep the first `keep` rows; window KDA layers take new states (replayed if fewer), conv shifted.
     pub fn commit(f: *const Forward, keep: usize) !void {
         for (f.ranks) |r| {
