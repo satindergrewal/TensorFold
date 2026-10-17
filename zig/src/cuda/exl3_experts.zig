@@ -130,10 +130,19 @@ pub const MmaTile = enum { mt16, mt32, mt64 };
     pub fn mmaMixed(e: *const Experts, s: Stream, x: u64, x_stride: usize, rows: usize, slots: usize, pick: u64, suh_g: u64, suh_u: u64, svh_g: u64, svh_u: u64, suh_d: u64, svh_d: u64, mats_up: u64, mats_down: u64, plan: grouped.Plan, items: usize, z: u64, xg: u64, xu: u64, xd: u64, ey: u64, width: usize, dims: usize, limit: f32, book: c_uint, skip: i32, wide: MmaTile) !void {
                 // SK=8 measured best at ALL stream counts (adaptive-SK to 2 at multi-stream dropped
         // aggregate 40-47%: the expert kernel needs the split parallelism even at high rows)
+        // measured end-to-end on the 2x RTX PRO 6000 box: gate/up SK=2 with the down pass whole (SK=1)
+        // runs ~101 tok/s vs 90 at the old SK=8-for-both (the python engine's split direction; our
+        // kernel shape prefers 2 for gate/up) - TF_GLM_MMA_SK still overrides
         const sk: usize = if (std.c.getenv("TF_GLM_MMA_SK") != null) blk: {
             const v = std.c.getenv("TF_GLM_MMA_SK").?;
-            break :blk std.fmt.parseInt(usize, std.mem.span(v), 10) catch 8;
-        } else 8;
+            break :blk std.fmt.parseInt(usize, std.mem.span(v), 10) catch 2;
+        } else 2;
+        // the python engine splits the gate/up pass but runs the down pass whole (its SK=1):
+        // TF_GLM_MMA_SK_DOWN overrides the down pass alone (default: the shared SK)
+        const sk_down: usize = if (std.c.getenv("TF_GLM_MMA_SK_DOWN") != null) blk: {
+            const v = std.c.getenv("TF_GLM_MMA_SK_DOWN").?;
+            break :blk std.fmt.parseInt(usize, std.mem.span(v), 10) catch 1;
+        } else 1;
         const p = rows * slots;
         {
             var a: launch_.Args = .{};
@@ -192,11 +201,11 @@ pub const MmaTile = enum { mt16, mt32, mt64 };
             a.add(z);
             a.add(@as(i32, @intCast(dims)));
             a.add(@as(i32, @intCast(p)));
-            a.add(@as(c_int, @intCast(sk)));
+            a.add(@as(c_int, @intCast(sk_down)));
             a.add(skip);
             a.add(@as(c_uint, book));
             a.add(@as(c_int, 1));
-            if (wide == .mt32) try launch_.launch(e.mma_grouped32_fn, .{ .grid = .{ .x = @intCast(items), .y = @intCast(dims / 32), .z = @intCast(sk) }, .block = .{ .x = 128 }, .shared = 32 * 4 + 4 * 32 * 32 * 4 }, s, &a) else if (wide == .mt64) try launch_.launch(e.mma_grouped64_fn, .{ .grid = .{ .x = @intCast(items), .y = @intCast(dims / 16), .z = @intCast(sk) }, .block = .{ .x = 128 }, .shared = 64 * 4 + 4 * 64 * 16 * 4 }, s, &a) else try launch_.launch(e.mma_grouped16_fn, .{ .grid = .{ .x = @intCast(items), .y = @intCast(dims / 128), .z = @intCast(sk) }, .block = .{ .x = 128 }, .shared = 16 * 4 + 4 * 16 * 128 * 4 }, s, &a);
+            if (wide == .mt32) try launch_.launch(e.mma_grouped32_fn, .{ .grid = .{ .x = @intCast(items), .y = @intCast(dims / 32), .z = @intCast(sk_down) }, .block = .{ .x = 128 }, .shared = 32 * 4 + 4 * 32 * 32 * 4 }, s, &a) else if (wide == .mt64) try launch_.launch(e.mma_grouped64_fn, .{ .grid = .{ .x = @intCast(items), .y = @intCast(dims / 16), .z = @intCast(sk_down) }, .block = .{ .x = 128 }, .shared = 64 * 4 + 4 * 64 * 16 * 4 }, s, &a) else try launch_.launch(e.mma_grouped16_fn, .{ .grid = .{ .x = @intCast(items), .y = @intCast(dims / 128), .z = @intCast(sk_down) }, .block = .{ .x = 128 }, .shared = 16 * 4 + 4 * 16 * 128 * 4 }, s, &a);
         }
         {
             var a: launch_.Args = .{};
@@ -206,7 +215,7 @@ pub const MmaTile = enum { mt16, mt32, mt64 };
             a.add(ey);
             a.add(@as(i32, @intCast(p)));
             a.add(@as(i32, @intCast(dims)));
-            a.add(@as(c_int, @intCast(sk)));
+            a.add(@as(c_int, @intCast(sk_down)));
             a.add(@as(i32, @intCast(slots)));
             a.add(@as(i32, @intCast(slots)));
             a.add(skip);
