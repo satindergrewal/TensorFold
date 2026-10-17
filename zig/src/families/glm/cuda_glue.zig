@@ -113,6 +113,7 @@ pub const Kernels = struct {
     combine: cuda.Function,
     slice_sum: cuda.Function,
     top1: cuda.Function,
+    top1_rows: cuda.Function,
     put_words: cuda.Function,
     embed_b16: cuda.Function,
     conv_shift: cuda.Function,

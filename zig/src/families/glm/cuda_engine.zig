@@ -81,7 +81,8 @@ pub const Engine = struct {
     bm: fw.Buffers, // the MTP head's rows
     bs: ?fw.Buffers = null, // shared verify windows (with the MTP head, as the lane core shares only then)
     hold: cuda.DeviceBuffer, // the prompt's last row's hidden (decode's e.last_hidden), the first draft's source
-    pairs: cuda.DeviceBuffer, // every rank's (value, id) of a greedy draw
+    pairs: cuda.DeviceBuffer, // every rank's (value, id) of a greedy draw (the send slices)
+    pairs_all: cuda.DeviceBuffer, // the all-gather's destination: a separate buffer, out-of-place on every rank
     smp: sampler.Sampler,
     seqs: std.ArrayList(?*Seq) = .empty, // every stream's sequence by slot (the lane backend's), slot 0 made at init
     cur: *Seq = undefined, // the bound slot's: every step below runs on it
@@ -139,7 +140,7 @@ pub const Engine = struct {
         if (o.settings.layers > c.layers) return error.BadLayers;
         const layers = try a.alloc(u32, if (o.settings.layers > 0) o.settings.layers else c.layers);
         for (layers, 0..) |*l, i| l.* = @intCast(i);
-        e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = o.settings.heat, .root = heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .settings = o.settings, .m = m, .stream = stream, .pieces = pieces, .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .bm = undefined, .hold = undefined, .pairs = undefined, .smp = undefined, .mtp = o.mtp };
+        e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = o.settings.heat, .root = heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .settings = o.settings, .m = m, .stream = stream, .pieces = pieces, .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .bm = undefined, .hold = undefined, .pairs = undefined, .pairs_all = undefined, .smp = undefined, .mtp = o.mtp };
         e.w = try weights.load(gpa, io, d, stream, e.m.tools(), checkpoint, c, share, layers, o.mtp);
         errdefer e.w.deinit();
         try e.bind(0);
@@ -157,7 +158,8 @@ pub const Engine = struct {
         errdefer if (e.bs) |*b| b.deinit();
         e.hold = try cuda.DeviceBuffer.alloc(d, c.hidden * 2);
         errdefer e.hold.free();
-        e.pairs = try cuda.DeviceBuffer.alloc(d, 8 * world);
+        e.pairs = try cuda.DeviceBuffer.alloc(d, 8 * world * fw.window_rows);
+        e.pairs_all = try cuda.DeviceBuffer.alloc(d, 8 * world * fw.window_rows);
         errdefer e.pairs.free();
         e.smp = try sampler.Sampler.init(d, c.vocab, fw.window_rows);
         @import("cuda_latent.zig").setDriver(d);
@@ -216,6 +218,7 @@ pub const Engine = struct {
         e.shared_buf.free();
         e.smp.deinit();
         e.pairs.free();
+        e.pairs_all.free();
         e.hold.free();
         if (e.bs) |*b| b.deinit();
         e.bm.deinit();
@@ -744,11 +747,50 @@ pub const Engine = struct {
     /// `rows` logits rows of this rank's vocabulary -> the tokens at positions first, first + 1, ...
     fn draw(e: *Engine, logits: u64, rows: usize, first: u64, out: []u32) !void {
         if (e.cur.sampling) |s| return e.smp.draw(e.stream, e.exchange(), e.spans, &.{.{ .rank = e.share.rank, .logits = logits }}, rows, first, sampler.rule(s), out);
-        for (0..rows) |r| out[r] = try e.greedy(logits + r * e.share.vocab.len() * 2);
+        try e.greedyRows(logits, rows, out);
     }
 
-    /// decode.sample_rows' greedy pick: per-rank top-1 (tf_glm_top1), all-gathered, largest value then lowest id.
-    fn greedy(e: *Engine, logits: u64) !u32 {
+    /// decode.sample_rows' greedy pick for a whole window: the per-row top-1 launches stay, but the
+    /// count-2 all-gathers run as one NCCL group with ONE sync and ONE download for the whole window
+    /// (TF_GLM_GREEDY_ROWS=0 keeps a full round trip a row). Bit-exact vs the per-row path
+    /// (shas c6b7f32e/f5ac5dd91226 on both). Credit: BobClawblaw's TensorFold PR #978 launch surgery.
+    fn greedyRows(e: *Engine, logits: u64, rows: usize, out: []u32) !void {
+        const world = e.share.world;
+        if (std.c.getenv("TF_GLM_GREEDY_ROWS")) |v| {
+            if (std.mem.eql(u8, std.mem.span(v), "0")) {
+                for (0..rows) |r| out[r] = try e.greedyRow(logits + r * e.share.vocab.len() * 2);
+                return;
+            }
+        }
+        for (0..rows) |r| {
+            var a: cuda.Args = .{};
+            a.add(logits + r * e.share.vocab.len() * 2);
+            a.add(@as(i64, @intCast(e.share.vocab.len())));
+            a.add(@as(u32, @intCast(e.share.vocab.lo)));
+            a.add(e.pairs.ptr + e.share.rank * 8);
+            try cuda.launch.launch(e.m.glue.top1, .{ .grid = .{ .x = 1 }, .block = .{ .x = 1024 } }, e.stream, &a);
+            // one count-2 all-gather a row (the proven shape), grouped: one sync covers the whole window.
+            // Row r's gather lands at pairs_all + r*world*8, a separate destination (out-of-place on both ranks).
+            try e.lib.check(e.lib.api.ncclGroupStart(), "ncclGroupStart");
+            try e.lib.check(e.lib.api.ncclAllGather(e.pairs.ptr + e.share.rank * 8, e.pairs_all.ptr + r * world * 8, 2, .u32, e.comm, e.stream.handle), "ncclAllGather");
+            try e.lib.check(e.lib.api.ncclGroupEnd(), "ncclGroupEnd");
+        }
+        try e.stream.synchronize();
+        var all: [fw.window_rows * 16][2]u32 = undefined;
+        try e.d.check(e.d.api.cuMemcpyDtoH_v2(&all, e.pairs_all.ptr, world * rows * 8), "cuMemcpyDtoH");
+        for (0..rows) |r| {
+            var pick = all[r * world];
+            for (all[r * world + 1 .. r * world + world]) |p| {
+                const v: f32 = @bitCast(p[0]);
+                const b: f32 = @bitCast(pick[0]);
+                if (v > b or (v == b and p[1] < pick[1])) pick = p;
+            }
+            out[r] = pick[1];
+        }
+    }
+
+    /// The original single-row greedy: per-rank top-1 (tf_glm_top1), all-gathered, largest value then lowest id.
+    fn greedyRow(e: *Engine, logits: u64) !u32 {
         const world = e.share.world;
         var a: cuda.Args = .{};
         a.add(logits);

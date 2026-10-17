@@ -218,6 +218,36 @@ extern "C" __global__ void __launch_bounds__(1024) tf_glm_top1(const unsigned sh
   }
 }
 
+// The same pick for every row of a verify window in ONE launch: a block a row, out [rows][2] (value bits, lo+id).
+// Credit: BobClawblaw's TensorFold PR #978 (q35-speed) - the per-row launch/collective/sync loop serialized the round.
+extern "C" __global__ void __launch_bounds__(1024) tf_glm_top1_rows(const unsigned short* logits, int64_t n, int64_t vocab,
+                                                                     unsigned lo, int rows, unsigned* out) {
+  __shared__ float sv[1024];
+  __shared__ unsigned si[1024];
+  const int r = blockIdx.x, t = threadIdx.x;
+  const unsigned short* row = logits + (int64_t)r * vocab;
+  float top = -__int_as_float(0x7f800000);
+  unsigned best = 0xffffffffu;
+  for (int64_t i = t; i < n; i += 1024) {
+    const float v = __int_as_float(static_cast<int>(static_cast<unsigned>(row[i]) << 16));
+    if (v > top) top = v, best = static_cast<unsigned>(i);
+  }
+  sv[t] = top, si[t] = best;
+  __syncthreads();
+  for (int h = 512; h > 0; h >>= 1) {
+    if (t < h) {
+      const float a = sv[t], b = sv[t + h];
+      const unsigned ia = si[t], ib = si[t + h];
+      if (b > a || (b == a && ib < ia)) sv[t] = b, si[t] = ib;
+    }
+    __syncthreads();
+  }
+  if (t == 0) {
+    out[2 * r] = __float_as_uint(sv[0]);
+    out[2 * r + 1] = lo + (si[0] == 0xffffffffu ? 0u : si[0]);
+  }
+}
+
 // The leader's step for the other ranks, written to the link's buffer from launch arguments (cuda_follow's Link.send).
 struct tf_glm_words {
   unsigned w[96];
