@@ -333,19 +333,33 @@ __device__ __forceinline__ float tf_exl3m_bf16r(float x) {
     return __bfloat162float(__float2bfloat16_rn(x));
 }
 
+// Launch order only (credit: MiaAI-Lab patch 0090, glm-expert-launch-order): with swz set, a block's
+// (item, column block, mat*SK+split) come from a linear remap so one item's blocks (swz 2) or one k
+// slice's blocks (swz 1) launch together - the shared X rows and the expert's trellis neighborhood
+// stay hot in L2, and consecutive blocks' items/count dispatch loads coalesce. No math changes.
+__device__ __forceinline__ void tf_exl3m_swz(int swz, int& item, int& nby, int& zz) {
+    if (!swz) { item = blockIdx.x; nby = blockIdx.y; zz = blockIdx.z; return; }
+    const unsigned lid = blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z);
+    const unsigned r = lid / gridDim.y;
+    nby = (int)(lid % gridDim.y);
+    if (swz == 1) { item = (int)(r % gridDim.x); zz = (int)(r / gridDim.x); }
+    else { zz = (int)(r % gridDim.z); item = (int)(r / gridDim.z); }
+}
+
 template <int MT, int NT, int W, int K, bool XROW = false>
 __device__ __forceinline__ void tf_exl3m_body(const half* __restrict__ X0, const half* __restrict__ X1,
         const TfExl3Mat* __restrict__ mdb, const int* __restrict__ items, const int* __restrict__ counts,
         const int* __restrict__ members, float* __restrict__ Z, int N, int P, int SK, int skip, unsigned book,
-        int mats, int slots, int* __restrict__ rows_sh, float* __restrict__ red) {
-    const int item = blockIdx.x;
+        int mats, int slots, int* __restrict__ rows_sh, float* __restrict__ red, int swz) {
+    int item, nby, zz;
+    tf_exl3m_swz(swz, item, nby, zz);
     if (item >= counts[0]) return;
     const int e = items[3 * item];
     if (e == skip) return;
     const int first = items[3 * item + 1], cnt = items[3 * item + 2];
-    const int mat = blockIdx.z / SK;
+    const int mat = zz / SK;
     const TfExl3Mat& md = mdb[(size_t)e * mats + mat];
-    const int split = blockIdx.z % SK;
+    const int split = zz % SK;
     const half* X = mat ? X1 : X0;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int g = lane >> 2, t = lane & 3;
@@ -369,7 +383,7 @@ __device__ __forceinline__ void tf_exl3m_body(const half* __restrict__ X0, const
 
     const int per_split = KT / SK, per_warp = per_split / W;
     const int kt0 = split * per_split + warp * per_warp;
-    const int nt0 = blockIdx.y * NT;
+    const int nt0 = nby * NT;
     const uint32_t* tile = reinterpret_cast<const uint32_t*>(md.trellis) + ((size_t)kt0 * NTILES + nt0) * (8 * K);
 
     float acc[MT][NT][2][4];
@@ -431,7 +445,7 @@ __device__ __forceinline__ void tf_exl3m_body(const half* __restrict__ X0, const
         float s = red[row * (NT * 16) + col];
 #pragma unroll
         for (int w = 1; w < W; ++w) s += red[((size_t)w * ROWS + row) * (NT * 16) + col];
-        Z[(((size_t)mat * SK + split) * P + r) * N + blockIdx.y * NT * 16 + col] = s;
+        Z[(((size_t)mat * SK + split) * P + r) * N + nby * NT * 16 + col] = s;
     }
 }
 
@@ -442,20 +456,22 @@ template <int MT, int NT, int W>
 __device__ __forceinline__ void tf_exl3m_grouped(const half* __restrict__ X0, const half* __restrict__ X1,
         const TfExl3Mat* __restrict__ mdb, const int* __restrict__ items, const int* __restrict__ counts,
         const int* __restrict__ members, float* __restrict__ Z, int N, int P, int SK, int skip, unsigned book,
-        int mats, int slots, int xrow) {
-    if (blockIdx.x >= counts[0]) return;
-    const int e = items[3 * blockIdx.x];
+        int mats, int slots, int xrow, int swz) {
+    int item, nby, zz;
+    tf_exl3m_swz(swz, item, nby, zz);
+    if (item >= counts[0]) return;
+    const int e = items[3 * item];
     if (e == skip) return;
     extern __shared__ char tf_exl3m_smem[];  // rows then the warps' partial sums: one block, both widths
     int* rows_sh = reinterpret_cast<int*>(tf_exl3m_smem);
     float* red = reinterpret_cast<float*>(tf_exl3m_smem + ((16 * MT * 4 + 15) & ~15));
-    const unsigned bits = mdb[(size_t)e * mats + blockIdx.z / SK].bits;
+    const unsigned bits = mdb[(size_t)e * mats + zz / SK].bits;
     if (xrow) {
-        if (bits == 3) tf_exl3m_body<MT, NT, W, 3, true>(X0, X1, mdb, items, counts, members, Z, N, P, SK, skip, book, mats, slots, rows_sh, red);
-        else if (bits == 4) tf_exl3m_body<MT, NT, W, 4, true>(X0, X1, mdb, items, counts, members, Z, N, P, SK, skip, book, mats, slots, rows_sh, red);
+        if (bits == 3) tf_exl3m_body<MT, NT, W, 3, true>(X0, X1, mdb, items, counts, members, Z, N, P, SK, skip, book, mats, slots, rows_sh, red, swz);
+        else if (bits == 4) tf_exl3m_body<MT, NT, W, 4, true>(X0, X1, mdb, items, counts, members, Z, N, P, SK, skip, book, mats, slots, rows_sh, red, swz);
     } else {
-        if (bits == 3) tf_exl3m_body<MT, NT, W, 3, false>(X0, X1, mdb, items, counts, members, Z, N, P, SK, skip, book, mats, slots, rows_sh, red);
-        else if (bits == 4) tf_exl3m_body<MT, NT, W, 4, false>(X0, X1, mdb, items, counts, members, Z, N, P, SK, skip, book, mats, slots, rows_sh, red);
+        if (bits == 3) tf_exl3m_body<MT, NT, W, 3, false>(X0, X1, mdb, items, counts, members, Z, N, P, SK, skip, book, mats, slots, rows_sh, red, swz);
+        else if (bits == 4) tf_exl3m_body<MT, NT, W, 4, false>(X0, X1, mdb, items, counts, members, Z, N, P, SK, skip, book, mats, slots, rows_sh, red, swz);
     }
 }
 
@@ -503,8 +519,8 @@ extern "C" __global__ void tf_exl3m_rot_rows(const __nv_bfloat16* __restrict__ x
 extern "C" __global__ void __launch_bounds__(128) tf_exl3m_grouped32(const half* __restrict__ X0,
         const half* __restrict__ X1, const TfExl3Mat* __restrict__ mdb, const int* __restrict__ items,
         const int* __restrict__ counts, const int* __restrict__ members, float* __restrict__ Z, int N, int P,
-        int SK, int skip, unsigned book, int mats, int slots, int xrow) {
-    tf_exl3m_grouped<2, 2, 4>(X0, X1, mdb, items, counts, members, Z, N, P, SK, skip, book, mats, slots, xrow);
+        int SK, int skip, unsigned book, int mats, int slots, int xrow, int swz) {
+    tf_exl3m_grouped<2, 2, 4>(X0, X1, mdb, items, counts, members, Z, N, P, SK, skip, book, mats, slots, xrow, swz);
 }
 
 // items of 64 pairs, 2 n-tiles a block, 4 warps (their glm_exl3_grouped64's shape): one tile decode feeds
@@ -512,17 +528,17 @@ extern "C" __global__ void __launch_bounds__(128) tf_exl3m_grouped32(const half*
 extern "C" __global__ void __launch_bounds__(128) tf_exl3m_grouped64(const half* __restrict__ X0,
         const half* __restrict__ X1, const TfExl3Mat* __restrict__ mdb, const int* __restrict__ items,
         const int* __restrict__ counts, const int* __restrict__ members, float* __restrict__ Z, int N, int P,
-        int SK, int skip, unsigned book, int mats, int slots, int xrow) {
+        int SK, int skip, unsigned book, int mats, int slots, int xrow, int swz) {
     // NT=1: half the accumulator registers of the first try's <4,2,4> (which regressed) at 16 columns a block
-    tf_exl3m_grouped<4, 1, 4>(X0, X1, mdb, items, counts, members, Z, N, P, SK, skip, book, mats, slots, xrow);
+    tf_exl3m_grouped<4, 1, 4>(X0, X1, mdb, items, counts, members, Z, N, P, SK, skip, book, mats, slots, xrow, swz);
 }
 
 // items of 16 pairs, 8 n-tiles a block, 4 warps (their glm_exl3_grouped's shape).
 extern "C" __global__ void __launch_bounds__(128) tf_exl3m_grouped16(const half* __restrict__ X0,
         const half* __restrict__ X1, const TfExl3Mat* __restrict__ mdb, const int* __restrict__ items,
         const int* __restrict__ counts, const int* __restrict__ members, float* __restrict__ Z, int N, int P,
-        int SK, int skip, unsigned book, int mats, int slots, int xrow) {
-    tf_exl3m_grouped<1, 8, 4>(X0, X1, mdb, items, counts, members, Z, N, P, SK, skip, book, mats, slots, xrow);
+        int SK, int skip, unsigned book, int mats, int slots, int xrow, int swz) {
+    tf_exl3m_grouped<1, 8, 4>(X0, X1, mdb, items, counts, members, Z, N, P, SK, skip, book, mats, slots, xrow, swz);
 }
 
 // The FUSED down pass (TF_GLM_MMA_FDOWN, on when SK_DOWN=1): the grouped16 shape's accumulation (MT=1, NT=8 -
