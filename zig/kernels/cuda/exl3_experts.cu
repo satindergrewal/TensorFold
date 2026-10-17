@@ -333,11 +333,11 @@ __device__ __forceinline__ float tf_exl3m_bf16r(float x) {
     return __bfloat162float(__float2bfloat16_rn(x));
 }
 
-template <int MT, int NT, int W, int K>
+template <int MT, int NT, int W, int K, bool XROW = false>
 __device__ __forceinline__ void tf_exl3m_body(const half* __restrict__ X0, const half* __restrict__ X1,
         const TfExl3Mat* __restrict__ mdb, const int* __restrict__ items, const int* __restrict__ counts,
         const int* __restrict__ members, float* __restrict__ Z, int N, int P, int SK, int skip, unsigned book,
-        int mats, int* __restrict__ rows_sh, float* __restrict__ red) {
+        int mats, int slots, int* __restrict__ rows_sh, float* __restrict__ red) {
     const int item = blockIdx.x;
     if (item >= counts[0]) return;
     const int e = items[3 * item];
@@ -361,8 +361,10 @@ __device__ __forceinline__ void tf_exl3m_body(const half* __restrict__ X0, const
     for (int m = 0; m < MT; ++m) {
         r0[m] = rows_sh[m * 16 + g];
         r1[m] = rows_sh[m * 16 + g + 8];
-        x0[m] = X + (size_t)(r0[m] < 0 ? 0 : r0[m]) * md.k + 2 * t;
-        x1[m] = X + (size_t)(r1[m] < 0 ? 0 : r1[m]) * md.k + 2 * t;
+        const int xr0 = XROW ? r0[m] / slots : r0[m];  // a row-indexed rotation: one xr row serves every pair
+        const int xr1 = XROW ? r1[m] / slots : r1[m];
+        x0[m] = X + (size_t)(r0[m] < 0 ? 0 : xr0) * md.k + 2 * t;
+        x1[m] = X + (size_t)(r1[m] < 0 ? 0 : xr1) * md.k + 2 * t;
     }
 
     const int per_split = KT / SK, per_warp = per_split / W;
@@ -440,7 +442,7 @@ template <int MT, int NT, int W>
 __device__ __forceinline__ void tf_exl3m_grouped(const half* __restrict__ X0, const half* __restrict__ X1,
         const TfExl3Mat* __restrict__ mdb, const int* __restrict__ items, const int* __restrict__ counts,
         const int* __restrict__ members, float* __restrict__ Z, int N, int P, int SK, int skip, unsigned book,
-        int mats) {
+        int mats, int slots, int xrow) {
     if (blockIdx.x >= counts[0]) return;
     const int e = items[3 * blockIdx.x];
     if (e == skip) return;
@@ -448,8 +450,13 @@ __device__ __forceinline__ void tf_exl3m_grouped(const half* __restrict__ X0, co
     int* rows_sh = reinterpret_cast<int*>(tf_exl3m_smem);
     float* red = reinterpret_cast<float*>(tf_exl3m_smem + ((16 * MT * 4 + 15) & ~15));
     const unsigned bits = mdb[(size_t)e * mats + blockIdx.z / SK].bits;
-    if (bits == 3) tf_exl3m_body<MT, NT, W, 3>(X0, X1, mdb, items, counts, members, Z, N, P, SK, skip, book, mats, rows_sh, red);
-    else if (bits == 4) tf_exl3m_body<MT, NT, W, 4>(X0, X1, mdb, items, counts, members, Z, N, P, SK, skip, book, mats, rows_sh, red);
+    if (xrow) {
+        if (bits == 3) tf_exl3m_body<MT, NT, W, 3, true>(X0, X1, mdb, items, counts, members, Z, N, P, SK, skip, book, mats, slots, rows_sh, red);
+        else if (bits == 4) tf_exl3m_body<MT, NT, W, 4, true>(X0, X1, mdb, items, counts, members, Z, N, P, SK, skip, book, mats, slots, rows_sh, red);
+    } else {
+        if (bits == 3) tf_exl3m_body<MT, NT, W, 3, false>(X0, X1, mdb, items, counts, members, Z, N, P, SK, skip, book, mats, slots, rows_sh, red);
+        else if (bits == 4) tf_exl3m_body<MT, NT, W, 4, false>(X0, X1, mdb, items, counts, members, Z, N, P, SK, skip, book, mats, slots, rows_sh, red);
+    }
 }
 
 // X rows (bf16, x_stride apart) -> the pairs' gate and up rotations: xg/xu [pairs][K] half. One warp a program.
@@ -471,13 +478,33 @@ extern "C" __global__ void tf_exl3m_rot_in(const __nv_bfloat16* __restrict__ x, 
     for (int j = 0; j < 4; ++j) o[j] = __float2half_rn(v[j] * 0.08838834764831845f);
 }
 
+// XROW (TF_GLM_MMA_XROW): when a layer's experts share one gate/up suh - this checkpoint's quant does, every
+// expert's gate and up suh byte-identical - ONE rotation a row serves both mats and all its pairs. A row is
+// rotated by its first pair's expert's suh rows (any pair gives the same bytes); xr [rows][K] half.
+extern "C" __global__ void tf_exl3m_rot_rows(const __nv_bfloat16* __restrict__ x, int x_stride, int slots,
+        const int* __restrict__ pick, const half* __restrict__ suh, half* __restrict__ xr, int K, int skip) {
+    const int r = blockIdx.x, blk = blockIdx.y;
+    const int lane = threadIdx.x;
+    const int e = pick[r * slots];
+    const bool live = e != skip;
+    const half* s = suh + (size_t)(live ? e : 0) * K + blk * 128 + 4 * lane;
+    const __nv_bfloat16* xr_in = x + (size_t)r * x_stride + blk * 128 + 4 * lane;
+    float v[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) v[j] = live ? __bfloat162float(xr_in[j]) * __half2float(s[j]) : 0.f;
+    tf_exl3_fwht(v, lane);
+    half* o = xr + (size_t)r * K + blk * 128 + 4 * lane;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) o[j] = __float2half_rn(v[j] * 0.08838834764831845f);
+}
+
 // items of 32 pairs, 2 n-tiles a block, 4 warps: the middle shape — one tile decode feeds twice the rows of
 // grouped16 at half grouped64's register pressure (shared windows' hot experts hold 20-30 pairs).
 extern "C" __global__ void __launch_bounds__(128) tf_exl3m_grouped32(const half* __restrict__ X0,
         const half* __restrict__ X1, const TfExl3Mat* __restrict__ mdb, const int* __restrict__ items,
         const int* __restrict__ counts, const int* __restrict__ members, float* __restrict__ Z, int N, int P,
-        int SK, int skip, unsigned book, int mats) {
-    tf_exl3m_grouped<2, 2, 4>(X0, X1, mdb, items, counts, members, Z, N, P, SK, skip, book, mats);
+        int SK, int skip, unsigned book, int mats, int slots, int xrow) {
+    tf_exl3m_grouped<2, 2, 4>(X0, X1, mdb, items, counts, members, Z, N, P, SK, skip, book, mats, slots, xrow);
 }
 
 // items of 64 pairs, 2 n-tiles a block, 4 warps (their glm_exl3_grouped64's shape): one tile decode feeds
@@ -485,17 +512,17 @@ extern "C" __global__ void __launch_bounds__(128) tf_exl3m_grouped32(const half*
 extern "C" __global__ void __launch_bounds__(128) tf_exl3m_grouped64(const half* __restrict__ X0,
         const half* __restrict__ X1, const TfExl3Mat* __restrict__ mdb, const int* __restrict__ items,
         const int* __restrict__ counts, const int* __restrict__ members, float* __restrict__ Z, int N, int P,
-        int SK, int skip, unsigned book, int mats) {
+        int SK, int skip, unsigned book, int mats, int slots, int xrow) {
     // NT=1: half the accumulator registers of the first try's <4,2,4> (which regressed) at 16 columns a block
-    tf_exl3m_grouped<4, 1, 4>(X0, X1, mdb, items, counts, members, Z, N, P, SK, skip, book, mats);
+    tf_exl3m_grouped<4, 1, 4>(X0, X1, mdb, items, counts, members, Z, N, P, SK, skip, book, mats, slots, xrow);
 }
 
 // items of 16 pairs, 8 n-tiles a block, 4 warps (their glm_exl3_grouped's shape).
 extern "C" __global__ void __launch_bounds__(128) tf_exl3m_grouped16(const half* __restrict__ X0,
         const half* __restrict__ X1, const TfExl3Mat* __restrict__ mdb, const int* __restrict__ items,
         const int* __restrict__ counts, const int* __restrict__ members, float* __restrict__ Z, int N, int P,
-        int SK, int skip, unsigned book, int mats) {
-    tf_exl3m_grouped<1, 8, 4>(X0, X1, mdb, items, counts, members, Z, N, P, SK, skip, book, mats);
+        int SK, int skip, unsigned book, int mats, int slots, int xrow) {
+    tf_exl3m_grouped<1, 8, 4>(X0, X1, mdb, items, counts, members, Z, N, P, SK, skip, book, mats, slots, xrow);
 }
 
 // The FUSED down pass (TF_GLM_MMA_FDOWN, on when SK_DOWN=1): the grouped16 shape's accumulation (MT=1, NT=8 -
