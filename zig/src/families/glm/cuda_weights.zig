@@ -46,6 +46,7 @@ pub const Weights = struct {
     head_b16_for_draft: u64 = 0, // the bf16 head rows kept for the 4-bit draft head when the head itself is FP4
     exl3: bool = false, // an EXL3 checkpoint: the attention, shared expert, dense MLP and head quantized
     exl3_experts: bool = false, // routed experts EXL3 with bf16 attention (our hybrid)
+    nvfp4_bf16_dense: bool = false, // routed experts NVFP4 with bf16 dense layers (the ModelOpt carrier)
     mtp: ?Mtp = null,
     buffers: std.ArrayList(cuda.DeviceBuffer) = .empty,
     named: std.ArrayList(Named) = .empty,
@@ -310,7 +311,7 @@ pub const Loader = struct {
         const c = &L.w.config;
         const s = L.w.share.dense;
         const d = c.hidden;
-        if (L.w.exl3_experts) {
+        if (L.w.exl3_experts or L.w.nvfp4_bf16_dense) {
             try L.cols(try L.get("layers.{d}.mlp.down_proj.weight", .{i}), s.lo, s.hi, .bf16);
             const down = try L.put("layers.{d}.mlp.down_proj.b16", .{i});
             return .{
@@ -562,6 +563,11 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, stream: c
         var nbf: [192]u8 = undefined;
         const moe0 = try std.fmt.bufPrint(&nbf, "{s}layers.{d}.mlp.experts.0.gate_proj.trellis", .{ prefix, c.dense_layers });
         w.exl3_experts = ck.has(moe0);
+       {
+        var nbd: [192]u8 = undefined;
+        const dense0 = try std.fmt.bufPrint(&nbd, "{s}layers.0.mlp.gate_proj.weight_scale", .{prefix});
+        w.nvfp4_bf16_dense = !ck.has(dense0);
+    }
     }
     w.layers = try gpa.alloc(Layer, layers.len);
     for (layers, w.layers) |i, *l| {
