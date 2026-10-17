@@ -47,6 +47,7 @@ pub const Weights = struct {
     exl3: bool = false, // an EXL3 checkpoint: the attention, shared expert, dense MLP and head quantized
     exl3_experts: bool = false, // routed experts EXL3 with bf16 attention (our hybrid)
     nvfp4_bf16_dense: bool = false, // routed experts NVFP4 with bf16 dense layers (the ModelOpt carrier)
+    nvfp4_experts: bool = false, // routed experts NVFP4 whatever the rest's format (the mixed bake)
     mtp: ?Mtp = null,
     buffers: std.ArrayList(cuda.DeviceBuffer) = .empty,
     named: std.ArrayList(Named) = .empty,
@@ -408,8 +409,13 @@ pub const Loader = struct {
 
     /// weights.load's moe(i) on NVFP4: router and bias, routed experts as Experts4, the BF16 shared expert's share.
     fn moeLayer(L: *Loader, i: u32) !moe.Layer {
-        if (L.w.exl3) return x3.moe(L, i);
-        if (L.w.exl3_experts) return x3.moeHybrid(L, i);
+        if (L.w.nvfp4_experts and i < L.w.config.layers) {
+            // mixed bake: EXL3 attention/dense/head elsewhere, NVFP4 routed experts here
+        } else if (L.w.exl3) {
+            return x3.moe(L, i);
+        } else if (L.w.exl3_experts) {
+            return x3.moeHybrid(L, i);
+        }
         const c = &L.w.config;
         const d: usize = c.hidden;
         const cut = L.w.share.moe;
@@ -566,7 +572,12 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, stream: c
        {
         var nbd: [192]u8 = undefined;
         const dense0 = try std.fmt.bufPrint(&nbd, "{s}layers.0.mlp.gate_proj.weight_scale", .{prefix});
-        w.nvfp4_bf16_dense = !ck.has(dense0);
+        var nbt: [192]u8 = undefined;
+        const dense0t = try std.fmt.bufPrint(&nbt, "{s}layers.0.mlp.gate_proj.trellis", .{prefix});
+        w.nvfp4_bf16_dense = !ck.has(dense0) and !ck.has(dense0t);
+        var nbe: [192]u8 = undefined;
+        const exp0s = try std.fmt.bufPrint(&nbe, "{s}layers.{d}.mlp.experts.0.gate_proj.weight_scale", .{ prefix, c.dense_layers });
+        w.nvfp4_experts = ck.has(exp0s);
     }
     }
     w.layers = try gpa.alloc(Layer, layers.len);
