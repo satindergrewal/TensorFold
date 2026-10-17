@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #define TF_FULL 0xFFFFFFFFu
+__device__ __forceinline__ uint32_t tf_h2u(__half2 v) { uint32_t u; __builtin_memcpy(&u, &v, 4); return u; }
 
 // The unnormalized Sylvester transform of 128 values held as lane + 32 q, in one fixed order of fp32 adds.
 __device__ __forceinline__ void tf_exl3_fwht(float (&v)[4], unsigned lane) {
@@ -34,6 +35,21 @@ __device__ __forceinline__ __half tf_exl3_value(unsigned state) {
   // the two halves' exponents differ by at most a few binades, so the fp32 sum is exact
   const float s = __fadd_rn(__half2float(__ushort_as_half((unsigned short)(m & 0xFFFFu))), __half2float(__ushort_as_half((unsigned short)(m >> 16))));
   return __float2half_rn(s);
+}
+
+// Two MCG / 3inst values at once, half2: the halves' fp32 sum is exact (the comment above), so rounding
+// that exact sum once to fp16 equals the correctly rounded half2 add of the two half patterns - the same
+// bits, half the arithmetic per value pair (the decode is ALU-bound in the mma windows).
+template <int C>
+__device__ __forceinline__ __half2 tf_exl3_value2(unsigned s0, unsigned s1) {
+  const unsigned x0 = C == 1 ? s0 * 0xCBAC1FEDu : s0 * 89226354u + 64248484u;
+  const unsigned x1 = C == 1 ? s1 * 0xCBAC1FEDu : s1 * 89226354u + 64248484u;
+  const unsigned m0 = (x0 & 0x8FFF8FFFu) ^ 0x3B603B60u;
+  const unsigned m1 = (x1 & 0x8FFF8FFFu) ^ 0x3B603B60u;
+  uint32_t lo, hi; // byte permutes assemble (m0.lo, m1.lo) and (m0.hi, m1.hi): two ops, no extracts
+  asm("prmt.b32 %0, %1, %2, 0x5410;" : "=r"(lo) : "r"(m0), "r"(m1));
+  asm("prmt.b32 %0, %1, %2, 0x7632;" : "=r"(hi) : "r"(m0), "r"(m1));
+  return __hadd2(*reinterpret_cast<const __half2*>(&lo), *reinterpret_cast<const __half2*>(&hi));
 }
 
 // Lane l's stream words for its eight values 8 l .. 8 l + 7: the four u32 words its states span, MSB first.
@@ -83,7 +99,11 @@ __device__ __forceinline__ void tf_exl3_unpack(uint4 t, unsigned lane, __half (&
     }
   } else {
 #pragma unroll
-    for (int n = 0; n < 8; ++n) w[n] = tf_exl3_value<C>(st[n]);
+    for (int n = 0; n < 8; n += 2) {
+      const __half2 v = tf_exl3_value2<C>(st[n], st[n + 1]);
+      w[n] = __low2half(v);
+      w[n + 1] = __high2half(v);
+    }
   }
 }
 
@@ -93,6 +113,29 @@ __device__ __forceinline__ void tf_exl3_unpack_any(uint4 t, unsigned lane, unsig
   if (book == 2) tf_exl3_unpack<K, 2>(t, lane, w);
   else if (book == 1) tf_exl3_unpack<K, 1>(t, lane, w);
   else tf_exl3_unpack<K, 0>(t, lane, w);
+}
+
+// The four mma fragment words of a tile straight out of the decode: the half2 paths already hold each
+// pair, so no half array is built and re-packed.
+template <int K>
+__device__ __forceinline__ void tf_exl3_pairs_any(uint4 t, unsigned lane, unsigned book, uint32_t (&p)[4]) {
+  unsigned st[8];
+  tf_exl3_states<K>(t, lane, st);
+  if (book == 2) {
+    const __half2 scale = __half2half2(__ushort_as_half(0x1EEE)), bias = __half2half2(__ushort_as_half(0xC931));
+#pragma unroll
+    for (int n = 0; n < 8; n += 2) {
+      const __half2 h = __halves2half2(__uint2half_rn(__dp4a(st[n] * 0x83DCD12Du, 0x01010101u, 1024u)),
+                                       __uint2half_rn(__dp4a(st[n + 1] * 0x83DCD12Du, 0x01010101u, 1024u)));
+      p[n / 2] = tf_h2u(__hfma2(h, scale, bias));
+    }
+  } else if (book == 1) {
+#pragma unroll
+    for (int n = 0; n < 8; n += 2) p[n / 2] = tf_h2u(tf_exl3_value2<1>(st[n], st[n + 1]));
+  } else {
+#pragma unroll
+    for (int n = 0; n < 8; n += 2) p[n / 2] = tf_h2u(tf_exl3_value2<0>(st[n], st[n + 1]));
+  }
 }
 
 template <int K, int C>

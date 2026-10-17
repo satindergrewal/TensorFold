@@ -410,10 +410,9 @@ __device__ __forceinline__ void tf_exl3m_body(const half* __restrict__ X0, const
 #pragma unroll
         for (int i = 0; i < NT; ++i) {
             const uint4 tw = tf_exl3_words<K>(tile + i * (8 * K), lane);
-            __half w[8];
-            tf_exl3_unpack_any<K>(tw, lane, book, w);
-            const uint32_t b0 = tf_exl3_pair(w[0], w[1]), b1 = tf_exl3_pair(w[2], w[3]);
-            const uint32_t b2 = tf_exl3_pair(w[4], w[5]), b3 = tf_exl3_pair(w[6], w[7]);
+            uint32_t bp[4];
+            tf_exl3_pairs_any<K>(tw, lane, book, bp);
+            const uint32_t b0 = bp[0], b1 = bp[1], b2 = bp[2], b3 = bp[3];
 #pragma unroll
             for (int m = 0; m < MT; ++m) {
                 tf_exl3_mma(acc[m][i][0], a[m], b0, b1);
