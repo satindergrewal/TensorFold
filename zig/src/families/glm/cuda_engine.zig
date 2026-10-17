@@ -49,7 +49,7 @@ const Seq = struct {
 };
 
 const GraphKey = struct { slot: u32, rows: u8, parity: u8, bucket: u8 = 0 };
-const DraftKey = struct { slot: u32, nch: u16, parity: u8, dense: u8 };
+const DraftKey = struct { slot: u32, nch: u16, dense: u8 }; // no parity: the MTP layer's mixer is MLA (no KDA state)
 const VerifyGraph = struct { exec: cuda.graph.Exec, nch: usize };
 
 /// One rank's copy of a kept prompt state: the state arena's bytes and the host fields beside them.
@@ -661,13 +661,24 @@ pub const Engine = struct {
                     e.cur.st.prompt = e.bd.prefill;
                     if (std.c.getenv("TF_GLM_RPROF") != null) {
                         const t0 = profNow2();
+                        if (vprof_ev[0].handle == null) {
+                            for (&vprof_ev) |*ev| ev.* = cuda.Event.init(e.d, true) catch unreachable;
+                            vprof_ev_ok = true;
+                        }
+                        if (vprof_ev_ok) try vprof_ev[0].record(e.stream);
                         try g.exec.launchOn(e.stream);
+                        if (vprof_ev_ok) try vprof_ev[1].record(e.stream);
                         const t1 = profNow2();
                         e.cur.rows_at = e.bd.fnormed;
                         try e.draw(e.bd.logits, ids.len, e.cur.st.pos + 1, out);
+                        if (vprof_ev_ok) try vprof_ev[2].record(e.stream);
                         const t2 = profNow2();
                         prof_launch_ns += t1 - t0;
                         prof_draw_ns += t2 - t1;
+                        if (vprof_ev_ok) {
+                            prof_replay_ms += vprof_ev[0].elapsedMs(vprof_ev[1]) catch 0;
+                            prof_coll_ms += vprof_ev[1].elapsedMs(vprof_ev[2]) catch 0;
+                        }
                         profTick();
                         return;
                     }
@@ -815,7 +826,6 @@ pub const Engine = struct {
         const key: DraftKey = .{
             .slot = e.slot,
             .nch = @intCast(nch_d),
-            .parity = @as(u8, e.cur.st.cur[0]),
             .dense = @intFromBool(e.cur.st.mtp_len < e.c.keyWidth()),
         };
         try e.d.check(e.d.api.cuMemsetD32Async(e.draft_idx.ptr, 0, 1, e.stream.handle), "cuMemsetD32Async");
@@ -837,6 +847,7 @@ pub const Engine = struct {
                 _ = cuda.graph.endCapture(e.stream) catch {};
                 return error.DraftGraphCapture;
             }
+            std.debug.print("DGCAP mtp_len={d} nch={d} dense={d}\n", .{ e.cur.st.mtp_len, nch_d, key.dense });
             const cap = try cuda.graph.endCapture(e.stream);
             defer {
                 var gm = cap;
@@ -851,6 +862,7 @@ pub const Engine = struct {
         // the round's forward steps: the first launch also runs a fresh capture
         var steps: usize = 0;
         while (steps < depth - 1) : (steps += 1) {
+            std.debug.print("DGREP mtp_len={d} step={d} key_nch={d}\n", .{ e.cur.st.mtp_len, steps, key.nch });
             try g.?.launchOn(e.stream);
             e.cur.st.mtp_len += 1;
             e.cur.in_head += 1;
@@ -890,12 +902,18 @@ pub const Engine = struct {
     pub var prof_launch_ns: u64 = 0;
     pub var prof_draw_ns: u64 = 0;
     pub var prof_n: u64 = 0;
+    var vprof_ev: [3]cuda.Event = .{ undefined, undefined, undefined };
+    var vprof_ev_ok: bool = false;
+    var prof_replay_ms: f32 = 0;
+    var prof_coll_ms: f32 = 0;
     fn profTick() void {
         prof_n += 1;
         if (prof_n % 128 == 0) {
-            std.debug.print("VPROF calls={d} launch_us={d} draw_us={d}\n", .{ prof_n, prof_launch_ns / 128 / 1000, prof_draw_ns / 128 / 1000 });
+            std.debug.print("VPROF calls={d} launch_us={d} draw_us={d} replay_gpu_us={d} draw_gpu_us={d}\n", .{ prof_n, prof_launch_ns / 128 / 1000, prof_draw_ns / 128 / 1000, @as(u64, @intFromFloat(prof_replay_ms * 1000 / 128)), @as(u64, @intFromFloat(prof_coll_ms * 1000 / 128)) });
             prof_launch_ns = 0;
             prof_draw_ns = 0;
+            prof_replay_ms = 0;
+            prof_coll_ms = 0;
         }
     }
     fn profNow2() u64 {
