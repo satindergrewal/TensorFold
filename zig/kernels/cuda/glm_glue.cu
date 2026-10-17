@@ -380,3 +380,22 @@ extern "C" __global__ void __launch_bounds__(256, 1) tf_shm_gather_f32(const flo
     }
     if (tid == 0) seq[b] = gen;
 }
+
+
+// -- L2 prefetch of the next kernels' weights in decode windows (TF_GLM_L2PF, off by default) ----------------------
+// A small kernel on a side stream asks the memory system for the weights the main stream reads next while it waits
+// on an all-gather (DRAM idle). Only prefetches - no store - so no result can change. Table: [n, 2] int64
+// (address, bytes) pieces, 16-byte aligned, at most a few hundred KiB each. Bulk mode (sm_90+): one
+// cp.async.bulk.prefetch.L2 a piece. Adapted from jayleaton/glm53-tensorfold-spark patches/0460 (l2pf.cu;
+// Apache-2.0, Copyright 2026 Jay Leaton); changes: our calling convention, this engine's sites in cuda_forward.
+extern "C" __global__ void __launch_bounds__(256) tf_glm_l2pf(const long long* __restrict__ table, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        const unsigned long long a = (unsigned long long)table[2 * i];
+        const unsigned bytes = (unsigned)table[2 * i + 1];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(a), "r"(bytes) : "memory");
+#else
+        for (unsigned o = 0; o < bytes; o += 128) asm volatile("prefetch.global.L2 [%0];" :: "l"(a + o));
+#endif
+    }
+}

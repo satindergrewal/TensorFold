@@ -177,6 +177,35 @@ pub const Wave = struct {
     ev: [4]cuda.Event,
 };
 
+/// The decode-round L2 prefetcher (TF_GLM_L2PF): one device table of (address, bytes) pieces, a (first,
+/// count) a layer's site, and the side stream. fire() forks the side stream from the main one and asks for
+/// the site's pieces; join() makes the main stream wait before the round ends. It only prefetches: bits
+/// cannot change. Adapted from jayleaton/glm53-tensorfold-spark patches/0460 (Apache-2.0, (c) 2026 Jay Leaton).
+pub const L2pf = struct {
+    fn_table: u64, // i64 [max_pieces][2]
+    sites: [][2]u32, // per (layer, site 0='a' | 1='f'): first, count into the table
+    side: cuda.Stream,
+    ev: cuda.Event,
+    forked: bool = false,
+
+    fn fire(self: *L2pf, set: glue.Set, main: cuda.Stream, layer: usize, site: usize) !void {
+        if (layer * 2 + site >= self.sites.len) return;
+        const s = self.sites[layer * 2 + site];
+        if (s[1] == 0) return;
+        try self.ev.record(main);
+        try self.side.wait(self.ev);
+        try glue.l2pf(set, self.side, self.fn_table, s[0], s[1]);
+        self.forked = true;
+    }
+
+    fn join(self: *L2pf, main: cuda.Stream) void {
+        if (!self.forked) return;
+        self.ev.record(self.side) catch return;
+        main.wait(self.ev) catch return;
+        self.forked = false;
+    }
+};
+
 /// One rank of the forward: its weights, its sequence's caches, the window's buffers.
 pub const Rank = struct {
     w: *const weights.Weights,
@@ -197,6 +226,7 @@ pub const Forward = struct {
     exchange: Exchange,
     kda_wide: bool = true, // TF_GLM_KDA_DECODE_WIDE (the Python family's default): decode windows on KDA's three-kernel chain
     wave: ?*const Wave = null, // TF_GLM_WAVE=1: decode windows run the two-group exchange wavefront
+    l2pf: ?*L2pf = null, // TF_GLM_L2PF=1: side-stream weight prefetch at the gather waits
     pieces: ?*const Pieces = null, // a prompt chunk's exchanges in row pieces on a second stream (null: whole)
     split: bool = true, // TF_GLM_PREFILL_REDUCE=split (the default with send/recv): each rank glues its own rows
 
@@ -558,6 +588,7 @@ pub const Forward = struct {
             try f.wholeWave(f.wave.?, R);
         } else if (pieces > 1 or (pieces == 1 and f.splits(R))) try f.pieced(f.pieces.?, R, cut[0..pieces]) else try f.whole(R);
         try f.finish(R);
+        if (f.l2pf) |p| p.join(f.stream);
         if (std.c.getenv("TF_GLM_WAVE_DUMP") != null and !f.ranks[0].b.prefill) {
             dumpBytes(f, f.ranks[0].b.logits, R * f.ranks[0].w.share.vocab.len() * 2, "logits");
             dumpBytes(f, f.ranks[0].b.fnormed, R * c.hidden * 2, "fnormed");
@@ -871,6 +902,7 @@ pub const Forward = struct {
                 if (std.c.getenv("TF_GLM_WAVE_DUMP") != null and dump_rounds == 1 and j == 0) kdaDump(f, &r, li, "E", R / 2);
             }
             try f.gather(R);
+            if (f.l2pf) |p| p.fire(f.set(), f.stream, j, 0) catch {};
             for (f.ranks) |r| {
                 const l = r.w.layers[j];
                 try f.post(r, R);
@@ -878,6 +910,7 @@ pub const Forward = struct {
                 try f.ffn(r, l, R, slot(r, R));
             }
             try f.gather(R);
+            if (f.l2pf) |p| p.fire(f.set(), f.stream, j, 1) catch {};
             for (f.ranks) |r| try f.post(r, R);
             switch (f.ranks[0].w.layers[j].mixer) {
                 .kda => li += 1,

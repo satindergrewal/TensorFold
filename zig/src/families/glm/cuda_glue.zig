@@ -134,6 +134,7 @@ pub const Kernels = struct {
     chunks16_nvfp4: ?cuda.Function = null,
     chunks32_nvfp4: ?cuda.Function = null,
     chunks_16_s32: ?cuda.Function = null, // the 32-row sliced decode form (bf16)
+    l2pf: ?cuda.Function = null, // TF_GLM_L2PF: the side-stream weight-prefetch kernel
     chunks16_nvfp4_s32: ?cuda.Function = null,
     lat_dequant_nvfp4: ?cuda.Function = null,
     chunks32_fp8: ?cuda.Function = null,
@@ -158,7 +159,7 @@ pub const Kernels = struct {
     pub fn load(m: cuda.Module) !Kernels {
         var k: Kernels = undefined;
         inline for (@typeInfo(Kernels).@"struct".field_names) |name| {
-            if (comptime !std.mem.eql(u8, name, "mm") and !std.mem.endsWith(u8, name, "_fp8") and !std.mem.endsWith(u8, name, "_nvfp4") and !std.mem.endsWith(u8, name, "_s32") and !std.mem.startsWith(u8, name, "lat_dequant")) @field(k, name) = try m.function("tf_glm_" ++ name);
+            if (comptime !std.mem.eql(u8, name, "mm") and !std.mem.eql(u8, name, "l2pf") and !std.mem.endsWith(u8, name, "_fp8") and !std.mem.endsWith(u8, name, "_nvfp4") and !std.mem.endsWith(u8, name, "_s32") and !std.mem.startsWith(u8, name, "lat_dequant")) @field(k, name) = try m.function("tf_glm_" ++ name);
         }
         k.mm = try Mm16.load(m);
         // KV cache quantization kernels: load what exists, skip what doesn't
@@ -190,6 +191,7 @@ pub const Kernels = struct {
         try k.bmm_tile.allowDynamicShared(bmm_tile_smem);
         try k.bmm_tile1.allowDynamicShared(bmm_tile1_smem[1]);
         k.chunks_16_s32 = m.function("tf_glm_chunks_16_s32") catch null;
+        k.l2pf = m.function("tf_glm_l2pf") catch null;
         if (k.chunks_16_s32) |*f| f.allowDynamicShared(chunksSmem(16)) catch {
             k.chunks_16_s32 = null;
         };
@@ -270,6 +272,17 @@ pub const bmm_tile1_smem = [2]u32{ 3 * (128 + 128) * 32 * 2, 128 * (128 + 4) * 4
 /// glm_glue_attn.cuh's wide_smem<hb>(): q (hb x 512), two 32-key tiles, p (hb x 32) in bf16, then max/sum scratch.
 pub fn chunksSmem(comptime hb: u32) u32 {
     return (hb * 512 + 2 * 32 * 512 + hb * 32) * 2 + (hb * 4 + 2 * hb) * 4;
+}
+
+/// TF_GLM_L2PF: prefetch `n` pieces of the table on `side` (the caller forks it from the main stream first).
+pub fn l2pf(set: Set, side: cuda.Stream, table: u64, first: usize, n: usize) !void {
+    const f = set.glue.l2pf orelse return error.NoL2pf;
+    if (n == 0) return;
+    var a: cuda.Args = .{};
+    a.add(table + first * 16);
+    a.add(@as(c_int, @intCast(n)));
+    const blocks: u32 = @intCast(@min(48, (n + 255) / 256));
+    try cuda.launch.launch(f, .{ .grid = .{ .x = blocks }, .block = .{ .x = 256 } }, side, &a);
 }
 
 /// NVFP4 chunks kernels add a double-buffered staging tile of the packed e2m1 halves (2 * 32 * 256

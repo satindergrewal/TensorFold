@@ -97,6 +97,11 @@ pub const Engine = struct {
     wave_keep: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
     wave_conv: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
     wave_ev: [4]cuda.Event = undefined,
+    l2pf: ?fw.L2pf = null, // TF_GLM_L2PF=1: the decode-round weight prefetcher
+    l2pf_table: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
+    l2pf_sites: std.ArrayList([2]u32) = .empty,
+    l2pf_side: cuda.Stream = .{ .d = undefined, .handle = null },
+    l2pf_ev: cuda.Event = undefined,
     ids_stage: cuda.HostBuffer = undefined, // pinned: a captured H2D from pageable memory snapshots
     // the driver staging at capture time (every replay would copy the first round's ids)
     slot: u32 = 0,
@@ -157,6 +162,9 @@ pub const Engine = struct {
         @import("cuda_latent.zig").setDriver(d);
         errdefer e.smp.deinit();
         e.shared_buf = try cuda.DeviceBuffer.alloc(d, 8);
+        if (std.c.getenv("TF_GLM_L2PF") != null) {
+            try e.initL2pf();
+        }
         if (std.c.getenv("TF_GLM_WAVE") != null) {
             e.wave_scratch = try cuda.DeviceBuffer.alloc(d, 4 * fw.window_rows * c.hidden * 4);
             e.wave_pos2 = try cuda.DeviceBuffer.alloc(d, 4);
@@ -190,6 +198,12 @@ pub const Engine = struct {
         if (e.wave_keep.ptr != 0) e.wave_keep.free();
         if (e.wave_conv.ptr != 0) e.wave_conv.free();
         if (e.wave != null) for (&e.wave_ev) |*ev| ev.deinit();
+        if (e.l2pf != null) {
+            e.l2pf_ev.deinit();
+            e.l2pf_side.deinit();
+            e.l2pf_sites.deinit(e.gpa);
+            e.l2pf_table.free();
+        }
         var git = e.graphs.valueIterator();
         while (git.next()) |g| g.exec.deinit();
         e.graphs.deinit(e.gpa);
@@ -270,9 +284,132 @@ pub const Engine = struct {
         std.log.info("glm: shm gather arena ready (slot {d} units, dev {x})", .{ slot_units, dev_ptr });
     }
 
+
+    /// TF_GLM_L2PF: the pieces table (i64 [n][2]) and per-(layer, site) ranges. Site 'a' (the mixer gather)
+    /// prefetches this layer's FFN side: hc weights, post norm, router, bias, the shared expert's gate/up and
+    /// down. Site 'f' (the ffn gather) prefetches the NEXT layer's attention side (or, past the last layer,
+    /// the final norm and the head). Small tensors whole, big ones' leading bytes, 256KiB pieces, 8MiB a site.
+    fn initL2pf(e: *Engine) !void {
+        const gpa = e.gpa;
+        const w = &e.w;
+        const budget: usize = 8 << 20;
+        const piece: usize = 256 << 10;
+        const cap: usize = 2 << 20; // one buffer's leading bytes at most
+        var rows: std.ArrayList(i64) = .empty;
+        defer rows.deinit(gpa);
+        var sites: std.ArrayList([2]u32) = .empty;
+        errdefer sites.deinit(gpa);
+        const lenOf = struct {
+            fn f(w2: *const weights.Weights, p: u64) usize {
+                if (p == 0) return 0;
+                for (w2.named.items) |n| if (n.ptr == p) return n.len;
+                return 0;
+            }
+        }.f;
+        const wOf = struct {
+            fn q(qq: cuda.qlinear.Weight) u64 {
+                return switch (qq) {
+                    .bf16 => |m| m.codes,
+                    .nvfp4 => |m| m.codes,
+                    .fp8 => |m| m.codes,
+                    .fp8g => |m| m.codes,
+                    .affine4 => 0,
+                    .exl3 => 0,
+                };
+            }
+            fn p(pr: @import("cuda_b16.zig").Proj) u64 {
+                return switch (pr) {
+                    .b16 => |v| v,
+                    .q => |qq| q(qq),
+                };
+            }
+        };
+        const push = struct {
+            fn f(gpa2: std.mem.Allocator, rows2: *std.ArrayList(i64), lo: *usize, a: u64, n0: usize, cap2: usize, piece2: usize) void {
+                if (a == 0 or n0 == 0 or lo.* < piece2) return;
+                const n = @min(n0, cap2);
+                var off: usize = 0;
+                while (off < n and lo.* >= piece2) : (off += piece2) {
+                    const take = @min(piece2, n - off);
+                    rows2.append(gpa2, @intCast(a + off)) catch return;
+                    rows2.append(gpa2, @intCast(take)) catch return;
+                    lo.* -= take;
+                }
+            }
+        }.f;
+        var total_pieces: u32 = 0;
+        for (w.layers, 0..) |l, j| {
+            var site: usize = 0;
+            while (site < 2) : (site += 1) {
+                var left = budget;
+                const before = rows.items.len;
+                if (site == 0) {
+                    push(gpa, &rows, &left, l.ffn_hc.fn_w, lenOf(w, l.ffn_hc.fn_w), cap, piece);
+                    push(gpa, &rows, &left, l.ffn_hc.base, lenOf(w, l.ffn_hc.base), cap, piece);
+                    push(gpa, &rows, &left, l.ffn_hc.scale, lenOf(w, l.ffn_hc.scale), cap, piece);
+                    push(gpa, &rows, &left, l.post_norm, lenOf(w, l.post_norm), cap, piece);
+                    switch (l.ffn) {
+                        .moe => |m| {
+                            push(gpa, &rows, &left, m.router, lenOf(w, m.router), cap, piece);
+                            push(gpa, &rows, &left, m.bias, lenOf(w, m.bias), cap, piece);
+                            push(gpa, &rows, &left, m.shared_gu, lenOf(w, m.shared_gu), cap, piece);
+                            push(gpa, &rows, &left, wOf.p(m.shared_down), lenOf(w, wOf.p(m.shared_down)), cap, piece);
+                        },
+                        .dense => |m| {
+                            push(gpa, &rows, &left, wOf.q(m.gate), lenOf(w, wOf.q(m.gate)), cap, piece);
+                            push(gpa, &rows, &left, wOf.q(m.up), lenOf(w, wOf.q(m.up)), cap, piece);
+                            if (m.down) |d| push(gpa, &rows, &left, wOf.q(d), lenOf(w, wOf.q(d)), cap, piece);
+                        },
+                    }
+                } else {
+                    const nxt_opt = if (j + 1 < w.layers.len) w.layers[j + 1] else null;
+                    if (nxt_opt) |nx| {
+                        push(gpa, &rows, &left, nx.attn_hc.fn_w, lenOf(w, nx.attn_hc.fn_w), cap, piece);
+                        push(gpa, &rows, &left, nx.attn_hc.base, lenOf(w, nx.attn_hc.base), cap, piece);
+                        push(gpa, &rows, &left, nx.attn_hc.scale, lenOf(w, nx.attn_hc.scale), cap, piece);
+                        push(gpa, &rows, &left, nx.in_norm, lenOf(w, nx.in_norm), cap, piece);
+                        switch (nx.mixer) {
+                            .kda => |k| {
+                                push(gpa, &rows, &left, k.a_log, lenOf(w, k.a_log), cap, piece);
+                                push(gpa, &rows, &left, k.dt_bias, lenOf(w, k.dt_bias), cap, piece);
+                                push(gpa, &rows, &left, k.norm_w, lenOf(w, k.norm_w), cap, piece);
+                                push(gpa, &rows, &left, k.conv_w, lenOf(w, k.conv_w), cap, piece);
+                                push(gpa, &rows, &left, k.fb, lenOf(w, k.fb), cap, piece);
+                                push(gpa, &rows, &left, k.gb, lenOf(w, k.gb), cap, piece);
+                                push(gpa, &rows, &left, k.proj, lenOf(w, k.proj), cap, piece);
+                            },
+                            .mla => |a| {
+                                push(gpa, &rows, &left, a.q_norm, lenOf(w, a.q_norm), cap, piece);
+                                push(gpa, &rows, &left, a.kv_norm, lenOf(w, a.kv_norm), cap, piece);
+                                push(gpa, &rows, &left, a.wk, lenOf(w, a.wk), cap, piece);
+                                push(gpa, &rows, &left, a.wv, lenOf(w, a.wv), cap, piece);
+                                push(gpa, &rows, &left, a.proj, lenOf(w, a.proj), cap, piece);
+                                push(gpa, &rows, &left, wOf.p(a.q_b), lenOf(w, wOf.p(a.q_b)), cap, piece);
+                            },
+                        }
+                    } else {
+                        push(gpa, &rows, &left, w.norm, lenOf(w, w.norm), cap, piece);
+                        push(gpa, &rows, &left, wOf.p(w.head), lenOf(w, wOf.p(w.head)), cap, piece);
+                    }
+                }
+                const count: u32 = @intCast((rows.items.len - before) / 2);
+                sites.append(e.gpa, .{ total_pieces, count }) catch {};
+                total_pieces += count;
+            }
+        }
+        if (rows.items.len == 0) return; // nothing resolvable: the prefetcher stays off
+        e.l2pf_table = try cuda.DeviceBuffer.alloc(e.d, rows.items.len * 8);
+        try e.l2pf_table.upload(0, std.mem.sliceAsBytes(rows.items));
+        e.l2pf_side = try cuda.Stream.init(e.d, false);
+        e.l2pf_ev = try cuda.Event.init(e.d, false);
+        e.l2pf_sites = sites;
+        e.l2pf = .{ .fn_table = e.l2pf_table.ptr, .sites = e.l2pf_sites.items, .side = e.l2pf_side, .ev = e.l2pf_ev };
+        std.log.info("glm: l2pf on ({d} pieces over {d} sites, up to 8 MiB a site)", .{ total_pieces, e.l2pf_sites.items.len });
+    }
+
     fn view(e: *Engine, b: *fw.Buffers, out: *[1]fw.Rank) fw.Forward {
         out.* = .{.{ .w = &e.w, .st = &e.cur.st, .b = b }};
-        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = if (b == &e.bp) &e.pieces else null, .split = e.settings.split, .kda_wide = e.settings.kda_wide, .wave = if (b == &e.bd and e.wave != null) &e.wave.? else null };
+        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = if (b == &e.bp) &e.pieces else null, .split = e.settings.split, .kda_wide = e.settings.kda_wide, .wave = if (b == &e.bd and e.wave != null) &e.wave.? else null, .l2pf = if (b == &e.bd and e.l2pf != null) &e.l2pf.? else null };
     }
 
     /// Binds slot `slot`'s sequence for the steps that follow, making it (a zeroed state) on first use.
