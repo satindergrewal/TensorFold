@@ -151,16 +151,65 @@ pub const Link = struct {
     }
 
     /// Other ranks: the next step and its ids (valid until the next receive).
+    var prof_recv_n: u64 = 0;
+    var prof_bell_ns: u64 = 0;
+    var prof_bc1_ns: u64 = 0;
+    var prof_dl1_ns: u64 = 0;
+    var prof_bc2_ns: u64 = 0;
+    var prof_dl2_ns: u64 = 0;
+    fn profNow3() u64 {
+        var ts: std.c.timespec = undefined;
+        if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
+        return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+    }
+    fn profRecvTick() void {
+        prof_recv_n += 1;
+        if (prof_recv_n % 64 == 0) {
+            std.debug.print("RECV calls={d} bell_us={d} b1_us={d} d1_us={d} b2_us={d} d2_us={d}\n", .{
+                prof_recv_n, prof_bell_ns / 64 / 1000, prof_bc1_ns / 64 / 1000, prof_dl1_ns / 64 / 1000, prof_bc2_ns / 64 / 1000, prof_dl2_ns / 64 / 1000,
+            });
+            prof_bell_ns = 0;
+            prof_bc1_ns = 0;
+            prof_dl1_ns = 0;
+            prof_bc2_ns = 0;
+            prof_dl2_ns = 0;
+        }
+    }
+
     pub fn receive(l: *Link) !struct { h: Header, ids: []const u32 } {
+        const prof = std.c.getenv("TF_GLM_RPROF") != null;
+        var t = profNow3();
         try l.awaitBell();
+        if (prof) {
+            const n = profNow3();
+            prof_bell_ns += n - t;
+            t = n;
+        }
         try l.bcast(64);
+        if (prof) {
+            const n = profNow3();
+            prof_bc1_ns += n - t;
+            t = n;
+        }
         var h: Header = undefined;
         try l.buf.download(0, std.mem.asBytes(&h));
+        if (prof) {
+            const n = profNow3();
+            prof_dl1_ns += n - t;
+            t = n;
+        }
         if (h.n > l.ids.len) return error.TooManyIds;
         if (h.n > 0) {
             try l.bcast(64 + h.n * 4);
+            if (prof) {
+                const n = profNow3();
+                prof_bc2_ns += n - t;
+                t = n;
+            }
             try l.buf.download(64, std.mem.sliceAsBytes(l.ids[0..h.n]));
+            if (prof) prof_dl2_ns += profNow3() - t;
         }
+        if (prof) profRecvTick();
         return .{ .h = h, .ids = l.ids[0..h.n] };
     }
 };

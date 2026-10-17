@@ -116,13 +116,49 @@ pub const Backend = struct {
     pub fn read(b: Backend, handle: u64) !u32 {
         return b.vtable.read(b.ptr, handle);
     }
+    // TF_GLM_RPROF=1: per-call wall time of the verify/draft windows, printed every 128 calls
+    pub var prof_on: ?bool = null;
+    pub var prof_verify_ns: u64 = 0;
+    pub var prof_draft_ns: u64 = 0;
+    pub var prof_calls: u64 = 0;
+    fn profEnabled() bool {
+        if (prof_on) |v| return v;
+        const v = std.c.getenv("TF_GLM_RPROF") != null;
+        prof_on = v;
+        return v;
+    }
+    fn profNow() u64 {
+        var ts: std.c.timespec = undefined;
+        if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
+        return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+    }
+    fn profAdd(slot: *u64, t0: u64) void {
+        slot.* += profNow() - t0;
+    }
+    fn profPrint() void {
+        prof_calls += 1;
+        if (prof_calls % 128 == 0) {
+            std.debug.print("RPROF calls={d} verify_us={d} draft_us={d}\n", .{ prof_calls, prof_verify_ns / 128 / 1000, prof_draft_ns / 128 / 1000 });
+            prof_verify_ns = 0;
+            prof_draft_ns = 0;
+        }
+    }
+
     pub fn verify(b: Backend, windows: []const Window, out: []Verified) !void {
-        return b.vtable.verify(b.ptr, windows, out);
+        if (!profEnabled()) return b.vtable.verify(b.ptr, windows, out);
+        const t0 = profNow();
+        defer profAdd(&prof_verify_ns, t0);
+        const r = b.vtable.verify(b.ptr, windows, out);
+        profPrint();
+        return r;
     }
     pub fn keep(b: Backend, windows: []const Window, paths: []const []const u32) !void {
         return b.vtable.keep(b.ptr, windows, paths);
     }
     pub fn draft(b: Backend, requests: []const DraftRequest) !void {
+        if (!profEnabled()) return b.vtable.draft(b.ptr, requests);
+        const t0 = profNow();
+        defer profAdd(&prof_draft_ns, t0);
         return b.vtable.draft(b.ptr, requests);
     }
     pub fn features(b: Backend, s: *Stream, taps: []const u32, start: u64, count: u32) !Features {

@@ -659,6 +659,18 @@ pub const Engine = struct {
                     @memcpy(@as([*]u32, @ptrCast(e.ids_stage.bytes.ptr))[0..ids.len], ids);
                     e.cur.st.pending = ids.len; // the host writes run() does, mirrored on replay rounds
                     e.cur.st.prompt = e.bd.prefill;
+                    if (std.c.getenv("TF_GLM_RPROF") != null) {
+                        const t0 = profNow2();
+                        try g.exec.launchOn(e.stream);
+                        const t1 = profNow2();
+                        e.cur.rows_at = e.bd.fnormed;
+                        try e.draw(e.bd.logits, ids.len, e.cur.st.pos + 1, out);
+                        const t2 = profNow2();
+                        prof_launch_ns += t1 - t0;
+                        prof_draw_ns += t2 - t1;
+                        profTick();
+                        return;
+                    }
                     try g.exec.launchOn(e.stream);
                     e.cur.rows_at = e.bd.fnormed;
                     try e.draw(e.bd.logits, ids.len, e.cur.st.pos + 1, out);
@@ -810,6 +822,9 @@ pub const Engine = struct {
         const add_fn = try e.m.ops().function("tf_glm_add_i32");
         var g = e.draft_graphs.getPtr(key);
         if (g == null) {
+            // the previous graph's replays (and the eager absorb mtps) may still be in flight on the
+            // stream; a capture begun over pending NCCL graph work is the suspected replay fault
+            try e.stream.synchronize();
             try cuda.graph.beginCapture(e.stream, .relaxed);
             const ran = blk: {
                 e.pickDev(e.bm.logits, e.bm.ids, e.draft_tokens.ptr, 1) catch break :blk false;
@@ -872,6 +887,23 @@ pub const Engine = struct {
     }
 
     /// `rows` logits rows of this rank's vocabulary -> the tokens at positions first, first + 1, ...
+    pub var prof_launch_ns: u64 = 0;
+    pub var prof_draw_ns: u64 = 0;
+    pub var prof_n: u64 = 0;
+    fn profTick() void {
+        prof_n += 1;
+        if (prof_n % 128 == 0) {
+            std.debug.print("VPROF calls={d} launch_us={d} draw_us={d}\n", .{ prof_n, prof_launch_ns / 128 / 1000, prof_draw_ns / 128 / 1000 });
+            prof_launch_ns = 0;
+            prof_draw_ns = 0;
+        }
+    }
+    fn profNow2() u64 {
+        var ts: std.c.timespec = undefined;
+        if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
+        return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+    }
+
     fn draw(e: *Engine, logits: u64, rows: usize, first: u64, out: []u32) !void {
         if (e.cur.sampling) |s| return e.smp.draw(e.stream, e.exchange(), e.spans, &.{.{ .rank = e.share.rank, .logits = logits }}, rows, first, sampler.rule(s), out);
         try e.greedyRows(logits, rows, out);
