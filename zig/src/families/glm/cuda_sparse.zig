@@ -7,6 +7,8 @@ const glue = @import("cuda_glue.zig");
 /// sparse.POOL, TOPK_POOLS, SELECT_LIST, SCORE_LOOP_FROM, SCORE_LOOP; geometry.MLA_SELECT_ROWS.
 pub const pool = 4;
 pub const topk_pools = 512;
+/// The pool-bucket floor: poolBucket never returns less (also the CUDA-graph bucket unit).
+pub const pool_min = 1024;
 pub const select_list = 1024;
 pub const score_loop_from = 64;
 pub const score_loop = 32;
@@ -31,7 +33,7 @@ pub fn indexUpdate(set: glue.Set, stream: cuda.Stream, k_raw: u64, k_stride: usi
 /// sparse.pool_bucket: visible pools for rows pos .. pos + rows - 1, a power of two (at least 1024), at most `np_max`.
 pub fn poolBucket(pos: usize, rows: usize, np_max: usize) usize {
     const visible = (pos + rows) / pool + 1;
-    return @min(np_max, @max(1024, std.math.ceilPowerOfTwoAssert(usize, visible)));
+    return @min(np_max, @max(pool_min, std.math.ceilPowerOfTwoAssert(usize, visible)));
 }
 
 /// sparse.score_columns: the pool columns selection reads for those rows (the last row's complete pools, at least 512).
@@ -66,7 +68,11 @@ pub fn selectTokens(set: glue.Set, ops: cuda.Module, stream: cuda.Stream, qi: u6
             try cuda.launch.launch(add, .{ .grid = .{}, .block = .{ .x = 32 } }, stream, &args);
             at = s.at;
         }
-        const nb = cdiv(scoreColumns(host_pos + a, n, np_max), 64);
+        // The grid covers the whole power-of-two bucket (np_max), not the exact visible columns:
+        // scores blocks past a row's visible pools only write -inf, and select_rows clamps by the
+        // device-read position, so the picked pools are the same bits either way. The launch then
+        // depends on no host position, and a captured CUDA graph replays across the whole bucket.
+        const nb = cdiv(np_max, 64);
         var sa: cuda.Args = .{};
         inline for (.{ qi + a * heads * d * 2, wts + a * w_stride * 2, @as(i64, @intCast(w_stride)), pk, s.scores, at, @as(i64, @intCast(np_max)), @as(i64, @intCast(nb)), @as(f32, @floatCast(std.math.pow(f64, @floatFromInt(d), -0.5))), headScale(heads), @as(i64, @intCast(heads)), @as(c_int, @intCast(loop)) }) |v| sa.add(v);
         if (d != 128 or heads > 32) return error.IndexShape;

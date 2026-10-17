@@ -10,6 +10,7 @@ const weights = @import("cuda_weights.zig");
 const fw = @import("cuda_forward.zig");
 const ranks = @import("cuda_ranks.zig");
 const sampler = @import("cuda_sampler.zig");
+const sparse = @import("cuda_sparse.zig");
 const heat = @import("heat");
 
 pub const Options = struct {
@@ -47,7 +48,7 @@ const Seq = struct {
     rows_at: u64 = 0, // its last verify's final-norm rows (bf16 [rows][hidden]), which the next draft reads
 };
 
-const GraphKey = struct { slot: u32, rows: u8, parity: u8 };
+const GraphKey = struct { slot: u32, rows: u8, parity: u8, bucket: u8 = 0 };
 const VerifyGraph = struct { exec: cuda.graph.Exec, nch: usize };
 
 /// One rank's copy of a kept prompt state: the state arena's bytes and the host fields beside them.
@@ -616,15 +617,24 @@ pub const Engine = struct {
     pub fn verify(e: *Engine, ids: []const u32, out: []u32) !void {
         if (ids.len == 0 or ids.len > fw.window_rows) return error.WindowTooWide;
         const nch_now = @min(latent.chunksFor(e.cur.st.pos + ids.len), e.bd.nch);
-        // graphs cover the dense phase only: pos + rows below the key width, where no layer runs
-        // its sparse indexer and every grid is static (the sparse phase's branch and pool grid
-        // depend on the position as host values, which a capture would bake)
+        // graphs cover the dense window (pos + rows below the key width, static grids) and the
+        // sparse phase in power-of-two pool buckets: inside a bucket np_max is constant, the
+        // scores grid over-covers (past-visible blocks only write -inf), and the sparse kernels
+        // read the position from pos_dev, so a capture replays across the whole bucket. A window
+        // straddling the dense limit runs eager (its host branch is not bakeable).
         const dense_phase = e.cur.st.pos + ids.len < e.c.keyWidth();
-        const key: GraphKey = .{ .slot = e.slot, .rows = @intCast(ids.len), .parity = @as(u8, e.cur.st.cur[0]) };
+        const sparse_phase = e.cur.st.pos >= e.c.keyWidth();
+        const np_bucket: usize = if (sparse_phase) sparse.poolBucket(e.cur.st.pos, ids.len, e.cur.st.capacity / sparse.pool) else 0;
+        const key: GraphKey = .{
+            .slot = e.slot,
+            .rows = @intCast(ids.len),
+            .parity = @as(u8, e.cur.st.cur[0]),
+            .bucket = if (sparse_phase) @intCast(1 + std.math.log2_int(usize, np_bucket / sparse.pool_min)) else 0,
+        };
         // Opt-in while the replay still diverges from eager by one input (deterministic since the
         // pinned staging + exact-nch keying; 161.8 tok/s vs 91.6 eager when running - the remaining
         // baked input is the next session's instrumented eager-vs-graph logits diff).
-        if (std.c.getenv("TF_GLM_GRAPHS") != null and dense_phase and e.wave == null) {
+        if (std.c.getenv("TF_GLM_GRAPHS") != null and (dense_phase or sparse_phase) and e.wave == null) {
             if (e.graphs.getPtr(key)) |g| {
                 if (g.nch == nch_now) { // exact: the indexer score path reads garbage for chunks past
                     // its own range, so a replay may only cover exactly the nch this round needs
