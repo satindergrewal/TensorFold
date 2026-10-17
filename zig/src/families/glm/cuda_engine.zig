@@ -49,6 +49,7 @@ const Seq = struct {
 };
 
 const GraphKey = struct { slot: u32, rows: u8, parity: u8, bucket: u8 = 0 };
+const DraftKey = struct { slot: u32, nch: u16, parity: u8, dense: u8 };
 const VerifyGraph = struct { exec: cuda.graph.Exec, nch: usize };
 
 /// One rank's copy of a kept prompt state: the state arena's bytes and the host fields beside them.
@@ -84,6 +85,7 @@ pub const Engine = struct {
     pairs: cuda.DeviceBuffer, // every rank's (value, id) of a greedy draw (the send slices)
     pairs_all: cuda.DeviceBuffer, // the all-gather's destination: a separate buffer, out-of-place on every rank
     draft_tokens: cuda.DeviceBuffer, // the device-resident draft chain's picked tokens (TF_GLM_DRAFT_DEV)
+    draft_idx: cuda.DeviceBuffer, // the chain step's slot counter (device; reset each round)
     smp: sampler.Sampler,
     seqs: std.ArrayList(?*Seq) = .empty, // every stream's sequence by slot (the lane backend's), slot 0 made at init
     cur: *Seq = undefined, // the bound slot's: every step below runs on it
@@ -93,6 +95,11 @@ pub const Engine = struct {
     // skips, and pos is read on the device). ids_stage is the stable host source whose bytes the
     // captured H2D memcpy re-reads at every replay.
     graphs: std.AutoHashMapUnmanaged(GraphKey, VerifyGraph) = .empty,
+    // Draft-chain steps as CUDA graphs (TF_GLM_DRAFT_GRAPH=0 keeps them eager): one captured step =
+    // pick (slot from the device counter) + the MTP head's forward + position/slot increments, keyed
+    // by slot, KDA parity, the MTP cache chunk count and the dense/sparse window phase - the same
+    // bucket trick as the verify graphs (every host-varying input is a bucket key).
+    draft_graphs: std.AutoHashMapUnmanaged(DraftKey, cuda.graph.Exec) = .empty,
     // TF_GLM_WAVE=1: the decode wavefront's scratch, pos2 word and events (docs/WAVEFRONT.md)
     wave: ?fw.Wave = null,
     wave_scratch: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
@@ -141,7 +148,7 @@ pub const Engine = struct {
         if (o.settings.layers > c.layers) return error.BadLayers;
         const layers = try a.alloc(u32, if (o.settings.layers > 0) o.settings.layers else c.layers);
         for (layers, 0..) |*l, i| l.* = @intCast(i);
-        e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = o.settings.heat, .root = heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .settings = o.settings, .m = m, .stream = stream, .pieces = pieces, .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .bm = undefined, .hold = undefined, .pairs = undefined, .pairs_all = undefined, .draft_tokens = undefined, .smp = undefined, .mtp = o.mtp };
+        e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = o.settings.heat, .root = heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .settings = o.settings, .m = m, .stream = stream, .pieces = pieces, .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .bm = undefined, .hold = undefined, .pairs = undefined, .pairs_all = undefined, .draft_tokens = undefined, .draft_idx = undefined, .smp = undefined, .mtp = o.mtp };
         e.w = try weights.load(gpa, io, d, stream, e.m.tools(), checkpoint, c, share, layers, o.mtp);
         errdefer e.w.deinit();
         try e.bind(0);
@@ -162,6 +169,7 @@ pub const Engine = struct {
         e.pairs = try cuda.DeviceBuffer.alloc(d, 8 * world * fw.window_rows);
         e.pairs_all = try cuda.DeviceBuffer.alloc(d, 8 * world * fw.window_rows);
         e.draft_tokens = try cuda.DeviceBuffer.alloc(d, 4 * max_drafts);
+        e.draft_idx = try cuda.DeviceBuffer.alloc(d, 4);
         errdefer e.pairs.free();
         e.smp = try sampler.Sampler.init(d, c.vocab, fw.window_rows);
         @import("cuda_latent.zig").setDriver(d);
@@ -222,6 +230,10 @@ pub const Engine = struct {
         e.pairs.free();
         e.pairs_all.free();
         e.draft_tokens.free();
+        e.draft_idx.free();
+        var dg_it = e.draft_graphs.iterator();
+        while (dg_it.next()) |kv| kv.value_ptr.deinit();
+        e.draft_graphs.deinit(e.gpa);
         e.hold.free();
         if (e.bs) |*b| b.deinit();
         e.bm.deinit();
@@ -738,16 +750,29 @@ pub const Engine = struct {
             try e.cur.st.setMtpLen(e.stream, e.cur.st.mtp_len + part.len);
         }
         if (std.c.getenv("TF_GLM_DRAFT_DEV") != null) {
-            // the device-resident chain (TF_GLM_DRAFT_DEV): no draft token crosses the host until one
-            // sync and one download at the end - the profile showed the chain's per-draft collectives +
-            // synchronize round trips dominated the round's non-GPU time. Greedy picks resolve through
-            // tf_glm_pick_greedy; sampled draws keep tf_draw's device token and copy it into the ids slot.
+            // the device-resident chain: no draft token crosses the host until one sync and one
+            // download at the end. Greedy chains whose history outlives the first row replay ONE
+            // captured step graph (TF_GLM_DRAFT_GRAPH, default on) - pick + MTP forward + the
+            // position/slot device increments - keyed by (slot, parity, nch, phase); the final
+            // pick-only step runs eager. Everything else keeps the eager device chain.
             const sampled = if (e.cur.sampling) |sm| sm else null;
+            // opt-in WIP: the captured step replays fine for ~200 tokens then faults (cuGraphLaunch
+            // ILLEGAL_ADDRESS) - keep the verified eager device chain as the default until the replay
+            // state issue is found. TF_GLM_DRAFT_GRAPH=1 enables the graph path for bisection.
+            const graph_on = sampled == null and e.cur.st.mtp_len > 0 and
+                std.mem.eql(u8, std.mem.span(std.c.getenv("TF_GLM_DRAFT_GRAPH") orelse "0"), "1");
+            if (graph_on) {
+                if (e.draftGraphRound(&f, depth)) |_| {
+                    try e.stream.synchronize();
+                    try e.d.check(e.d.api.cuMemcpyDtoH_v2(out.ptr, e.draft_tokens.ptr, depth * 4), "cuMemcpyDtoH");
+                    return;
+                } else |_| {} // capture failed: the eager chain below runs instead
+            }
             for (0..depth) |j| {
                 if (sampled) |sm| {
                     try e.smp.drawDev(e.stream, e.exchange(), e.spans, &.{.{ .rank = e.share.rank, .logits = e.bm.logits }}, 1, e.cur.st.pos + 1 + j, sampler.rule(sm), e.bm.ids, e.draft_tokens.ptr + j * 4);
                 } else {
-                    try e.pickDev(e.bm.logits, e.bm.ids, e.draft_tokens.ptr + j * 4);
+                    try e.pickDev(e.bm.logits, e.bm.ids, e.draft_tokens.ptr + j * 4, 0);
                 }
                 if (j + 1 < depth) {
                     try f.mtpDev(&.{e.bm.fnormed});
@@ -769,9 +794,66 @@ pub const Engine = struct {
         }
     }
 
+    /// One captured draft step per (slot, parity, nch, phase) bucket: pick (the step slot from the
+    /// device counter) + the MTP head's forward + position/slot increments. Replayed for every forward
+    /// step of the round; the final pick (which needs no forward) runs eager afterwards. Host mirrors
+    /// mtp_len and in_head itself - the captured graph reads only device state.
+    fn draftGraphRound(e: *Engine, f: *const fw.Forward, depth: usize) !void {
+        const nch_d = @min(latent.chunksFor(e.cur.st.mtp_len + 1), e.bm.nch);
+        const key: DraftKey = .{
+            .slot = e.slot,
+            .nch = @intCast(nch_d),
+            .parity = @as(u8, e.cur.st.cur[0]),
+            .dense = @intFromBool(e.cur.st.mtp_len < e.c.keyWidth()),
+        };
+        try e.d.check(e.d.api.cuMemsetD32Async(e.draft_idx.ptr, 0, 1, e.stream.handle), "cuMemsetD32Async");
+        const add_fn = try e.m.ops().function("tf_glm_add_i32");
+        var g = e.draft_graphs.getPtr(key);
+        if (g == null) {
+            try cuda.graph.beginCapture(e.stream, .relaxed);
+            const ran = blk: {
+                e.pickDev(e.bm.logits, e.bm.ids, e.draft_tokens.ptr, 1) catch break :blk false;
+                f.mtpDev(&.{e.bm.fnormed}) catch break :blk false;
+                e.addOne(add_fn, e.cur.st.mtp_pos_dev) catch break :blk false;
+                e.addOne(add_fn, e.draft_idx.ptr) catch break :blk false;
+                break :blk true;
+            };
+            if (!ran) {
+                _ = cuda.graph.endCapture(e.stream) catch {};
+                return error.DraftGraphCapture;
+            }
+            const cap = try cuda.graph.endCapture(e.stream);
+            defer {
+                var gm = cap;
+                gm.deinit();
+            }
+            var exec = try cap.instantiate();
+            errdefer exec.deinit();
+            try exec.upload(e.stream);
+            try e.draft_graphs.put(e.gpa, key, exec);
+            g = e.draft_graphs.getPtr(key);
+        }
+        // the round's forward steps: the first launch also runs a fresh capture
+        var steps: usize = 0;
+        while (steps < depth - 1) : (steps += 1) {
+            try g.?.launchOn(e.stream);
+            e.cur.st.mtp_len += 1;
+            e.cur.in_head += 1;
+        }
+        try e.pickDev(e.bm.logits, e.bm.ids, e.draft_tokens.ptr, 1); // the last pick: its slot is the counter
+    }
+
+    fn addOne(e: *Engine, add: cuda.Function, p: u64) !void {
+        var a: cuda.Args = .{};
+        a.add(p);
+        a.add(@as(c_int, 1));
+        a.add(p);
+        try cuda.launch.launch(add, .{ .grid = .{}, .block = .{ .x = 32 } }, e.stream, &a);
+    }
+
     /// One greedy pick that never returns to the host: top-1 into this rank's pairs slot, one count-2
     /// all-gather, then tf_glm_pick_greedy writes the winner to the head's ids slot and the token log.
-    fn pickDev(e: *Engine, logits: u64, ids_slot: u64, token_out: u64) !void {
+    fn pickDev(e: *Engine, logits: u64, ids_slot: u64, token_out: u64, slot_idx: c_int) !void {
         const world = e.share.world;
         var a: cuda.Args = .{};
         a.add(logits);
@@ -783,6 +865,7 @@ pub const Engine = struct {
         var p: cuda.Args = .{};
         p.add(e.pairs_all.ptr);
         p.add(@as(c_int, @intCast(world)));
+        p.add(if (slot_idx != 0) e.draft_idx.ptr else 0);
         p.add(token_out);
         p.add(ids_slot);
         try cuda.launch.launch(e.m.glue.pick_greedy, .{ .grid = .{ .x = 1 }, .block = .{ .x = 32 } }, e.stream, &p);

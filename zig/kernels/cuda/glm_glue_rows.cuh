@@ -252,7 +252,7 @@ extern "C" __global__ void __launch_bounds__(1024) tf_glm_top1_rows(const unsign
 // drafted chain never returns to the host: the winner goes straight into the MTP head's ids slot
 // (the same rule greedyRows' host loop applies; credit: Justin Casey's TensorFold decode graphs).
 extern "C" __global__ void __launch_bounds__(32) tf_glm_pick_greedy(const unsigned* all, int world,
-                                                                     int* token_out, int* ids_slot) {
+                                                                     const int* slot_idx, int* token_base, int* ids_slot) {
   __shared__ unsigned sh[32][2];
   const int t = threadIdx.x;
   if (t < world) { sh[t][0] = all[2 * t]; sh[t][1] = all[2 * t + 1]; }
@@ -264,7 +264,7 @@ extern "C" __global__ void __launch_bounds__(32) tf_glm_pick_greedy(const unsign
     const float b = __int_as_float(static_cast<int>(bv));
     if (v > b || (v == b && sh[w][1] < bi)) { bv = sh[w][0]; bi = sh[w][1]; }
   }
-  token_out[0] = static_cast<int>(bi);
+  token_base[slot_idx ? *slot_idx : 0] = static_cast<int>(bi); // the chain's step slot (device count)
   if (ids_slot) ids_slot[0] = static_cast<int>(bi);
 }
 
