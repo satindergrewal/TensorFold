@@ -50,6 +50,7 @@ pub const Experts = struct {
     mma_rot_in_fn: Function = undefined, // the mixed-width mma decode pass (ported skeleton)
     mma_grouped16_fn: Function = undefined,
     mma_fdown_fn: Function = undefined, // the fused down pass (no Z round trip)
+    mma_rot_rows_fn: Function = undefined, // XROW: one rotation a row (shared suh)
     mma_grouped64_fn: Function = undefined,
     mma_grouped32_fn: Function = undefined,
     mma_gateup_fn: Function = undefined,
@@ -64,7 +65,7 @@ pub const Experts = struct {
         const decode = try mod.function("tf_exl3_experts");
         const prompt = try mod.function("tf_exl3_experts_prompt");
         // the mixed-width mma decode pass (the same fatbin; tf_exl3m_* in exl3_experts.cu)
-        const mma: struct { rot: Function, g: Function, g64: Function, g32: Function, gu: Function, dn: Function, fd: Function } = .{
+        const mma: struct { rot: Function, g: Function, g64: Function, g32: Function, gu: Function, dn: Function, fd: Function, rr: Function } = .{
             .rot = try mod.function("tf_exl3m_rot_in"),
             .g = try mod.function("tf_exl3m_grouped16"),
             .g64 = try mod.function("tf_exl3m_grouped64"),
@@ -72,6 +73,7 @@ pub const Experts = struct {
             .gu = try mod.function("tf_exl3m_gateup"),
             .dn = try mod.function("tf_exl3m_down"),
             .fd = try mod.function("tf_exl3m_fdown"),
+            .rr = try mod.function("tf_exl3m_rot_rows"),
         };
         const e: Experts = .{
             .mod = mod,
@@ -81,6 +83,7 @@ pub const Experts = struct {
             .mma_rot_in_fn = mma.rot,
             .mma_grouped16_fn = mma.g,
             .mma_fdown_fn = mma.fd,
+            .mma_rot_rows_fn = mma.rr,
             .mma_grouped64_fn = mma.g64,
             .mma_grouped32_fn = mma.g32,
             .mma_gateup_fn = mma.gu,
@@ -147,7 +150,21 @@ pub const MmaTile = enum { mt16, mt32, mt64 };
             break :blk std.fmt.parseInt(usize, std.mem.span(v), 10) catch 1;
         } else 1;
         const p = rows * slots;
-        {
+        // XROW (TF_GLM_MMA_XROW=1): the checkpoint's experts all share one gate/up suh (verified
+        // byte-identical), so ONE rotation a row - 16x smaller than the per-pair pass - serves both mats
+        const xrow = std.c.getenv("TF_GLM_MMA_XROW") != null;
+        if (xrow) {
+            var a: launch_.Args = .{};
+            a.add(x);
+            a.add(@as(i32, @intCast(x_stride)));
+            a.add(@as(i32, @intCast(slots)));
+            a.add(pick);
+            a.add(suh_g);
+            a.add(xg);
+            a.add(@as(i32, @intCast(dims)));
+            a.add(skip);
+            try launch_.launch(e.mma_rot_rows_fn, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(dims / 128) }, .block = .{ .x = 32 } }, s, &a);
+        } else {
             var a: launch_.Args = .{};
             a.add(x);
             a.add(@as(i32, @intCast(x_stride)));
@@ -164,7 +181,7 @@ pub const MmaTile = enum { mt16, mt32, mt64 };
         {
             var a: launch_.Args = .{};
             a.add(xg);
-            a.add(xu);
+            a.add(if (xrow) xg else xu);
             a.add(mats_up);
             a.add(plan.items);
             a.add(plan.counts);
@@ -176,6 +193,8 @@ pub const MmaTile = enum { mt16, mt32, mt64 };
             a.add(skip);
             a.add(@as(c_uint, book));
             a.add(@as(c_int, 2));
+            a.add(@as(i32, @intCast(slots)));
+            a.add(@as(c_int, @intFromBool(xrow)));
             if (wide == .mt32) try launch_.launch(e.mma_grouped32_fn, .{ .grid = .{ .x = @intCast(items), .y = @intCast(width / 32), .z = @intCast(2 * sk) }, .block = .{ .x = 128 }, .shared = 32 * 4 + 4 * 32 * 32 * 4 }, s, &a) else if (wide == .mt64) try launch_.launch(e.mma_grouped64_fn, .{ .grid = .{ .x = @intCast(items), .y = @intCast(width / 16), .z = @intCast(2 * sk) }, .block = .{ .x = 128 }, .shared = 64 * 4 + 4 * 64 * 16 * 4 }, s, &a) else try launch_.launch(e.mma_grouped16_fn, .{ .grid = .{ .x = @intCast(items), .y = @intCast(width / 128), .z = @intCast(2 * sk) }, .block = .{ .x = 128 }, .shared = 16 * 4 + 4 * 16 * 128 * 4 }, s, &a);
         }
         {
@@ -228,6 +247,8 @@ pub const MmaTile = enum { mt16, mt32, mt64 };
             a.add(skip);
             a.add(@as(c_uint, book));
             a.add(@as(c_int, 1));
+            a.add(@as(i32, @intCast(slots)));
+            a.add(@as(c_int, 0));
             if (wide == .mt32) try launch_.launch(e.mma_grouped32_fn, .{ .grid = .{ .x = @intCast(items), .y = @intCast(dims / 32), .z = @intCast(sk_down) }, .block = .{ .x = 128 }, .shared = 32 * 4 + 4 * 32 * 32 * 4 }, s, &a) else if (wide == .mt64) try launch_.launch(e.mma_grouped64_fn, .{ .grid = .{ .x = @intCast(items), .y = @intCast(dims / 16), .z = @intCast(sk_down) }, .block = .{ .x = 128 }, .shared = 64 * 4 + 4 * 64 * 16 * 4 }, s, &a) else try launch_.launch(e.mma_grouped16_fn, .{ .grid = .{ .x = @intCast(items), .y = @intCast(dims / 128), .z = @intCast(sk_down) }, .block = .{ .x = 128 }, .shared = 16 * 4 + 4 * 16 * 128 * 4 }, s, &a);
             var b: launch_.Args = .{};
             b.add(z);
