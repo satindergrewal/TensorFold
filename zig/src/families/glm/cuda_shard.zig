@@ -27,20 +27,57 @@ pub const Share = struct {
     vocab: Span, // the head's rows
 
     /// Rank `rank` of `world`; refused where a rank would be left empty (the Python family's split_units refuses it).
+    /// TF_GLM_TP_WEIGHTS="a,b" weights the routed and shared expert rows by capability (a slower card takes
+    /// less); every rank must see the same string, and each share stays a 128-multiple for the trellis tiles.
     pub fn of(c: *const Config, rank: usize, world: usize) !Share {
         if (world == 0 or rank >= world) return error.BadRank;
+        var wbuf: [256]u64 = @splat(1);
+        const wts = tpWeights(world, &wbuf);
+        var even = wts.len == world;
+        for (wts) |w| if (w != wts[0]) {
+            even = false;
+        };
+        const moe = if (even) try span(c.moe_inter, unit, rank, world) else try spanW(c.moe_inter, unit, rank, world, wts);
+        const shared = if (even) try span(c.shared_inter, unit, rank, world) else try spanW(c.shared_inter, unit, rank, world, wts);
+        if (moe.len() % 128 != 0 or shared.len() % 64 != 0) return error.BadSplit;
         return .{
             .rank = rank,
             .world = world,
             .kda = try span(c.kda_heads, 1, rank, world),
             .mla = try span(c.mla_heads, 1, rank, world),
             .dense = try span(c.dense_inter, unit, rank, world),
-            .moe = try span(c.moe_inter, unit, rank, world),
-            .shared = try span(c.shared_inter, unit, rank, world),
+            .moe = moe,
+            .shared = shared,
             .vocab = try span(c.vocab, c.head_unit, rank, world),
         };
     }
 };
+
+/// TF_GLM_TP_WEIGHTS: comma-separated positive integers, one a rank; falls back to even on any mismatch.
+fn tpWeights(world: usize, buf: *[256]u64) []const u64 {
+    const raw = std.c.getenv("TF_GLM_TP_WEIGHTS") orelse return buf[0..world];
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, std.mem.span(raw), ',');
+    while (it.next()) |part| {
+        if (n >= world) return buf[0..world];
+        const w = std.fmt.parseInt(u64, std.mem.trim(u8, part, " \t"), 10) catch return buf[0..world];
+        if (w == 0) return buf[0..world];
+        buf[n] = w;
+        n += 1;
+    }
+    if (n != world) return buf[0..world];
+    return buf[0..world];
+}
+
+/// Rank `rank`'s [lo, hi) of `total` elements taken in whole `per`s, proportional to `weights`.
+fn spanW(total: usize, per: usize, rank: usize, world: usize, weights: []const u64) !Span {
+    if (total % per != 0 or world > 256) return error.BadSplit;
+    var out: [256]canon.Range = undefined;
+    canon.partition(@intCast(total / per), weights, out[0..world]);
+    const r = out[rank];
+    if (r.len() == 0) return error.EmptyShare;
+    return .{ .lo = r.begin * per, .hi = r.end * per };
+}
 
 /// Rank `rank`'s [lo, hi) of `total` elements taken in whole `per`s.
 fn span(total: usize, per: usize, rank: usize, world: usize) !Span {
