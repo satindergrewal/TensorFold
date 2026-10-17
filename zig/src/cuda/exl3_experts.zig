@@ -49,6 +49,7 @@ pub const Experts = struct {
     decode_fn: Function, // every width and codebook
     mma_rot_in_fn: Function = undefined, // the mixed-width mma decode pass (ported skeleton)
     mma_grouped16_fn: Function = undefined,
+    mma_fdown_fn: Function = undefined, // the fused down pass (no Z round trip)
     mma_grouped64_fn: Function = undefined,
     mma_grouped32_fn: Function = undefined,
     mma_gateup_fn: Function = undefined,
@@ -63,13 +64,14 @@ pub const Experts = struct {
         const decode = try mod.function("tf_exl3_experts");
         const prompt = try mod.function("tf_exl3_experts_prompt");
         // the mixed-width mma decode pass (the same fatbin; tf_exl3m_* in exl3_experts.cu)
-        const mma: struct { rot: Function, g: Function, g64: Function, g32: Function, gu: Function, dn: Function } = .{
+        const mma: struct { rot: Function, g: Function, g64: Function, g32: Function, gu: Function, dn: Function, fd: Function } = .{
             .rot = try mod.function("tf_exl3m_rot_in"),
             .g = try mod.function("tf_exl3m_grouped16"),
             .g64 = try mod.function("tf_exl3m_grouped64"),
             .g32 = try mod.function("tf_exl3m_grouped32"),
             .gu = try mod.function("tf_exl3m_gateup"),
             .dn = try mod.function("tf_exl3m_down"),
+            .fd = try mod.function("tf_exl3m_fdown"),
         };
         const e: Experts = .{
             .mod = mod,
@@ -78,6 +80,7 @@ pub const Experts = struct {
             .resident = .{ @max(1, try decode.occupancy(256, 0)) * sms, @max(1, try prompt.occupancy(256, 0)) * sms },
             .mma_rot_in_fn = mma.rot,
             .mma_grouped16_fn = mma.g,
+            .mma_fdown_fn = mma.fd,
             .mma_grouped64_fn = mma.g64,
             .mma_grouped32_fn = mma.g32,
             .mma_gateup_fn = mma.gu,
@@ -190,7 +193,27 @@ pub const MmaTile = enum { mt16, mt32, mt64 };
             a.add(skip);
             try launch_.launch(e.mma_gateup_fn, .{ .grid = .{ .x = @intCast(p), .y = @intCast(width / 128) }, .block = .{ .x = 32 } }, s, &a);
         }
-        {
+        // the down pass whole (SK_DOWN=1, the default) takes the FUSED kernel: the epilogue's FWHT +
+        // svh_d scale + ey write happen in-kernel - no Z round trip, one launch less a layer (the python
+        // engine's fuse=1). TF_GLM_MMA_FDOWN=0 keeps the split pair.
+        if (sk_down == 1 and std.c.getenv("TF_GLM_MMA_FDOWN") == null) {
+            var a: launch_.Args = .{};
+            a.add(xd);
+            a.add(mats_down);
+            a.add(plan.items);
+            a.add(plan.counts);
+            a.add(plan.members);
+            a.add(pick);
+            a.add(svh_d);
+            a.add(ey);
+            a.add(@as(i32, @intCast(dims)));
+            a.add(@as(i32, @intCast(p)));
+            a.add(@as(i32, @intCast(slots)));
+            a.add(@as(i32, @intCast(slots)));
+            a.add(skip);
+            a.add(@as(c_uint, book));
+            try launch_.launch(e.mma_fdown_fn, .{ .grid = .{ .x = @intCast(items), .y = @intCast(dims / 128) }, .block = .{ .x = 128 }, .shared = 64 + 4 * 16 * 128 * 4 + 16 * 128 * 4 }, s, &a);
+        } else {
             var a: launch_.Args = .{};
             a.add(xd);
             a.add(xd);
@@ -206,20 +229,18 @@ pub const MmaTile = enum { mt16, mt32, mt64 };
             a.add(@as(c_uint, book));
             a.add(@as(c_int, 1));
             if (wide == .mt32) try launch_.launch(e.mma_grouped32_fn, .{ .grid = .{ .x = @intCast(items), .y = @intCast(dims / 32), .z = @intCast(sk_down) }, .block = .{ .x = 128 }, .shared = 32 * 4 + 4 * 32 * 32 * 4 }, s, &a) else if (wide == .mt64) try launch_.launch(e.mma_grouped64_fn, .{ .grid = .{ .x = @intCast(items), .y = @intCast(dims / 16), .z = @intCast(sk_down) }, .block = .{ .x = 128 }, .shared = 64 * 4 + 4 * 64 * 16 * 4 }, s, &a) else try launch_.launch(e.mma_grouped16_fn, .{ .grid = .{ .x = @intCast(items), .y = @intCast(dims / 128), .z = @intCast(sk_down) }, .block = .{ .x = 128 }, .shared = 16 * 4 + 4 * 16 * 128 * 4 }, s, &a);
-        }
-        {
-            var a: launch_.Args = .{};
-            a.add(z);
-            a.add(pick);
-            a.add(svh_d);
-            a.add(ey);
-            a.add(@as(i32, @intCast(p)));
-            a.add(@as(i32, @intCast(dims)));
-            a.add(@as(c_int, @intCast(sk_down)));
-            a.add(@as(i32, @intCast(slots)));
-            a.add(@as(i32, @intCast(slots)));
-            a.add(skip);
-            try launch_.launch(e.mma_down_fn, .{ .grid = .{ .x = @intCast(p), .y = @intCast(dims / 128) }, .block = .{ .x = 32 } }, s, &a);
+            var b: launch_.Args = .{};
+            b.add(z);
+            b.add(pick);
+            b.add(svh_d);
+            b.add(ey);
+            b.add(@as(i32, @intCast(p)));
+            b.add(@as(i32, @intCast(dims)));
+            b.add(@as(c_int, @intCast(sk_down)));
+            b.add(@as(i32, @intCast(slots)));
+            b.add(@as(i32, @intCast(slots)));
+            b.add(skip);
+            try launch_.launch(e.mma_down_fn, .{ .grid = .{ .x = @intCast(p), .y = @intCast(dims / 128) }, .block = .{ .x = 32 } }, s, &b);
         }
     }
 
