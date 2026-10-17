@@ -525,10 +525,13 @@ pub const LaneHost = struct {
                 continue;
             }
             h.unlock();
+            const rp_on = std.c.getenv("TF_GLM_RPROF") != null;
+            const rp0 = if (rp_on) rpNowHS() else 0;
             h.core.step() catch |e| {
                 h.failAll(@errorName(e));
                 continue;
             };
+            const rp1 = if (rp_on) rpNowHS() else 0;
             var i: usize = 0;
             while (i < h.admitted.items.len) {
                 const job = h.admitted.items[i];
@@ -539,6 +542,29 @@ pub const LaneHost = struct {
                 } else i += 1;
             }
             lone.reclaim(h);
+            if (rp_on) {
+                const rp2 = rpNowHS();
+                rpTickHS(rp1 - rp0, rp2 - rp1);
+            }
+        }
+    }
+
+    var rp_hs_n: u64 = 0;
+    var rp_step_ns: u64 = 0;
+    var rp_deliv_ns: u64 = 0;
+    fn rpNowHS() u64 {
+        var ts: std.c.timespec = undefined;
+        if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
+        return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+    }
+    fn rpTickHS(step_ns: u64, deliv_ns: u64) void {
+        rp_step_ns += step_ns;
+        rp_deliv_ns += deliv_ns;
+        rp_hs_n += 1;
+        if (rp_hs_n % 128 == 0) {
+            std.debug.print("RPHOST n={d} step_us={d} deliver_us={d}\n", .{ rp_hs_n, rp_step_ns / 128 / 1000, rp_deliv_ns / 128 / 1000 });
+            rp_step_ns = 0;
+            rp_deliv_ns = 0;
         }
     }
 

@@ -203,6 +203,30 @@ pub const Engine = struct {
     }
 
     /// One stream's round: verify pending and drafted tokens together, keep drafts to the first mismatch.
+    pub var rp_n: u64 = 0;
+    pub var rp_verify: u64 = 0;
+    pub var rp_keep: u64 = 0;
+    pub var rp_draft: u64 = 0;
+    pub var rp_round: u64 = 0;
+    fn rpNow() u64 {
+        var ts: std.c.timespec = undefined;
+        if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
+        return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+    }
+    fn rpTick() void {
+        rp_n += 1;
+        if (rp_n % 128 == 0) {
+            std.debug.print("RPROUND n={d} round_us={d} verify_us={d} keep_us={d} draft_us={d}\n", .{ rp_n, rp_round / 128 / 1000, rp_verify / 128 / 1000, rp_keep / 128 / 1000, rp_draft / 128 / 1000 });
+            rp_verify = 0;
+            rp_keep = 0;
+            rp_draft = 0;
+            rp_round = 0;
+        }
+    }
+    fn rpOn() bool {
+        return std.c.getenv("TF_GLM_RPROF") != null;
+    }
+
     fn familyRound(e: *Engine, s: *Stream, copied: ?[]const u32) !Result {
         e.clock.start();
         const priced = s.priced;
@@ -216,11 +240,14 @@ pub const Engine = struct {
         const windows = [_]be.Window{try win.build(e, plan, early)};
         const rows = windows[0].rows();
         var out = [_]be.Verified{.{ .sampled = try a.alloc(u32, rows), .drafts = try a.alloc(u32, rows - 1), .rows = if (s.logprobs != null) try a.alloc(LogRow, rows) else &.{} }};
+        const rp0 = if (rpOn()) rpNow() else 0;
         try e.backend.verify(&windows, &out);
+        const rp1 = if (rpOn()) rpNow() else 0;
         const tokens = try win.tokens(e, windows[0], out[0]);
         const parents = try win.rowParents(e, windows[0]);
         const o = try e.conclude(s, plan, out[0].sampled, out[0].rows, tokens, parents, windows[0].positions);
         if (o.path.len < rows or plan.parents != null) try e.backend.keep(&windows, &.{o.path});
+        const rp2 = if (rpOn()) rpNow() else 0;
         const held_levels = s.held_levels;
         if (e.cfg.family_mtp and s.drafts) {
             if (early and o.cut == null) {
@@ -252,6 +279,14 @@ pub const Engine = struct {
             const ms = e.clock.elapsedMs(.overhead);
             try trail.event(e, &.{ f("ev", str("overhead")), f("streams", int(1)), f("rows", int(rows)), f("ms", ev.bits(ms)) });
             try e.rule.observeOverhead(1, rows, ms, s.sampling != null, 0.0);
+        }
+        if (rpOn()) {
+            const rp3 = rpNow();
+            rp_verify += rp1 - rp0;
+            rp_keep += rp2 - rp1;
+            rp_draft += rp3 - rp2;
+            rp_round += rp3 - rp0;
+            rpTick();
         }
         return .{ .rows = @intCast(rows), .keep = @intCast(o.path.len), .got = o.got };
     }
