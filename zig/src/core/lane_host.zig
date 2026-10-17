@@ -493,11 +493,15 @@ pub const LaneHost = struct {
 
     fn run(h: *LaneHost) void {
         while (true) {
+            const rp_out = std.c.getenv("TF_GLM_RPROF") != null;
+            const rp_a = if (rp_out) rpNowHS() else 0;
             h.takeCancels();
             while (h.admitOne()) {}
             h.fillOne();
             status.noteLive(h);
+            const rp_b = if (rp_out) rpNowHS() else 0;
             h.lock();
+            const rp_c = if (rp_out) rpNowHS() else 0;
             if (h.closing) {
                 const left = h.queued.items.len + h.admitted.items.len;
                 h.unlock();
@@ -545,6 +549,8 @@ pub const LaneHost = struct {
             if (rp_on) {
                 const rp2 = rpNowHS();
                 rpTickHS(rp1 - rp0, rp2 - rp1);
+                rp_pre += rp_b - rp_a;
+                rp_lock += rp_c - rp_b;
             }
         }
     }
@@ -552,6 +558,8 @@ pub const LaneHost = struct {
     var rp_hs_n: u64 = 0;
     var rp_step_ns: u64 = 0;
     var rp_deliv_ns: u64 = 0;
+    var rp_pre: u64 = 0;
+    var rp_lock: u64 = 0;
     fn rpNowHS() u64 {
         var ts: std.c.timespec = undefined;
         if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
@@ -562,9 +570,11 @@ pub const LaneHost = struct {
         rp_deliv_ns += deliv_ns;
         rp_hs_n += 1;
         if (rp_hs_n % 128 == 0) {
-            std.debug.print("RPHOST n={d} step_us={d} deliver_us={d}\n", .{ rp_hs_n, rp_step_ns / 128 / 1000, rp_deliv_ns / 128 / 1000 });
+            std.debug.print("RPHOST n={d} step_us={d} deliver_us={d} pre_us={d} lock_us={d}\n", .{ rp_hs_n, rp_step_ns / 128 / 1000, rp_deliv_ns / 128 / 1000, rp_pre / 128 / 1000, rp_lock / 128 / 1000 });
             rp_step_ns = 0;
             rp_deliv_ns = 0;
+            rp_pre = 0;
+            rp_lock = 0;
         }
     }
 
