@@ -58,6 +58,8 @@ pub const DeviceBuffer = struct {
     /// `len` bytes, 256-byte aligned by the driver; zero bytes allocate nothing and hold address 0.
     pub fn alloc(d: *const Driver, len: usize) Error!DeviceBuffer {
         var p: abi.DevicePtr = 0;
+        if (len >= (1 << 30) and std.c.getenv("TENSORFOLD_ALLOC_LOG") != null)
+            std.debug.print("ALLOC-TRY bytes={} held={}\n", .{ len, device_bytes.load(.monotonic) });
         if (len > 0) try d.check(d.api.cuMemAlloc_v2(&p, len), "cuMemAlloc");
         if (len >= (1 << 30) and std.c.getenv("TENSORFOLD_ALLOC_LOG") != null)
             std.debug.print("ALLOC bytes={} held={}\n", .{ len, device_bytes.load(.monotonic) });
