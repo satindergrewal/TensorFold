@@ -202,7 +202,7 @@ pub const MmaTile = enum { mt16, mt32, mt64 };
             a.add(@as(i32, @intCast(slots)));
             a.add(@as(c_int, @intFromBool(xrow)));
             a.add(swz);
-            if (wide == .mt32) try launch_.launch(e.mma_grouped32_fn, .{ .grid = .{ .x = @intCast(items), .y = @intCast(width / 32), .z = @intCast(2 * sk) }, .block = .{ .x = 128 }, .shared = 32 * 4 + 4 * 32 * 32 * 4 + 6 * 4 * 2 * 32 * 4 }, s, &a) else if (wide == .mt64) try launch_.launch(e.mma_grouped64_fn, .{ .grid = .{ .x = @intCast(items), .y = @intCast(width / 16), .z = @intCast(2 * sk) }, .block = .{ .x = 128 }, .shared = 64 * 4 + 4 * 64 * 16 * 4 + 6 * 4 * 1 * 32 * 4 }, s, &a) else try launch_.launch(e.mma_grouped16_fn, .{ .grid = .{ .x = @intCast(items), .y = @intCast(width / 128), .z = @intCast(2 * sk) }, .block = .{ .x = 128 }, .shared = 16 * 4 + 4 * 16 * 128 * 4 + 6 * 4 * 8 * 32 * 4 }, s, &a);
+            if (wide == .mt32) try launch_.launch(e.mma_grouped32_fn, .{ .grid = .{ .x = @intCast(items), .y = @intCast(width / 32), .z = @intCast(2 * sk) }, .block = .{ .x = 128 }, .shared = 32 * 4 + 4 * 32 * 32 * 4 }, s, &a) else if (wide == .mt64) try launch_.launch(e.mma_grouped64_fn, .{ .grid = .{ .x = @intCast(items), .y = @intCast(width / 16), .z = @intCast(2 * sk) }, .block = .{ .x = 128 }, .shared = 64 * 4 + 4 * 64 * 16 * 4 }, s, &a) else try launch_.launch(e.mma_grouped16_fn, .{ .grid = .{ .x = @intCast(items), .y = @intCast(width / 128), .z = @intCast(2 * sk) }, .block = .{ .x = 128 }, .shared = 16 * 4 + 4 * 16 * 128 * 4 }, s, &a);
         }
         {
             var a: launch_.Args = .{};
@@ -257,7 +257,7 @@ pub const MmaTile = enum { mt16, mt32, mt64 };
             a.add(@as(i32, @intCast(slots)));
             a.add(@as(c_int, 0));
             a.add(swz);
-            if (wide == .mt32) try launch_.launch(e.mma_grouped32_fn, .{ .grid = .{ .x = @intCast(items), .y = @intCast(dims / 32), .z = @intCast(sk_down) }, .block = .{ .x = 128 }, .shared = 32 * 4 + 4 * 32 * 32 * 4 + 6 * 4 * 2 * 32 * 4 }, s, &a) else if (wide == .mt64) try launch_.launch(e.mma_grouped64_fn, .{ .grid = .{ .x = @intCast(items), .y = @intCast(dims / 16), .z = @intCast(sk_down) }, .block = .{ .x = 128 }, .shared = 64 * 4 + 4 * 64 * 16 * 4 + 6 * 4 * 1 * 32 * 4 }, s, &a) else try launch_.launch(e.mma_grouped16_fn, .{ .grid = .{ .x = @intCast(items), .y = @intCast(dims / 128), .z = @intCast(sk_down) }, .block = .{ .x = 128 }, .shared = 16 * 4 + 4 * 16 * 128 * 4 + 6 * 4 * 8 * 32 * 4 }, s, &a);
+            if (wide == .mt32) try launch_.launch(e.mma_grouped32_fn, .{ .grid = .{ .x = @intCast(items), .y = @intCast(dims / 32), .z = @intCast(sk_down) }, .block = .{ .x = 128 }, .shared = 32 * 4 + 4 * 32 * 32 * 4 }, s, &a) else if (wide == .mt64) try launch_.launch(e.mma_grouped64_fn, .{ .grid = .{ .x = @intCast(items), .y = @intCast(dims / 16), .z = @intCast(sk_down) }, .block = .{ .x = 128 }, .shared = 64 * 4 + 4 * 64 * 16 * 4 }, s, &a) else try launch_.launch(e.mma_grouped16_fn, .{ .grid = .{ .x = @intCast(items), .y = @intCast(dims / 128), .z = @intCast(sk_down) }, .block = .{ .x = 128 }, .shared = 16 * 4 + 4 * 16 * 128 * 4 }, s, &a);
             var b: launch_.Args = .{};
             b.add(z);
             b.add(pick);

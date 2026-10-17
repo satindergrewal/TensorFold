@@ -329,18 +329,6 @@ extern "C" __global__ void __launch_bounds__(256) tf_exl3_experts_prompt(const _
 
 namespace {
 
-// A 4-byte cp.async: each lane stages one word of a k-tile row, so the whole warp's 8 K words
-// travel as one coalesced 128-byte request instead of four scattered scalar loads per lane in the
-// dependent decode chain. Staged DEPTH tiles ahead into dedicated shared memory (no aliasing with
-// the epilogue's partial area), so the loads are issued well before their decode needs them.
-__device__ __forceinline__ void tf_cpasync4(void* dst, const void* src) {
-  const unsigned sa = (unsigned)__cvta_generic_to_shared(dst);
-  asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(sa), "l"(src));
-}
-__device__ __forceinline__ void tf_cpasync_commit() { asm volatile("cp.async.commit_group;\n"); }
-template <int N>
-__device__ __forceinline__ void tf_cpasync_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
-
 __device__ __forceinline__ float tf_exl3m_bf16r(float x) {
     return __bfloat162float(__float2bfloat16_rn(x));
 }
@@ -408,26 +396,8 @@ __device__ __forceinline__ void tf_exl3m_body(const half* __restrict__ X0, const
 #pragma unroll
                 for (int c = 0; c < 4; ++c) acc[m][i][h][c] = 0.f;
 
-    constexpr int WORDS = 8 * K, DEPTH = 6;
-    uint32_t* const stash = reinterpret_cast<uint32_t*>(
-        reinterpret_cast<char*>(red) + (size_t)W * ROWS * NT * 16 * 4);
-    const uint32_t* stage_src = tile;
-    const auto issue = [&](int s) {
-        uint32_t* const dst = stash + (((size_t)s * W + warp) * NT) * WORDS;
-#pragma unroll
-        for (int i = 0; i < NT; ++i)
-            if (lane < WORDS) tf_cpasync4(dst + i * WORDS + lane, stage_src + i * WORDS + lane);
-        stage_src += (size_t)NTILES * WORDS;
-        tf_cpasync_commit();
-    };
-    const int prefetch = per_warp < DEPTH ? per_warp : DEPTH;
-    for (int n = 0; n < prefetch; ++n) issue(n);
-    const unsigned i0 = tf_exl3_i0<K>(lane);
     for (int kt = kt0; kt < kt0 + per_warp; ++kt) {
-        const int n = kt - kt0, s = n % DEPTH;
         const int k = kt * 16;
-        tf_cpasync_wait<DEPTH - 1>();
-        __syncthreads();
         uint32_t a[MT][4];
 #pragma unroll
         for (int m = 0; m < MT; ++m) {
@@ -439,10 +409,7 @@ __device__ __forceinline__ void tf_exl3m_body(const half* __restrict__ X0, const
         }
 #pragma unroll
         for (int i = 0; i < NT; ++i) {
-            const uint32_t* const sh = stash + (((size_t)s * W + warp) * NT + i) * WORDS;
-            uint4 tw;
-            if (i0 % 4 == 0 && i0 + 3 < WORDS) tw = *reinterpret_cast<const uint4*>(sh + i0);
-            else tw = make_uint4(sh[i0], sh[(i0 + 1) % WORDS], sh[(i0 + 2) % WORDS], sh[(i0 + 3) % WORDS]);
+            const uint4 tw = tf_exl3_words<K>(tile + i * (8 * K), lane);
             uint32_t bp[4];
             tf_exl3_pairs_any<K>(tw, lane, book, bp);
             const uint32_t b0 = bp[0], b1 = bp[1], b2 = bp[2], b3 = bp[3];
@@ -452,12 +419,8 @@ __device__ __forceinline__ void tf_exl3m_body(const half* __restrict__ X0, const
                 tf_exl3_mma(acc[m][i][1], a[m], b2, b3);
             }
         }
-        __syncthreads();
-        if (n + DEPTH < per_warp) issue(s);
-        tile += (size_t)NTILES * WORDS;
+        tile += (size_t)NTILES * (8 * K);
     }
-    tf_cpasync_wait<0>();
-    __syncthreads();
 
 #pragma unroll
     for (int m = 0; m < MT; ++m)

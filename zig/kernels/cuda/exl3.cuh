@@ -52,18 +52,11 @@ __device__ __forceinline__ __half2 tf_exl3_value2(unsigned s0, unsigned s1) {
   return __hadd2(*reinterpret_cast<const __half2*>(&lo), *reinterpret_cast<const __half2*>(&hi));
 }
 
-// Lane l's first stream word: the window its eight values 8 l .. 8 l + 7 spans starts here.
-template <int K>
-__device__ __forceinline__ unsigned tf_exl3_i0(unsigned lane) {
-  constexpr unsigned ring = 256 * K;
-  return ((8 * lane * K + K + ring - 16) % ring) / 32;
-}
-
 // Lane l's stream words for its eight values 8 l .. 8 l + 7: the four u32 words its states span, MSB first.
 template <int K>
 __device__ __forceinline__ uint4 tf_exl3_words(const uint32_t* tile, unsigned lane) {
-  constexpr unsigned words = 8 * K;
-  const unsigned i0 = tf_exl3_i0<K>(lane);
+  constexpr unsigned ring = 256 * K, words = 8 * K;
+  const unsigned i0 = ((8 * lane * K + K + ring - 16) % ring) / 32;
   // one 16-byte nc vector load when the four words sit together (the python engine's dec kernel loads
   // this way, jayleaton/glm53-tensorfold-spark 0580's ld.global.nc.L1::no_allocate: a quarter the load
   // instructions and no L1 allocation for read-once trellis words); the ring wrap falls back to scalars
