@@ -498,6 +498,126 @@ extern "C" __global__ void __launch_bounds__(128) tf_exl3m_grouped16(const half*
     tf_exl3m_grouped<1, 8, 4>(X0, X1, mdb, items, counts, members, Z, N, P, SK, skip, book, mats);
 }
 
+// The FUSED down pass (TF_GLM_MMA_FDOWN, on when SK_DOWN=1): the grouped16 shape's accumulation (MT=1, NT=8 -
+// one 128-column Hadamard block a program) with the down epilogue in-kernel: the warps' partial sums land in
+// shared, one warp a row runs the 128-wide FWHT, the 0.0883 * svh_d scale applies, and the result writes ey
+// directly. No Z round trip and one launch less a layer (the python engine's fuse=1 design). The shared
+// expert's item writes that pair's ey zeros, exactly as the epilogue it replaces did.
+template <int K>
+__device__ __forceinline__ void tf_exl3m_fdown_body(const half* __restrict__ X, const TfExl3Mat& md,
+        const int* __restrict__ members, int first, int cnt, const half* __restrict__ svh_d,
+        float* __restrict__ ey, int D, int slots, int ys, bool dead, unsigned book, int* __restrict__ rows_sh,
+        float* __restrict__ red, float* __restrict__ buf) {
+    constexpr int NT = 8, W = 4, ROWS = 16;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int g = lane >> 2, t = lane & 3;
+    const int KT = md.k >> 4, NTILES = md.tiles_n;
+
+    for (int i = threadIdx.x; i < ROWS; i += W * 32) rows_sh[i] = i < cnt ? members[first + i] : -1;
+    __syncthreads();
+    int r0v = rows_sh[g], r1v = rows_sh[g + 8];
+    const half* x0 = X + (size_t)(r0v < 0 ? 0 : r0v) * md.k + 2 * t;
+    const half* x1 = X + (size_t)(r1v < 0 ? 0 : r1v) * md.k + 2 * t;
+
+    const int per_warp = KT / W;
+    const int kt0 = warp * per_warp;
+    const int nt0 = blockIdx.y * NT;
+    const uint32_t* tile = reinterpret_cast<const uint32_t*>(md.trellis) + ((size_t)kt0 * NTILES + nt0) * (8 * K);
+
+    float acc[NT][2][4];
+#pragma unroll
+    for (int i = 0; i < NT; ++i)
+#pragma unroll
+        for (int h = 0; h < 2; ++h)
+#pragma unroll
+            for (int cc = 0; cc < 4; ++cc) acc[i][h][cc] = 0.f;
+
+    if (!dead) {
+        for (int kt = kt0; kt < kt0 + per_warp; ++kt) {
+            const int k = kt * 16;
+            uint32_t a[4];
+            const bool ok0 = r0v >= 0, ok1 = r1v >= 0;
+            a[0] = ok0 ? *reinterpret_cast<const uint32_t*>(x0 + k) : 0u;
+            a[1] = ok1 ? *reinterpret_cast<const uint32_t*>(x1 + k) : 0u;
+            a[2] = ok0 ? *reinterpret_cast<const uint32_t*>(x0 + k + 8) : 0u;
+            a[3] = ok1 ? *reinterpret_cast<const uint32_t*>(x1 + k + 8) : 0u;
+#pragma unroll
+            for (int i = 0; i < NT; ++i) {
+                const uint4 tw = tf_exl3_words<K>(tile + i * (8 * K), lane);
+                __half w[8];
+                tf_exl3_unpack_any<K>(tw, lane, book, w);
+                const uint32_t b0 = tf_exl3_pair(w[0], w[1]), b1 = tf_exl3_pair(w[2], w[3]);
+                const uint32_t b2 = tf_exl3_pair(w[4], w[5]), b3 = tf_exl3_pair(w[6], w[7]);
+                tf_exl3_mma(acc[i][0], a, b0, b1);
+                tf_exl3_mma(acc[i][1], a, b2, b3);
+            }
+            tile += (size_t)NTILES * (8 * K);
+        }
+    }
+
+#pragma unroll
+    for (int i = 0; i < NT; ++i)
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int col = i * 16 + h * 8 + 2 * t;
+            const size_t p0 = ((size_t)warp * ROWS + g) * (NT * 16) + col;
+            const size_t p1 = ((size_t)warp * ROWS + g + 8) * (NT * 16) + col;
+            red[p0] = acc[i][h][0];
+            red[p0 + 1] = acc[i][h][1];
+            red[p1] = acc[i][h][2];
+            red[p1 + 1] = acc[i][h][3];
+        }
+    __syncthreads();
+    for (int idx = threadIdx.x; idx < ROWS * NT * 16; idx += W * 32) {
+        const int row = idx / (NT * 16), col = idx % (NT * 16);
+        float s = red[row * (NT * 16) + col];
+#pragma unroll
+        for (int w = 1; w < W; ++w) s += red[((size_t)w * ROWS + row) * (NT * 16) + col];
+        buf[row * (NT * 16) + col] = s;
+    }
+    __syncthreads();
+    const half* svh = dead ? nullptr : svh_d;
+#pragma unroll
+    for (int j = 0; j < ROWS / W; ++j) {  // W warps cover the 16 rows: 4 each (j < 8 walked rows 16..31)
+        const int row = warp + W * j;
+        const int p = rows_sh[row];
+        if (p < 0) continue;
+        float v[4];
+#pragma unroll
+        for (int q = 0; q < 4; ++q) v[q] = buf[row * 128 + lane + 32 * q];
+        tf_exl3_fwht(v, lane);
+        float* o = ey + ((size_t)(p / slots) * ys + (p % slots)) * D + blockIdx.y * 128;
+#pragma unroll
+        for (int q = 0; q < 4; ++q)
+            o[lane + 32 * q] = dead ? 0.f : v[q] * 0.08838834764831845f * __half2float(svh[(size_t)0 * D + blockIdx.y * 128 + lane + 32 * q]);
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(128) tf_exl3m_fdown(const half* __restrict__ X,
+        const TfExl3Mat* __restrict__ mdb, const int* __restrict__ items, const int* __restrict__ counts,
+        const int* __restrict__ members, const int* __restrict__ pick, const half* __restrict__ svh_d,
+        float* __restrict__ ey, int D, int P, int slots, int ys, int skip, unsigned book) {
+    const int item = blockIdx.x;
+    if (item >= counts[0]) return;
+    const int e = items[3 * item], first = items[3 * item + 1], cnt = items[3 * item + 2];
+    const bool dead = e == skip;
+    extern __shared__ char fdsm[];
+    int* rows_sh = reinterpret_cast<int*>(fdsm);
+    float* red = reinterpret_cast<float*>(fdsm + 64);
+    float* buf = reinterpret_cast<float*>(fdsm + 64 + 4 * 16 * 128 * 4);
+    // the shared expert's item (e == skip) has no mdb row: a dummy mat with k = D keeps the row-stride
+    // reads in bounds; its mma loop never runs and the epilogue writes the pair's ey zeros
+    TfExl3Mat mds = TfExl3Mat{};
+    mds.k = D;
+    mds.bits = 4;
+    const TfExl3Mat& md = dead ? mds : mdb[(size_t)e];
+    const half* svh = dead ? svh_d : svh_d + (size_t)e * D;
+    if (md.bits == 3)
+        tf_exl3m_fdown_body<3>(X, md, members, first, cnt, svh, ey, D, slots, ys, dead, book, rows_sh, red, buf);
+    else if (md.bits == 4)
+        tf_exl3m_fdown_body<4>(X, md, members, first, cnt, svh, ey, D, slots, ys, dead, book, rows_sh, red, buf);
+}
+
 // The gate/up sums: splits in order, rotated, svh, GLM's limited SwiGLU (their rounding chain), then the down
 // projection's input rotation: xd[pair][N] half.
 extern "C" __global__ void tf_exl3m_gateup(const float* __restrict__ Z, const int* __restrict__ pick,
