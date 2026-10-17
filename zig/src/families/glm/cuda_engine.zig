@@ -737,13 +737,18 @@ pub const Engine = struct {
             try f.mtp(part, &.{hidden + s0 * D * 2});
             try e.cur.st.setMtpLen(e.stream, e.cur.st.mtp_len + part.len);
         }
-        if (e.cur.sampling == null and std.c.getenv("TF_GLM_DRAFT_DEV") != null) {
-            // the device-resident chain (TF_GLM_DRAFT_DEV): each greedy pick resolves on the device into
-            // the head's ids slot (tf_glm_pick_greedy applies greedyRows' host rule), so no draft token
-            // crosses the host until one sync and one download at the end - the profile showed the chain's
-            // per-draft all-gather + synchronize round trips dominated the round's non-GPU time.
+        if (std.c.getenv("TF_GLM_DRAFT_DEV") != null) {
+            // the device-resident chain (TF_GLM_DRAFT_DEV): no draft token crosses the host until one
+            // sync and one download at the end - the profile showed the chain's per-draft collectives +
+            // synchronize round trips dominated the round's non-GPU time. Greedy picks resolve through
+            // tf_glm_pick_greedy; sampled draws keep tf_draw's device token and copy it into the ids slot.
+            const sampled = if (e.cur.sampling) |sm| sm else null;
             for (0..depth) |j| {
-                try e.pickDev(e.bm.logits, e.bm.ids, e.draft_tokens.ptr + j * 4);
+                if (sampled) |sm| {
+                    try e.smp.drawDev(e.stream, e.exchange(), e.spans, &.{.{ .rank = e.share.rank, .logits = e.bm.logits }}, 1, e.cur.st.pos + 1 + j, sampler.rule(sm), e.bm.ids, e.draft_tokens.ptr + j * 4);
+                } else {
+                    try e.pickDev(e.bm.logits, e.bm.ids, e.draft_tokens.ptr + j * 4);
+                }
                 if (j + 1 < depth) {
                     try f.mtpDev(&.{e.bm.fnormed});
                     try e.cur.st.setMtpLen(e.stream, e.cur.st.mtp_len + 1);

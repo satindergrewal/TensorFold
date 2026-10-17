@@ -65,6 +65,13 @@ pub const Sampler = struct {
     /// `rows` rows of `mine` -> `out`, tokens at positions first, first + 1, ...; `spans`: every rank's, rank order.
     pub fn draw(s: *Sampler, stream: cuda.Stream, exchange: Exchange, spans: []const Span, mine: []const Local, rows: usize, first: u64, r: Rule, out: []u32) !void {
         std.debug.assert(rows <= s.rows and out.len >= rows and first >= 1);
+        try s.drawTo(stream, exchange, spans, mine, rows, first, r);
+        try stream.synchronize();
+        try s.tok.download(0, std.mem.sliceAsBytes(out[0..rows]));
+    }
+
+    /// draw's enqueued part: the span copies, the grouped broadcasts, the rule and meta uploads, tf_draw.
+    fn drawTo(s: *Sampler, stream: cuda.Stream, exchange: Exchange, spans: []const Span, mine: []const Local, rows: usize, first: u64, r: Rule) !void {
         const V = s.vocab;
         for (mine) |l| {
             const span = spans[l.rank];
@@ -101,8 +108,15 @@ pub const Sampler = struct {
         args.add(s.tok.ptr);
         args.add(s.prob.ptr);
         try cuda.launch.launch(s.tf_draw, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 1024 } }, stream, &args);
-        try stream.synchronize();
-        try s.tok.download(0, std.mem.sliceAsBytes(out[0..rows]));
+    }
+
+    /// draw for the device-resident draft chain (TF_GLM_DRAFT_DEV): the sampled token never returns to
+    /// the host - after tf_draw it is copied on the device into the MTP head's ids slot and the chain's
+    /// token log, both async; one sync and one download at the chain's end collect every draft token.
+    pub fn drawDev(s: *Sampler, stream: cuda.Stream, exchange: Exchange, spans: []const Span, mine: []const Local, rows: usize, first: u64, r: Rule, ids_slot: u64, token_out: u64) !void {
+        try s.drawTo(stream, exchange, spans, mine, rows, first, r);
+        try s.copy(stream, ids_slot, s.tok.ptr, rows * 4);
+        try s.copy(stream, token_out, s.tok.ptr, rows * 4);
     }
 
     /// The whole rows a draw read (bf16 [rows][vocab]), for checks against the host rule.
