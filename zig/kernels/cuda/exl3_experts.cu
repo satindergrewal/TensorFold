@@ -398,6 +398,13 @@ __device__ __forceinline__ void tf_exl3m_body(const half* __restrict__ X0, const
 
     for (int kt = kt0; kt < kt0 + per_warp; ++kt) {
         const int k = kt * 16;
+        // L2 prefetch of the tile two steps ahead: the decode is DRAM-latency bound and the word
+        // loads are scattered, so pull the line early. A prefetch cannot change any value.
+        if (kt - kt0 + 2 < per_warp) {
+#pragma unroll
+            for (int i = 0; i < NT; ++i)
+                asm volatile("prefetch.global.L2 [%0];" ::"l"(tile + (size_t)2 * NTILES * (8 * K) + i * (8 * K) + lane * 4));
+        }
         uint32_t a[MT][4];
 #pragma unroll
         for (int m = 0; m < MT; ++m) {
