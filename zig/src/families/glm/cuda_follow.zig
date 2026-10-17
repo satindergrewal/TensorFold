@@ -31,33 +31,47 @@ pub const Header = extern struct {
 pub const Words = extern struct { w: [96]u32 };
 pub const put_ids = 96 - 16;
 
-/// The follower doorbell: a 64-byte /dev/shm word (named from NCCL_COMM_ID, zero at creation) mapped
-/// into both processes and host-registered so each rank has a device view of the SAME memory. Rank 0
-/// enqueues cuStreamWriteValue32 after a step's broadcasts; followers enqueue cuStreamWaitValue32
-/// before their receive broadcasts - the broadcasts stay in the protocol's enqueue order, their
-/// EXECUTION is hardware-gated on the flag: no spinning SM on the follower's GPU (GPU1 was 99% idle
-/// on a follower receive kernel; credit: jayleaton patch 0630's class). TF_GLM_LINK_BELL=0 disables.
-const Bell = struct { host: *volatile u32, dev: u64 };
+/// The step link lives in host memory: one /dev/shm segment (named from NCCL_COMM_ID, zero at
+/// creation) mapped by both processes. A one-slot mailbox with backpressure: rank 0 waits until the
+/// followers consumed the previous step (ack), writes the header and ids with CPU stores, then
+/// release-stores the sequence; followers wait for seq == seen + 1, copy, and release-store ack.
+/// No NCCL and no cudaIpc imports on the step path - the per-step broadcasts were the trace's
+/// ~10-12ms stalls (NCCL's own cuMemImportFromShareableHandle churn mid-decode).
+pub const LinkLayout = struct {
+    seq: u32, // rank 0: release-stored after a step's bytes are in place
+    ack: u32, // followers: release-stored after copying a step out
+    n: u32, // ids count
+    _pad: u32,
+    hdr: [64]u8, // the Header bytes
+    ids: [1024]u32,
+};
 
-fn initBell(d: *const cuda.Driver) ?Bell {
-    if (std.c.getenv("TF_GLM_LINK_BELL")) |v| {
+const Arena = struct {
+    lay: *LinkLayout,
+    dev: u64, // the device view (registered for completeness; the link no longer runs kernels)
+};
+
+fn initArena(d: *const cuda.Driver, max_ids: usize) ?Arena {
+    if (std.c.getenv("TF_GLM_LINK_HOST")) |v| {
         if (std.mem.eql(u8, std.mem.span(v), "0")) return null;
     }
     const cid = std.c.getenv("NCCL_COMM_ID") orelse return null;
     var h: u64 = 5381;
     for (std.mem.span(cid)) |ch| h = (h *% 33) +% ch;
     var nb: [64]u8 = undefined;
-    const path = std.fmt.bufPrint(&nb, "/dev/shm/tf_glm_bell_{x}\x00", .{h}) catch return null;
+    const path = std.fmt.bufPrint(&nb, "/dev/shm/tf_glm_link_{x}\x00", .{h}) catch return null;
     const fd = std.c.open(@ptrCast(path.ptr), .{ .ACCMODE = .RDWR, .CREAT = true }, @as(c_uint, 0o600));
     if (fd < 0) return null;
     defer _ = std.c.close(fd);
-    _ = std.c.ftruncate(fd, 4096);
-    const m = std.posix.mmap(null, 4096, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, fd, 0) catch return null;
+    const len = @sizeOf(LinkLayout) + 64;
+    _ = std.c.ftruncate(fd, @intCast(len));
+    const m = std.posix.mmap(null, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, fd, 0) catch return null;
+    _ = max_ids;
     const flags: c_uint = 0x1 | 0x2; // cudaHostRegisterPortable | Mapped
-    d.check(d.api.cuMemHostRegister_v2(m.ptr, 4096, flags), "cuMemHostRegister") catch return null;
+    _ = d.api.cuMemHostRegister_v2(m.ptr, len, flags);
     var dev: cuda.abi.DevicePtr = 0;
-    d.check(d.api.cuMemHostGetDevicePointer_v2(&dev, m.ptr, 0), "cuMemHostGetDevicePointer") catch return null;
-    return .{ .host = @ptrCast(@alignCast(m.ptr)), .dev = dev };
+    _ = d.api.cuMemHostGetDevicePointer_v2(&dev, m.ptr, 0);
+    return .{ .lay = @ptrCast(@alignCast(m.ptr)), .dev = dev };
 }
 
 /// The most ids one step carries (a prompt at the engine's capacity).
@@ -70,16 +84,25 @@ pub const Link = struct {
     ids: []u32, // host copy of the last step's ids
     gpa: std.mem.Allocator,
     wait: bool, // TF_GLM_LINK_WAIT=1: every step uploaded and waited for, as before the put
-    bell: ?Bell, // the software-wait doorbell (see initBell): rank 0 host-stores after its broadcasts, followers gate
-    bell_seq: u64,
-    bell_wait: cuda.Function, // tf_glm_bell_wait
-    fail: cuda.DeviceBuffer, // its give-up word
+    arena: ?Arena, // the host-memory step link (see initArena): CPU stores a step, CPU loads it
+    sent: u32, // rank 0: the last step's sequence written
+    seen: u32, // followers: the last sequence consumed
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, stream: cuda.Stream, max_ids: usize, bell_wait: cuda.Function) !Link {
+        _ = bell_wait;
         const buf = try cuda.DeviceBuffer.alloc(d, 64 + max_ids * 4);
-        const fail = try cuda.DeviceBuffer.alloc(d, 4);
         const wait = if (std.c.getenv("TF_GLM_LINK_WAIT")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
-        return .{ .d = d, .lib = lib, .comm = comm, .stream = stream, .buf = buf, .ids = try gpa.alloc(u32, max_ids), .gpa = gpa, .wait = wait, .bell = initBell(d), .bell_seq = 0, .bell_wait = bell_wait, .fail = fail };
+        var l: Link = .{ .d = d, .lib = lib, .comm = comm, .stream = stream, .buf = buf, .ids = try gpa.alloc(u32, max_ids), .gpa = gpa, .wait = wait, .arena = initArena(d, max_ids), .sent = 0, .seen = 0 };
+        if (l.arena) |a| {
+            // the /dev/shm segment outlives a server: continue from its current sequence instead of
+            // racing a fresh zero (a restarted follower on a stale seq would wait forever). Rank 0
+            // also resets ack to its baseline so its first send is not blocked by a stale ack.
+            const base = @atomicLoad(u32, &a.lay.seq, .acquire);
+            l.sent = base;
+            l.seen = base;
+            @atomicStore(u32, &a.lay.ack, base, .release);
+        }
+        return l;
     }
 
     pub fn deinit(l: *Link) void {
@@ -96,120 +119,74 @@ pub const Link = struct {
         try l.lib.check(l.lib.api.ncclBroadcast(l.buf.ptr, l.buf.ptr, bytes, .u8, 0, l.comm, l.stream.handle), "ncclBroadcast");
     }
 
-    /// Rank 0: the step and ids to every rank; up to `put_ids` ids go by `put` unwaited, longer ones upload and wait.
-    /// The doorbell rings FIRST: the follower wakes and enqueues its receive broadcasts before this
-    /// rank's own are enqueued, so no post can sit unpaired behind one of this rank's later syncs.
+    /// Rank 0: the step to every rank - CPU stores into the host arena (or the NCCL fallback).
     pub fn send(l: *Link, put: cuda.Function, h: Header, ids: []const u32) !void {
         if (ids.len > l.ids.len) return error.TooManyIds;
-        var hh = h;
-        hh.n = @intCast(ids.len);
-        if (!l.wait and ids.len <= put_ids) {
-            var w: Words = undefined;
-            @memcpy(w.w[0..16], std.mem.bytesAsSlice(u32, std.mem.asBytes(&hh)));
-            @memcpy(w.w[16..][0..ids.len], ids);
-            var a: cuda.Args = .{};
-            a.add(l.buf.ptr);
-            a.add(@as(u32, @intCast(16 + ids.len)));
-            a.add(w);
-            try cuda.launch.launch(put, .{ .grid = .{ .x = 1 }, .block = .{ .x = 128 } }, l.stream, &a);
-            try l.post(64);
-            if (ids.len > 0) try l.post(64 + ids.len * 4);
-            try l.ring();
+        if (l.arena) |a| {
+            const lay = a.lay;
+            if (ids.len > lay.ids.len) return error.TooManyIds;
+            while (@atomicLoad(u32, &lay.ack, .acquire) != l.sent) {
+                std.atomic.spinLoopHint();
+            }
+            lay.n = @intCast(ids.len);
+            const hb = std.mem.asBytes(&h);
+            @memcpy(lay.hdr[0..hb.len], hb);
+            @memcpy(lay.ids[0..ids.len], ids);
+            l.sent +%= 1;
+            @atomicStore(u32, &lay.seq, l.sent, .release);
             return;
         }
-        // posts only (the stream orders uploads before their broadcasts and the next step's upload after them),
-        // so nothing host-blocks before the ring; TF_GLM_LINK_WAIT=1 keeps the old waits after it
-        try l.buf.uploadAsync(0, std.mem.asBytes(&hh), l.stream.handle);
+        if (!l.wait and ids.len <= put_ids) {
+            var w: Words = undefined;
+            @memcpy(w.w[0..16], std.mem.bytesAsSlice(u32, std.mem.asBytes(&h)));
+            @memcpy(w.w[16..][0..ids.len], ids);
+            var a2: cuda.Args = .{};
+            a2.add(l.buf.ptr);
+            a2.add(@as(u32, @intCast(16 + ids.len)));
+            a2.add(w);
+            try cuda.launch.launch(put, .{ .grid = .{ .x = 1 }, .block = .{ .x = 128 } }, l.stream, &a2);
+            try l.post(64);
+            if (ids.len > 0) try l.post(64 + ids.len * 4);
+            return;
+        }
+        try l.buf.uploadAsync(0, std.mem.asBytes(&h), l.stream.handle);
         try l.post(64);
         if (ids.len > 0) {
             try l.buf.uploadAsync(64, std.mem.sliceAsBytes(ids), l.stream.handle);
             try l.post(64 + ids.len * 4);
         }
-        try l.ring();
         if (l.wait) try l.stream.synchronize();
     }
 
-    /// Rank 0 after enqueueing a step's broadcasts: a plain host store into the shared word.
-    fn ring(l: *Link) !void {
-        if (l.bell) |b| {
-            l.bell_seq += 1;
-            b.host.* = @truncate(l.bell_seq);
-        }
-    }
-
-    /// A follower before its receive: a software stream wait (tf_glm_bell_wait), so the receive
-    /// broadcasts keep the protocol's enqueue order and only their execution is gated - no spinning
-    /// NCCL kernel on the follower's GPU (it slept at 99% utilisation before this; GPU1 idle: ~0%).
-    fn awaitBell(l: *Link) !void {
-        const b = l.bell orelse return;
-        l.bell_seq += 1;
-        var a: cuda.Args = .{};
-        a.add(b.dev);
-        a.add(@as(c_uint, @truncate(l.bell_seq)));
-        a.add(l.fail.ptr);
-        try cuda.launch.launch(l.bell_wait, .{ .grid = .{}, .block = .{ .x = 32 } }, l.stream, &a);
-    }
-
     /// Other ranks: the next step and its ids (valid until the next receive).
-    var prof_recv_n: u64 = 0;
-    var prof_bell_ns: u64 = 0;
-    var prof_bc1_ns: u64 = 0;
-    var prof_dl1_ns: u64 = 0;
-    var prof_bc2_ns: u64 = 0;
-    var prof_dl2_ns: u64 = 0;
-    fn profNow3() u64 {
-        var ts: std.c.timespec = undefined;
-        if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
-        return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
-    }
-    fn profRecvTick() void {
-        prof_recv_n += 1;
-        if (prof_recv_n % 64 == 0) {
-            std.debug.print("RECV calls={d} bell_us={d} b1_us={d} d1_us={d} b2_us={d} d2_us={d}\n", .{
-                prof_recv_n, prof_bell_ns / 64 / 1000, prof_bc1_ns / 64 / 1000, prof_dl1_ns / 64 / 1000, prof_bc2_ns / 64 / 1000, prof_dl2_ns / 64 / 1000,
-            });
-            prof_bell_ns = 0;
-            prof_bc1_ns = 0;
-            prof_dl1_ns = 0;
-            prof_bc2_ns = 0;
-            prof_dl2_ns = 0;
-        }
-    }
-
     pub fn receive(l: *Link) !struct { h: Header, ids: []const u32 } {
-        const prof = std.c.getenv("TF_GLM_RPROF") != null;
-        var t = profNow3();
-        try l.awaitBell();
-        if (prof) {
-            const n = profNow3();
-            prof_bell_ns += n - t;
-            t = n;
+        if (l.arena) |a| {
+            const lay = a.lay;
+            const want = l.seen +% 1;
+            var ts = std.c.timespec{ .sec = 0, .nsec = 100 };
+            while (@atomicLoad(u32, &lay.seq, .acquire) != want) {
+                std.atomic.spinLoopHint();
+                std.atomic.spinLoopHint();
+                _ = std.c.nanosleep(&ts, null);
+            }
+            const n = lay.n;
+            if (n > l.ids.len or n > lay.ids.len) return error.TooManyIds;
+            var h: Header = undefined;
+            const hb = std.mem.asBytes(&h);
+            @memcpy(hb, lay.hdr[0..hb.len]);
+            @memcpy(l.ids[0..n], lay.ids[0..n]);
+            l.seen = want;
+            @atomicStore(u32, &lay.ack, want, .release);
+            return .{ .h = h, .ids = l.ids[0..n] };
         }
         try l.bcast(64);
-        if (prof) {
-            const n = profNow3();
-            prof_bc1_ns += n - t;
-            t = n;
-        }
         var h: Header = undefined;
         try l.buf.download(0, std.mem.asBytes(&h));
-        if (prof) {
-            const n = profNow3();
-            prof_dl1_ns += n - t;
-            t = n;
-        }
         if (h.n > l.ids.len) return error.TooManyIds;
         if (h.n > 0) {
             try l.bcast(64 + h.n * 4);
-            if (prof) {
-                const n = profNow3();
-                prof_bc2_ns += n - t;
-                t = n;
-            }
             try l.buf.download(64, std.mem.sliceAsBytes(l.ids[0..h.n]));
-            if (prof) prof_dl2_ns += profNow3() - t;
         }
-        if (prof) profRecvTick();
         return .{ .h = h, .ids = l.ids[0..h.n] };
     }
 };
