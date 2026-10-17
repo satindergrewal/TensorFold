@@ -319,7 +319,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     // a family split over hosts holds only its rank's share (GLM-5.3-Flash's TP)
     const weights = if (@hasDecl(F, "weightShare")) F.weightShare(weightBytes(io, o.dir)) else weightBytes(io, o.dir);
     const held0 = cuda.usage(false).device;
-    if (weights > before.room(held0)) {
+    if (weights > before.room(held0) and std.c.getenv("TENSORFOLD_SKIP_WEIGHT_PREFLIGHT") == null) {
         problem.* = try std.fmt.allocPrint(a, "the checkpoint's {d:.1} GiB of weights do not fit the {d:.1} GiB the CUDA memory budget grants ({d:.1} GiB free less a {d:.1} GiB reserve{s}); free device memory or adjust TENSORFOLD_MEMORY_RESERVE_GIB / TENSORFOLD_CUDA_MEMORY_LIMIT_GB", .{ toGib(weights), toGib(before.room(held0)), toGib(before.free), toGib(before.reserve), if (before.limit != null) ", under TENSORFOLD_CUDA_MEMORY_LIMIT_GB" else "" });
         return null;
     }
