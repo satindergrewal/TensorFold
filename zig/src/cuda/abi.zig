@@ -184,6 +184,7 @@ pub const Api = struct {
     cuIpcGetMemHandle: *const fn (*IpcMemHandle, DevicePtr) callconv(.c) R,
     cuIpcOpenMemHandle_v2: *const fn (*DevicePtr, IpcMemHandle, c_uint) callconv(.c) R,
     cuStreamWaitValue32: *const fn (Stream, DevicePtr, c_uint, c_uint) callconv(.c) R,
+    cuStreamWriteValue32: *const fn (Stream, DevicePtr, c_uint, c_uint) callconv(.c) R,
     cuMemFree_v2: *const fn (DevicePtr) callconv(.c) R,
     cuMemHostAlloc: *const fn (*Ptr, usize, c_uint) callconv(.c) R,
     cuMemHostGetDevicePointer_v2: *const fn (*DevicePtr, Ptr, c_uint) callconv(.c) R,

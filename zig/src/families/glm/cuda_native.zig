@@ -91,7 +91,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     const cap = capacity(o.context);
     own.e = try engine.Engine.init(gpa, io, ctx.d, ctx, dir, &own.lib, own.comm, p.rank, p.world, .{ .capacity = cap, .mtp = o.drafts, .settings = set });
     errdefer own.e.deinit();
-    own.link = try follow.Link.init(gpa, ctx.d, &own.lib, own.comm, own.e.stream, cap);
+    own.link = try follow.Link.init(gpa, ctx.d, &own.lib, own.comm, own.e.stream, cap, own.e.m.glue.bell_wait);
     errdefer own.link.deinit();
     if (std.c.getenv("TF_GLM_SHM_GATHER") != null and p.world > 1) own.e.initShm() catch |err| {
         std.log.info("glm: shm gather off ({s}); NCCL carries the exchanges", .{@errorName(err)});

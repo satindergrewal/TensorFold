@@ -268,6 +268,19 @@ extern "C" __global__ void __launch_bounds__(32) tf_glm_pick_greedy(const unsign
   if (ids_slot) ids_slot[0] = static_cast<int>(bi);
 }
 
+// A software stream wait for the follower doorbell (a host-mapped word rank 0's CPU stores): the launch
+// sits in the follower's stream BEFORE its receive broadcasts, so their execution is gated on the store
+// with no spinning SM (nanosleep backoff, ~0% utilisation idle). Gives up after ~60 s of GPU clock.
+extern "C" __global__ void __launch_bounds__(32) tf_glm_bell_wait(const unsigned* bell, unsigned want, unsigned* failure) {
+  const long long t0 = clock64();
+  while (*reinterpret_cast<const volatile unsigned*>(bell) < want) {
+    if (clock64() - t0 > 2000000000LL) { failure[0] = want; return; }
+#if __CUDA_ARCH__ >= 700
+    __nanosleep(512);
+#endif
+  }
+}
+
 // The leader's step for the other ranks, written to the link's buffer from launch arguments (cuda_follow's Link.send).
 struct tf_glm_words {
   unsigned w[96];

@@ -115,6 +115,7 @@ pub const Kernels = struct {
     top1: cuda.Function,
     top1_rows: cuda.Function,
     pick_greedy: cuda.Function,
+    bell_wait: cuda.Function,
     put_words: cuda.Function,
     embed_b16: cuda.Function,
     conv_shift: cuda.Function,

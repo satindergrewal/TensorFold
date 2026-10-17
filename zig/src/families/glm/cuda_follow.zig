@@ -31,16 +31,18 @@ pub const Header = extern struct {
 pub const Words = extern struct { w: [96]u32 };
 pub const put_ids = 96 - 16;
 
-/// The follower doorbell: one 64-byte /dev/shm word named from NCCL_COMM_ID (unique a launch, like
-/// initShm's arena), zero at creation. TF_GLM_LINK_BELL=0 keeps the old GPU-side spin.
-fn openBell() ?[*]volatile u64 {
-    // opt-in WIP: the bell kills the follower's idle GPU spin (GPU1 99% -> 0%) but deadlocks the
-    // step protocol as-is - the leader's flow assumes the follower's receive broadcasts are always
-    // enqueued. The working design (next pass): cuStreamWaitValue32 on a cudaHostRegister-mapped
-    // bell - the broadcast stays enqueued in protocol order, its EXECUTION hardware-gated on the
-    // flag (no SM spin, no order change). TF_GLM_LINK_BELL=1 enables this CPU-poll variant.
-    const on = std.c.getenv("TF_GLM_LINK_BELL") orelse return null;
-    if (!std.mem.eql(u8, std.mem.span(on), "1")) return null;
+/// The follower doorbell: a 64-byte /dev/shm word (named from NCCL_COMM_ID, zero at creation) mapped
+/// into both processes and host-registered so each rank has a device view of the SAME memory. Rank 0
+/// enqueues cuStreamWriteValue32 after a step's broadcasts; followers enqueue cuStreamWaitValue32
+/// before their receive broadcasts - the broadcasts stay in the protocol's enqueue order, their
+/// EXECUTION is hardware-gated on the flag: no spinning SM on the follower's GPU (GPU1 was 99% idle
+/// on a follower receive kernel; credit: jayleaton patch 0630's class). TF_GLM_LINK_BELL=0 disables.
+const Bell = struct { host: *volatile u32, dev: u64 };
+
+fn initBell(d: *const cuda.Driver) ?Bell {
+    if (std.c.getenv("TF_GLM_LINK_BELL")) |v| {
+        if (std.mem.eql(u8, std.mem.span(v), "0")) return null;
+    }
     const cid = std.c.getenv("NCCL_COMM_ID") orelse return null;
     var h: u64 = 5381;
     for (std.mem.span(cid)) |ch| h = (h *% 33) +% ch;
@@ -49,9 +51,13 @@ fn openBell() ?[*]volatile u64 {
     const fd = std.c.open(@ptrCast(path.ptr), .{ .ACCMODE = .RDWR, .CREAT = true }, @as(c_uint, 0o600));
     if (fd < 0) return null;
     defer _ = std.c.close(fd);
-    _ = std.c.ftruncate(fd, 64);
-    const m = std.posix.mmap(null, 64, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, fd, 0) catch return null;
-    return @ptrCast(@alignCast(m.ptr));
+    _ = std.c.ftruncate(fd, 4096);
+    const m = std.posix.mmap(null, 4096, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, fd, 0) catch return null;
+    const flags: c_uint = 0x1 | 0x2; // cudaHostRegisterPortable | Mapped
+    d.check(d.api.cuMemHostRegister_v2(m.ptr, 4096, flags), "cuMemHostRegister") catch return null;
+    var dev: cuda.abi.DevicePtr = 0;
+    d.check(d.api.cuMemHostGetDevicePointer_v2(&dev, m.ptr, 0), "cuMemHostGetDevicePointer") catch return null;
+    return .{ .host = @ptrCast(@alignCast(m.ptr)), .dev = dev };
 }
 
 /// The most ids one step carries (a prompt at the engine's capacity).
@@ -64,15 +70,16 @@ pub const Link = struct {
     ids: []u32, // host copy of the last step's ids
     gpa: std.mem.Allocator,
     wait: bool, // TF_GLM_LINK_WAIT=1: every step uploaded and waited for, as before the put
-    bell: ?[*]volatile u64, // /dev/shm doorbell: rank 0's host stores a step counter once its
-    // broadcasts are enqueued, so a follower never holds a spinning NCCL kernel on its GPU while
-    // rank 0 is idle or computing (the GPU1 99%-idle spin; credit: jayleaton patch 0630's class)
+    bell: ?Bell, // the software-wait doorbell (see initBell): rank 0 host-stores after its broadcasts, followers gate
     bell_seq: u64,
+    bell_wait: cuda.Function, // tf_glm_bell_wait
+    fail: cuda.DeviceBuffer, // its give-up word
 
-    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, stream: cuda.Stream, max_ids: usize) !Link {
+    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, stream: cuda.Stream, max_ids: usize, bell_wait: cuda.Function) !Link {
         const buf = try cuda.DeviceBuffer.alloc(d, 64 + max_ids * 4);
+        const fail = try cuda.DeviceBuffer.alloc(d, 4);
         const wait = if (std.c.getenv("TF_GLM_LINK_WAIT")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
-        return .{ .d = d, .lib = lib, .comm = comm, .stream = stream, .buf = buf, .ids = try gpa.alloc(u32, max_ids), .gpa = gpa, .wait = wait, .bell = openBell(), .bell_seq = 0 };
+        return .{ .d = d, .lib = lib, .comm = comm, .stream = stream, .buf = buf, .ids = try gpa.alloc(u32, max_ids), .gpa = gpa, .wait = wait, .bell = initBell(d), .bell_seq = 0, .bell_wait = bell_wait, .fail = fail };
     }
 
     pub fn deinit(l: *Link) void {
@@ -94,7 +101,6 @@ pub const Link = struct {
     /// rank's own are enqueued, so no post can sit unpaired behind one of this rank's later syncs.
     pub fn send(l: *Link, put: cuda.Function, h: Header, ids: []const u32) !void {
         if (ids.len > l.ids.len) return error.TooManyIds;
-        l.ring();
         var hh = h;
         hh.n = @intCast(ids.len);
         if (!l.wait and ids.len <= put_ids) {
@@ -108,39 +114,45 @@ pub const Link = struct {
             try cuda.launch.launch(put, .{ .grid = .{ .x = 1 }, .block = .{ .x = 128 } }, l.stream, &a);
             try l.post(64);
             if (ids.len > 0) try l.post(64 + ids.len * 4);
+            try l.ring();
             return;
         }
+        // posts only (the stream orders uploads before their broadcasts and the next step's upload after them),
+        // so nothing host-blocks before the ring; TF_GLM_LINK_WAIT=1 keeps the old waits after it
         try l.buf.uploadAsync(0, std.mem.asBytes(&hh), l.stream.handle);
-        try l.bcast(64);
+        try l.post(64);
         if (ids.len > 0) {
             try l.buf.uploadAsync(64, std.mem.sliceAsBytes(ids), l.stream.handle);
-            try l.bcast(64 + ids.len * 4);
+            try l.post(64 + ids.len * 4);
         }
+        try l.ring();
+        if (l.wait) try l.stream.synchronize();
     }
 
-    /// Rank 0 after enqueueing a step's broadcasts: the followers may wake and enqueue their side.
-    fn ring(l: *Link) void {
+    /// Rank 0 after enqueueing a step's broadcasts: a plain host store into the shared word.
+    fn ring(l: *Link) !void {
         if (l.bell) |b| {
             l.bell_seq += 1;
-            b[0] = l.bell_seq;
+            b.host.* = @truncate(l.bell_seq);
         }
     }
 
-    /// A follower before enqueueing its receive: wait on the CPU doorbell, never a spinning GPU kernel.
-    fn awaitBell(l: *Link) void {
+    /// A follower before its receive: a software stream wait (tf_glm_bell_wait), so the receive
+    /// broadcasts keep the protocol's enqueue order and only their execution is gated - no spinning
+    /// NCCL kernel on the follower's GPU (it slept at 99% utilisation before this; GPU1 idle: ~0%).
+    fn awaitBell(l: *Link) !void {
         const b = l.bell orelse return;
-        var ts = std.c.timespec{ .sec = 0, .nsec = 100 };
-        while (b[0] == l.bell_seq) {
-            std.atomic.spinLoopHint();
-            std.atomic.spinLoopHint();
-            _ = std.c.nanosleep(&ts, null);
-        }
-        l.bell_seq = b[0];
+        l.bell_seq += 1;
+        var a: cuda.Args = .{};
+        a.add(b.dev);
+        a.add(@as(c_uint, @truncate(l.bell_seq)));
+        a.add(l.fail.ptr);
+        try cuda.launch.launch(l.bell_wait, .{ .grid = .{}, .block = .{ .x = 32 } }, l.stream, &a);
     }
 
     /// Other ranks: the next step and its ids (valid until the next receive).
     pub fn receive(l: *Link) !struct { h: Header, ids: []const u32 } {
-        l.awaitBell();
+        try l.awaitBell();
         try l.bcast(64);
         var h: Header = undefined;
         try l.buf.download(0, std.mem.asBytes(&h));
