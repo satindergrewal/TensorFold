@@ -299,6 +299,21 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     }
     g.ctx = try cuda.Context.init(&g.driver, @intCast(device));
     defer if (!opened) g.ctx.deinit();
+    // TF_CUDA_PEER=1: both GPUs stay visible (no CUDA_VISIBLE_DEVICES mask) and this rank enables
+    // peer access to the other, so kernels can write the peer's buffers directly over PCIe.
+    if (std.c.getenv("TF_CUDA_PEER")) |pv| {
+        if (std.mem.eql(u8, std.mem.span(pv), "1")) {
+            const peer: c_int = if (device == 0) 1 else 0;
+            var peer_dev: cuda.abi.Device = 0;
+            var can: c_int = 0;
+            _ = g.driver.api.cuDeviceGet(&peer_dev, peer);
+            _ = g.driver.api.cuDeviceCanAccessPeer(&can, g.ctx.device, peer_dev);
+            var peer_ctx: cuda.abi.Context = null;
+            const kept = g.driver.api.cuDevicePrimaryCtxRetain(&peer_ctx, peer_dev);
+            const r = if (kept == 0) g.driver.api.cuCtxEnablePeerAccess(peer_ctx, 0) else kept;
+            std.log.info("cuda: peer {d} can={d} enable={d}", .{ peer, can, r });
+        }
+    }
     bound = &g.ctx;
     const capability = try g.ctx.capability();
     var name_buf: [256]u8 = undefined;
