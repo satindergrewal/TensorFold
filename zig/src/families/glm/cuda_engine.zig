@@ -326,6 +326,14 @@ pub const Engine = struct {
     }
 
 
+    /// TF_GLM_TREE_TEST: publishes the sentinel mask pointer (1), and the attention synthesizes the
+    /// triangular chain mask in-register - the chain-equivalence gate for the tree port.
+    pub fn setTreeTest(e: *Engine) void {
+        if (std.c.getenv("TF_GLM_TREE_TEST") == null) return;
+        e.m.glue.tree_mask = 1;
+        std.log.info("glm: tree test sentinel mask on (chain-equivalence gate)", .{});
+    }
+
     /// TF_GLM_L2PF: the pieces table (i64 [n][2]) and per-(layer, site) ranges. Site 'a' (the mixer gather)
     /// prefetches this layer's FFN side: hc weights, post norm, router, bias, the shared expert's gate/up and
     /// down. Site 'f' (the ffn gather) prefetches the NEXT layer's attention side (or, past the last layer,

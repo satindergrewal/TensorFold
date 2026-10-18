@@ -102,6 +102,7 @@ pub const Set = struct { glue: *const Kernels, linear: cuda.qlinear.Linear = .{}
 
 /// Our glm_glue.cu's functions.
 pub const Kernels = struct {
+    tree_mask: u64 = 0,
     mm: Mm16 = undefined,
     rmsnorm_4096: cuda.Function,
     rmsnorm_1536: cuda.Function,
@@ -162,7 +163,7 @@ pub const Kernels = struct {
     pub fn load(m: cuda.Module) !Kernels {
         var k: Kernels = undefined;
         inline for (@typeInfo(Kernels).@"struct".field_names) |name| {
-            if (comptime !std.mem.eql(u8, name, "mm") and !std.mem.eql(u8, name, "l2pf") and !std.mem.endsWith(u8, name, "_fp8") and !std.mem.endsWith(u8, name, "_nvfp4") and !std.mem.endsWith(u8, name, "_s32") and !std.mem.startsWith(u8, name, "lat_dequant")) @field(k, name) = try m.function("tf_glm_" ++ name);
+            if (comptime !std.mem.eql(u8, name, "mm") and !std.mem.eql(u8, name, "l2pf") and !std.mem.eql(u8, name, "tree_mask") and !std.mem.endsWith(u8, name, "_fp8") and !std.mem.endsWith(u8, name, "_nvfp4") and !std.mem.endsWith(u8, name, "_s32") and !std.mem.startsWith(u8, name, "lat_dequant")) @field(k, name) = try m.function("tf_glm_" ++ name);
         }
         k.mm = try Mm16.load(m);
         // KV cache quantization kernels: load what exists, skip what doesn't

@@ -144,7 +144,7 @@ pub fn attention(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, pos: u
     if (rows <= 8) { // a solo decode window: one 32-row tile a block instead of a 16-tile serial chain
         const nch32 = nch * 16; // over-covers the last chunk; empty slices merge as -inf
         if (set.glue.chunks16_nvfp4_s32) |f| {
-            try launchNvfp4(f, stream, qa, cache, pos, 0, 0, p, rows, heads, lw, nch32, 0, scale, heads_tile, false, true);
+            try launchNvfp4(f, stream, qa, cache, pos, 0, set.glue.tree_mask, p, rows, heads, lw, nch32, 0, scale, heads_tile, false, true);
         } else if (set.glue.chunks_16_s32) |f| {
             try launchBf16(f, stream, qa, cache, pos, 0, 0, p, rows, heads, lw, nch32, 0, scale, heads_tile, false);
         } else return error.NoSlicedKernel;
@@ -153,16 +153,16 @@ pub fn attention(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, pos: u
     }
     if (set.glue.chunks16_nvfp4) |f16v| {
         if (hb == heads_tile_wide and set.glue.chunks32_nvfp4 != null) {
-            try launchNvfp4(set.glue.chunks32_nvfp4.?, stream, qa, cache, pos, 0, 0, p, rows, heads, lw, nch, 0, scale, hb, false, false);
+            try launchNvfp4(set.glue.chunks32_nvfp4.?, stream, qa, cache, pos, 0, set.glue.tree_mask, p, rows, heads, lw, nch, 0, scale, hb, false, false);
         } else {
-            try launchNvfp4(f16v, stream, qa, cache, pos, 0, 0, p, rows, heads, lw, nch, 0, scale, heads_tile, false, false);
+            try launchNvfp4(f16v, stream, qa, cache, pos, 0, set.glue.tree_mask, p, rows, heads, lw, nch, 0, scale, heads_tile, false, false);
         }
         try merge(set, stream, p, out, dummy, rows, heads, lw, nch, false);
         return;
     }
     var cache_bf16 = cache;
     if (set.glue.lat_dequant != null or set.glue.lat_dequant_nvfp4 != null) cache_bf16 = try dequantFor(set, stream, cache, 0, nch * 128 + rows, lw);
-    try chunks(set, stream, qa, cache_bf16, pos, 0, 0, p, rows, heads, lw, nch, 0, scale, hb, false);
+    try chunks(set, stream, qa, cache_bf16, pos, 0, set.glue.tree_mask, p, rows, heads, lw, nch, 0, scale, hb, false);
     try merge(set, stream, p, out, dummy, rows, heads, lw, nch, false);
 }
 
