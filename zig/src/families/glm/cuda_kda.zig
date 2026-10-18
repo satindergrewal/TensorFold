@@ -97,6 +97,7 @@ pub fn chain(ks: *const Kernels, stream: cuda.Stream, c: Chain, rows: usize, s: 
     a.add(c.lower);
     a.add(@as(c_int, @intCast(rows)));
     for ([_]u64{ s.out, s.state_out, s.k, s.v, s.g, s.b }) |v| a.add(v);
+    a.add(@as(u64, 0)); // parents: a chain (a tree round passes its rows' parents here)
     try cuda.launch.launch(ks.chain, .{ .grid = .{ .x = @intCast(c.heads) }, .block = .{ .x = 1024 } }, stream, &a);
 }
 

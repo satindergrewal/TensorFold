@@ -42,7 +42,7 @@ __device__ __forceinline__ void chain_kernel_body(
         const __nv_bfloat16* __restrict__ norm_w, float eps, float lower, int rows,
         __nv_bfloat16* __restrict__ out, float* __restrict__ state_out,
         float* __restrict__ k_save, __nv_bfloat16* __restrict__ v_save, float* __restrict__ g_save,
-        float* __restrict__ b_save) {
+        float* __restrict__ b_save, const int* __restrict__ parents) {
     const int C = 3 * H * DK;                         // conv channels: q | k | v
     const int h = blockIdx.x;
     const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
@@ -57,7 +57,8 @@ __device__ __forceinline__ void chain_kernel_body(
 #pragma unroll
         for (int i = 0; i < 4; ++i) s[j][i] = state_in[sbase + (size_t)(warp * 4 + j) * DK + lane * 4 + i];
     const float decay_rate = expf(a_log[h]);
-    for (int r = 0; r < rows; ++r) {
+    // A row's inputs: conv taps, the q/k RMS-norms and v, the gate and beta (the loop's first half).
+    auto loadRow = [&](int r) {
         if (c >= 0) {
             float acc = 0.0f;
 #pragma unroll
@@ -95,41 +96,77 @@ __device__ __forceinline__ void chain_kernel_body(
             }
         }
         __syncthreads();
+    };
+    // One row against a state: the delta-rule update, the output row, and the replay saves.
+    auto applyRow = [&](float (&st)[4][4], int r, bool emit) {
         const float beta = beta_s;
         float kk[4], qq[4], gg[4];
 #pragma unroll
         for (int i = 0; i < 4; ++i) { kk[i] = ks[lane * 4 + i]; qq[i] = qs[lane * 4 + i]; gg[i] = gs[lane * 4 + i]; }
-        update(s, kk, gg, vs, warp, beta);
+        update(st, kk, gg, vs, warp, beta);
+        if (emit) {
 #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            float o = 0.0f;
+            for (int j = 0; j < 4; ++j) {
+                float o = 0.0f;
 #pragma unroll
-            for (int i = 0; i < 4; ++i) o = o + s[j][i] * qq[i];
-            o = warp_sum(o);
-            if (lane == 0) ys[warp * 4 + j] = bf(o);
-        }
-        if (k_save != nullptr) {
-            const size_t base = ((size_t)r * H + h) * DK;
-            if (t < DK) { k_save[base + t] = ks[t]; g_save[base + t] = gs[t]; }
-            if (t >= DK && t < DK + DV) v_save[base + t - DK] = __float2bfloat16_rn(vs[t - DK]);
-            if (t == 0) b_save[r * H + h] = beta;
+                for (int i = 0; i < 4; ++i) o = o + st[j][i] * qq[i];
+                o = warp_sum(o);
+                if (lane == 0) ys[warp * 4 + j] = bf(o);
+            }
+            if (k_save != nullptr) {
+                const size_t base = ((size_t)r * H + h) * DK;
+                if (t < DK) { k_save[base + t] = ks[t]; g_save[base + t] = gs[t]; }
+                if (t >= DK && t < DK + DV) v_save[base + t - DK] = __float2bfloat16_rn(vs[t - DK]);
+                if (t == 0) b_save[r * H + h] = beta;
+            }
         }
         __syncthreads();
-        if (warp == 0) {
-            float ss = 0.0f;
+        if (emit) {
+            if (warp == 0) {
+                float ss = 0.0f;
 #pragma unroll
-            for (int i = 0; i < 4; ++i) { const float y = ys[lane * 4 + i]; ss = ss + y * y; }
-            ss = warp_sum(ss);
-            if (lane == 0) rinv = 1.0f / sqrtf(ss / (float)DV + eps);
+                for (int i = 0; i < 4; ++i) { const float y = ys[lane * 4 + i]; ss = ss + y * y; }
+                ss = warp_sum(ss);
+                if (lane == 0) rinv = 1.0f / sqrtf(ss / (float)DV + eps);
+            }
+            __syncthreads();
+            if (t < DV) {
+                const float yn = ys[t] * rinv;
+                const float yw = __bfloat162float(norm_w[t]) * yn;
+                const float gate = __bfloat162float(G[(size_t)r * g_stride + h * DV + t]);
+                out[(size_t)r * H * DV + h * DV + t] = __float2bfloat16_rn(yw * sigmoidf_(gate));
+            }
         }
         __syncthreads();
-        if (t < DV) {
-            const float yn = ys[t] * rinv;
-            const float yw = __bfloat162float(norm_w[t]) * yn;
-            const float gate = __bfloat162float(G[(size_t)r * g_stride + h * DV + t]);
-            out[(size_t)r * H * DV + h * DV + t] = __float2bfloat16_rn(yw * sigmoidf_(gate));
+    };
+    // The window's rows. A chain row's parent is the one before it; a tree row whose parent is earlier
+    // replays its ancestor path into a temporary state, so the main chain state stays the first branch's.
+    __shared__ int path_sh[16];
+    for (int r = 0; r < rows; ++r) {
+        loadRow(r);
+        if (parents != nullptr && parents[r] != r - 1) {
+            if (t == 0) {
+                int a = parents[r], n = 0;
+                while (a >= 0 && n < 15) { path_sh[n++] = a; a = parents[a]; }
+                path_sh[15] = n;
+            }
+            __syncthreads();
+            float tmp[4][4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+#pragma unroll
+                for (int i = 0; i < 4; ++i) tmp[j][i] = state_in[sbase + (size_t)(warp * 4 + j) * DK + lane * 4 + i];
+            const int n = path_sh[15];
+            for (int k = n - 1; k >= 0; --k) {
+                const int a = path_sh[k];
+                loadRow(a);
+                applyRow(tmp, a, false);
+            }
+            loadRow(r);
+            applyRow(tmp, r, true);
+        } else {
+            applyRow(s, r, true);
         }
-        __syncthreads();
     }
     if (state_out != nullptr) {
 #pragma unroll
@@ -383,8 +420,8 @@ __device__ __forceinline__ void out_kernel_body(
 
 }  // namespace
 
-extern "C" __global__ void __launch_bounds__(1024) tf_glm_kda_chain(int H, const __nv_bfloat16* __restrict__ P, int p_stride, int b_off, const __nv_bfloat16* __restrict__ A, int a_stride, const __nv_bfloat16* __restrict__ G, int g_stride, const __nv_bfloat16* __restrict__ cs, const float* __restrict__ cw, const float* __restrict__ state_in, const float* __restrict__ a_log, const float* __restrict__ dt_bias, const __nv_bfloat16* __restrict__ norm_w, float eps, float lower, int rows, __nv_bfloat16* __restrict__ out, float* __restrict__ state_out, float* __restrict__ k_save, __nv_bfloat16* __restrict__ v_save, float* __restrict__ g_save, float* __restrict__ b_save) {
-    chain_kernel_body(H, P, p_stride, b_off, A, a_stride, G, g_stride, cs, cw, state_in, a_log, dt_bias, norm_w, eps, lower, rows, out, state_out, k_save, v_save, g_save, b_save);
+extern "C" __global__ void __launch_bounds__(1024) tf_glm_kda_chain(int H, const __nv_bfloat16* __restrict__ P, int p_stride, int b_off, const __nv_bfloat16* __restrict__ A, int a_stride, const __nv_bfloat16* __restrict__ G, int g_stride, const __nv_bfloat16* __restrict__ cs, const float* __restrict__ cw, const float* __restrict__ state_in, const float* __restrict__ a_log, const float* __restrict__ dt_bias, const __nv_bfloat16* __restrict__ norm_w, float eps, float lower, int rows, __nv_bfloat16* __restrict__ out, float* __restrict__ state_out, float* __restrict__ k_save, __nv_bfloat16* __restrict__ v_save, float* __restrict__ g_save, float* __restrict__ b_save, const int* __restrict__ parents) {
+    chain_kernel_body(H, P, p_stride, b_off, A, a_stride, G, g_stride, cs, cw, state_in, a_log, dt_bias, norm_w, eps, lower, rows, out, state_out, k_save, v_save, g_save, b_save, parents);
 }
 
 extern "C" __global__ void __launch_bounds__(1024) tf_glm_kda_replay(int H, const float* __restrict__ state_in, const float* __restrict__ k_save, const __nv_bfloat16* __restrict__ v_save, const float* __restrict__ g_save, const float* __restrict__ b_save, int rows, float* __restrict__ state_out) {
