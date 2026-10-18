@@ -79,6 +79,7 @@ pub const Engine = struct {
     tree_active: bool = false, // the current round verified a draft tree
     kda_parents: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
     kda_parents_on: bool = false, // the KDA chain takes the parents buffer this round
+    tree_draft: bool = false, // the backend asked for a branch draft this call
     settings: ranks.Settings,
     m: fw.Modules,
     stream: cuda.Stream,
@@ -877,6 +878,15 @@ pub const Engine = struct {
     }
 
     /// decode.draft: the MTP head absorbs the kept rows (committed first) with `follow`, then chains `depth` drafts.
+    /// The sibling draft candidate from the last tree draft (draft_alt[1]); errors when no tree round ran.
+    pub fn draftSibling(e: *Engine) !u32 {
+        if (e.draft_alt.ptr == 0) return error.NoDraftHead;
+        var v: [2]i32 = undefined;
+        try e.d.check(e.d.api.cuMemcpyDtoH_v2(&v, e.draft_alt.ptr, 8), "draft sibling");
+        if (v[1] < 0) return error.NoDraftHead;
+        return @intCast(v[1]);
+    }
+
     pub fn draft(e: *Engine, from_prompt: bool, follow: []const u32, depth: usize, out: []u32) !void {
         if (!e.mtp) return error.NoDraftHead;
         if (depth > max_drafts) return error.TooDeep;
@@ -912,7 +922,7 @@ pub const Engine = struct {
                     return;
                 } else |_| {} // capture failed: the eager chain below runs instead
             }
-            const tree_draft = std.c.getenv("TF_GLM_TREE_DRAFT") != null;
+            const tree_draft = e.tree_draft or std.c.getenv("TF_GLM_TREE_DRAFT") != null;
             for (0..depth) |j| {
                 if (tree_draft and j == 0 and sampled == null) {
                     try e.pickTop2(e.bm.logits, e.bm.ids, e.draft_alt.ptr, 0);

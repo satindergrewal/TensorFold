@@ -2,7 +2,7 @@
 const std = @import("std");
 const Stream = @import("stream.zig").Stream;
 const Shape = @import("shape.zig").Shape;
-const Held = @import("stream.zig").Held;
+pub const Held = @import("stream.zig").Held;
 const Row = @import("logprob.zig").Row;
 
 /// A token to feed: one the backend drew and holds (a handle), or a host value (forced or pending).

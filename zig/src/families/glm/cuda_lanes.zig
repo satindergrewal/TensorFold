@@ -29,6 +29,9 @@ const Lane = struct {
     held: [engine.max_drafts]u32 = undefined,
     held_n: usize = 0,
     fill: ?usize = null, // a prompt pass going a chunk at a time: where its next chunk starts
+    tree_tokens: [3]u32 = undefined, // a draft tree's rows after the pending token (p0, s, p1)
+    tree_parents: [3]i32 = .{ 0, 0, 1 }, // row 0 is the pending token: p0 and s are its children, p1 is p0's
+    tree_n: u8 = 0,
 };
 
 pub const Lanes = struct {
@@ -56,6 +59,7 @@ pub const Lanes = struct {
         .verify = verifyFn,
         .keep = keepFn,
         .draft = draftFn,
+        .tree = treeFn,
         .release = releaseFn,
     };
     const steps_vt: be.Backend.VTable = vt: {
@@ -82,6 +86,7 @@ pub const Lanes = struct {
             .batch_rows = if (sharing) engine.shared_rows else 0,
             .max_streams = if (sharing) engine.max_shared else 1,
             .plain_guard = drafting, // a draft row rides the same weights-bound round a plain row does
+            .head_trees = std.c.getenv("TF_GLM_TREE") != null,
             .window_costs = if (drafting) &window_costs else &.{},
             .shared_costs = if (drafting) &window_costs else &.{},
             .mtp_step_ms = if (drafting) 0.6 else 0.0,
@@ -279,14 +284,27 @@ pub const Lanes = struct {
         }
     }
 
+    /// A tree head's held drafts as host tokens and parents; null when the lane has none.
+    fn treeFn(ptr: *anyopaque, s: *lanes.Stream, gpa: std.mem.Allocator) anyerror!?be.Held {
+        const self = of(ptr);
+        const l = self.lanes.getPtr(s) orelse return null;
+        if (l.tree_n == 0) return null;
+        const n: usize = l.tree_n;
+        const tokens = try gpa.dupe(u32, l.tree_tokens[0..n]);
+        errdefer gpa.free(tokens);
+        const parents = try gpa.dupe(i32, l.tree_parents[0..n]);
+        return .{ .count = @intCast(n), .tokens = tokens, .parents = parents };
+    }
+
     fn draftFn(ptr: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
         const self = of(ptr);
         if (!self.x.e.mtp) return error.NoDraftHead;
         for (requests) |r| {
             const l = try self.bind(r.stream, if (r.rows) |rows| rows.len else null);
             if (r.position != self.x.e.pos() + 1) return error.PositionMismatch;
-            if (r.lanes != null) return error.TreesNotBuilt;
-            const depth = @min(r.depth, engine.max_drafts);
+            const tree = r.lanes != null;
+            if (tree and r.rows != null) return error.TreesNotBuilt; // a tree is drafted from its first token
+            const depth = if (tree) @max(2, @min(r.depth, engine.max_drafts)) else @min(r.depth, engine.max_drafts);
             if (r.rows) |rows| {
                 for (rows, 0..) |row, i| if (row != i) return error.TreesNotBuilt;
                 try self.x.draft(false, r.follow[0..rows.len], depth, &l.held);
@@ -295,6 +313,15 @@ pub const Lanes = struct {
                 try self.x.draft(true, &.{first}, depth, &l.held);
             }
             l.held_n = depth;
+            if (tree) {
+                self.x.e.tree_draft = true;
+                defer self.x.e.tree_draft = false;
+                const sib = self.x.e.draftSibling() catch return error.TreesNotBuilt;
+                l.tree_tokens = .{ l.held[0], sib, l.held[1] };
+                l.tree_parents = .{ 0, 0, 1 };
+                l.tree_n = 3;
+                l.held_n = 3;
+            } else l.tree_n = 0;
         }
     }
 

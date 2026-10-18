@@ -99,6 +99,8 @@ pub fn open(gpa: Allocator, io: std.Io, dir: []const u8, window: u32, speed_up: 
     errdefer h.back.deinit();
     if (eng.ep != null) h.back.costs = try glm.timing.measure(&h.slots, gpa, io); // both Macs in step, as the warm-up
     h.cfg = try lanes.Config.init(gpa, h.back.facts(), glm.state.max_rows, glm.state.max_rows - 1);
+    // TF_GLM_LANES: a lone stream's draft lanes at most (the planner needs head_trees to use them).
+    if (std.c.getenv("TF_GLM_LANES")) |v| h.cfg.head_lanes = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 0;
     errdefer h.cfg.deinit(gpa);
     h.wall = .{ .io = io };
     h.core = lanes.Engine.init(gpa, &h.cfg, h.back.backend(), h.wall.clock());
