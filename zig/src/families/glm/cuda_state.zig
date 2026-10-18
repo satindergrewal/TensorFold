@@ -338,4 +338,28 @@ pub const State = struct {
     pub fn recAt(st: *const State, copy: u1, li: usize) u64 {
         return st.rec + (@as(usize, copy) * st.kda_layers + li) * st.rec_layer;
     }
+
+    /// Bytes of the KDA chain state a tree round must carry per branch: the conv window (a few MB) and
+    /// the two-copy recurrent ring (kda_layers x rec_layer each). 34 layers of 32x128x128 fp32 measure
+    /// 142.6 MB in the ring - the price of one extra branch, ~0.08 ms at HBM.
+    pub fn kdaBytes(st: *const State) usize {
+        return st.kda_layers * 3 * st.conv_c * 2 + 2 * st.kda_layers * st.rec_layer;
+    }
+
+    /// Copies the KDA chain state into `dst` (kdaBytes(st) long). Device-to-device on the stream; the
+    /// tree round restores it before a sibling branch so both children start from the parent's state.
+    pub fn kdaSnapshot(st: *const State, stream: cuda.Stream, dst: u64) !void {
+        const a = st.arena.buf.d;
+        const conv = st.kda_layers * 3 * st.conv_c * 2;
+        try a.check(a.api.cuMemcpyDtoDAsync_v2(dst, st.conv, conv, stream.handle), "kda conv snapshot");
+        try a.check(a.api.cuMemcpyDtoDAsync_v2(dst + conv, st.rec, 2 * st.kda_layers * st.rec_layer, stream.handle), "kda rec snapshot");
+    }
+
+    /// The inverse of kdaSnapshot: puts the saved chain state back (used when a branch is abandoned).
+    pub fn kdaRestore(st: *const State, stream: cuda.Stream, src: u64) !void {
+        const a = st.arena.buf.d;
+        const conv = st.kda_layers * 3 * st.conv_c * 2;
+        try a.check(a.api.cuMemcpyDtoDAsync_v2(st.conv, src, conv, stream.handle), "kda conv restore");
+        try a.check(a.api.cuMemcpyDtoDAsync_v2(st.rec, src + conv, 2 * st.kda_layers * st.rec_layer, stream.handle), "kda rec restore");
+    }
 };
