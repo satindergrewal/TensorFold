@@ -10,6 +10,7 @@
 extern "C" {
 __device__ unsigned g_tree_on = 0;
 __device__ unsigned g_tree_mask[16];
+__device__ unsigned g_tree_pos[16];
 }
 
 namespace glm_attn {

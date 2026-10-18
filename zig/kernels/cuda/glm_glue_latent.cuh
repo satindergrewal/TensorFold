@@ -5,6 +5,15 @@
 
 using namespace glm_triton;
 
+// Tree verify (draft trees): per-row cache positions for the window write. With g_tree_on 0 these are
+// unused and row r lands at pos[0] + r as always; a tree round sets g_tree_pos[r] to row r's depth-based
+// slot so siblings no longer collide. Defined beside g_tree_on/g_tree_mask in glm_glue_attn.cuh.
+extern "C" {
+extern __device__ unsigned g_tree_on;
+extern __device__ unsigned g_tree_pos[16];
+}
+
+
 // latent._absorb_q(_rows), block (head, 32 latent columns, row block) of 128 threads; rows per block change no bits.
 extern "C" __global__ void __launch_bounds__(128)
     tf_glm_absorb_q(const __nv_bfloat16* q, const __nv_bfloat16* wk, __nv_bfloat16* qa, int64_t rows, int64_t heads,
@@ -69,7 +78,7 @@ extern "C" __global__ void __launch_bounds__(128)
 // latent._lat_write (BF16 cache): row r of `lat` into cache slot pos + r.
 extern "C" __global__ void tf_glm_lat_write(const __nv_bfloat16* lat, int64_t lat_stride, __nv_bfloat16* cache,
                                             const int* pos, int64_t lw) {
-  const int64_t r = blockIdx.x, at = (int64_t)pos[0] + r;
+  const int64_t r = blockIdx.x, at = (g_tree_on != 0 && r < 16) ? (int64_t)g_tree_pos[r] : (int64_t)pos[0] + r;
   for (int64_t k = threadIdx.x; k < lw; k += blockDim.x) cache[at * lw + k] = lat[r * lat_stride + k];
 }
 
