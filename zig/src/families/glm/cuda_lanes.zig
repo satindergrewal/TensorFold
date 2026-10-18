@@ -219,18 +219,19 @@ pub const Lanes = struct {
         const self = of(ptr);
         if (windows.len > 1) return self.verifyShared(windows, out);
         for (windows, out) |w, *o| {
-            if (w.parents != null) return error.TreesNotBuilt;
+            if (w.parents != null and w.held != 0) return error.TreesNotBuilt; // tree rows are host tokens
             const l = try self.bind(w.stream, null);
             const rows = w.rows();
             if (rows > max_rows) return error.WindowTooWide;
             if (w.held > l.held_n) return error.NoHeldDrafts;
             const pos = self.x.e.pos();
-            for (w.positions, 0..) |p, r| if (p != pos + 1 + r) return error.PositionMismatch;
+            if (w.parents == null) for (w.positions, 0..) |p, r| if (p != pos + 1 + r) return error.PositionMismatch;
             var ids: [max_rows]u32 = undefined;
             ids[0] = w.pending;
             const drafts = if (w.held > 0) l.held[0..w.held] else w.tokens;
             @memcpy(ids[1..][0..drafts.len], drafts);
             var sampled: [max_rows]u32 = undefined;
+            try self.x.e.setTreeRound(w.parents);
             try self.x.verify(ids[0..rows], sampled[0..rows]);
             @memcpy(o.sampled[0..rows], sampled[0..rows]);
             @memcpy(o.drafts[0..drafts.len], drafts);

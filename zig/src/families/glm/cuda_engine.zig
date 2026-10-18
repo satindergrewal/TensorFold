@@ -72,7 +72,11 @@ pub const Engine = struct {
     comm: cuda.nccl.Comm,
     shm: ?fw.Shm = null, // liumorrisclaw's host-staged gather arena (TF_GLM_SHM_GATHER=1)
     shm_seq: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
-    tree_base_ptr: u64 = 0, // TF_GLM_TREE_TEST: g_tree_base address, written per round
+    tree_base_ptr: u64 = 0, // g_tree_base address, written per round when a tree round is active
+    tree_on_ptr: u64 = 0, // g_tree_on
+    tree_mask_ptr: u64 = 0, // g_tree_mask[16]
+    tree_pos_ptr: u64 = 0, // g_tree_pos[16]
+    tree_active: bool = false, // the current round verified a draft tree
     settings: ranks.Settings,
     m: fw.Modules,
     stream: cuda.Stream,
@@ -361,7 +365,43 @@ pub const Engine = struct {
         var base_len: usize = 0;
         try e.d.check(e.d.api.cuModuleGetGlobal_v2(&base_ptr, &base_len, mod, "g_tree_base"), "g_tree_base");
         e.tree_base_ptr = base_ptr;
+        e.tree_on_ptr = on_ptr;
+        e.tree_mask_ptr = mask_ptr;
+        e.tree_pos_ptr = pos_ptr;
+        e.tree_base_ptr = base_ptr;
+        e.m.glue.tree_mask = 1; // any non-zero marker; the kernel reads the globals now
+        e.tree_active = true;
         std.log.info("glm: tree test globals {x}/{x}/{x}/{x} (chain-equivalence gate)", .{ on_ptr, mask_ptr, pos_ptr, base_ptr });
+    }
+
+    /// A verify window's tree: row r's mask word holds the ancestor rows (parents chain) as bits, and
+    /// the decodes read it through the module globals. A null `parents` turns the mask off for the round.
+    pub fn setTreeRound(e: *Engine, parents: ?[]const i32) !void {
+        if (e.tree_on_ptr == 0) return;
+        if (parents == null or parents.?.len == 0) {
+            if (e.tree_active) {
+                const off: u32 = 0;
+                try e.d.check(e.d.api.cuMemcpyHtoDAsync_v2(e.tree_on_ptr, &off, 4, e.stream.handle), "tree off");
+                e.tree_active = false;
+            }
+            return;
+        }
+        const par = parents.?;
+        var masks: [16]u32 = @splat(0);
+        var slots: [16]u32 = undefined;
+        const n = @min(par.len, 16);
+        for (0..n) |r| {
+            var w: u32 = @as(u32, 1) << @intCast(r);
+            var j = par[r];
+            while (j >= 0 and j < 16) : (j = par[@intCast(j)]) w |= @as(u32, 1) << @intCast(@as(usize, @intCast(j)));
+            masks[r] = w;
+            slots[r] = @intCast(r);
+        }
+        const on: u32 = 1;
+        try e.d.check(e.d.api.cuMemcpyHtoDAsync_v2(e.tree_on_ptr, &on, 4, e.stream.handle), "tree on");
+        try e.d.check(e.d.api.cuMemcpyHtoDAsync_v2(e.tree_mask_ptr, &masks, 64, e.stream.handle), "tree mask");
+        try e.d.check(e.d.api.cuMemcpyHtoDAsync_v2(e.tree_pos_ptr, &slots, 64, e.stream.handle), "tree pos");
+        e.tree_active = true;
     }
 
     /// TF_GLM_L2PF: the pieces table (i64 [n][2]) and per-(layer, site) ranges. Site 'a' (the mixer gather)
@@ -693,7 +733,7 @@ pub const Engine = struct {
 
     /// A verify window: `ids` (pending token, then drafts) at the committed position; `out[r]` drawn at pos + 1 + r.
     pub fn verify(e: *Engine, ids: []const u32, out: []u32) !void {
-        if (e.tree_base_ptr != 0) {
+        if (e.tree_base_ptr != 0 and e.tree_active) {
             const base: u32 = @intCast(e.cur.st.pos);
             try e.d.check(e.d.api.cuMemcpyHtoDAsync_v2(e.tree_base_ptr, &base, 4, e.stream.handle), "tree base");
         }
