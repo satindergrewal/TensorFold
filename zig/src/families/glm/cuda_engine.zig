@@ -79,6 +79,8 @@ pub const Engine = struct {
     tree_active: bool = false, // the current round verified a draft tree
     kda_parents: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
     kda_parents_on: bool = false, // the KDA chain takes the parents buffer this round
+    keep_desc: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true }, // a non-prefix keep's row map
+    keep_path: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
     tree_draft: bool = false, // the backend asked for a branch draft this call
     settings: ranks.Settings,
     m: fw.Modules,
@@ -181,8 +183,12 @@ pub const Engine = struct {
         e.pairs_all = try cuda.DeviceBuffer.alloc(d, 8 * world * fw.window_rows);
         e.draft_tokens = try cuda.DeviceBuffer.alloc(d, 4 * max_drafts);
         e.pairs2 = try cuda.DeviceBuffer.alloc(d, e.share.world * 16);
-        e.draft_alt = try cuda.DeviceBuffer.alloc(d, 8);
+        e.draft_alt = try cuda.DeviceBuffer.alloc(d, 8 * max_drafts); // a runner-up per chain step
         if (std.c.getenv("TF_GLM_TREE") != null) e.kda_parents = try cuda.DeviceBuffer.alloc(d, 64);
+        if (std.c.getenv("TF_GLM_TREE") != null) {
+            e.keep_desc = try cuda.DeviceBuffer.alloc(d, 256 * @sizeOf(KeepDesc));
+            e.keep_path = try cuda.DeviceBuffer.alloc(d, 64);
+        }
         e.draft_idx = try cuda.DeviceBuffer.alloc(d, 4);
         errdefer e.pairs.free();
         e.smp = try sampler.Sampler.init(d, c.vocab, fw.window_rows);
@@ -245,6 +251,8 @@ pub const Engine = struct {
         e.pairs_all.free();
         e.draft_tokens.free();
         e.draft_idx.free();
+        if (e.keep_desc.ptr != 0) e.keep_desc.free();
+        if (e.keep_path.ptr != 0) e.keep_path.free();
         var dg_it = e.draft_graphs.iterator();
         while (dg_it.next()) |kv| kv.value_ptr.deinit();
         e.draft_graphs.deinit(e.gpa);
@@ -871,6 +879,65 @@ pub const Engine = struct {
     }
 
     /// forward.commit of the last window's first `n` rows (the KDA replay when fewer than it ran).
+    /// One row map entry: `base`'s rows of `row_bytes` at `row_stride`, the window's first row `base_row` in.
+    const KeepDesc = extern struct { base: u64, row_stride: u32, row_bytes: u32, base_row: u32, pad: u32 = 0 };
+
+    /// Settle a verify window on a non-prefix accepted path: the path's rows move into slots 0..n-1 across
+    /// the KDA saves/proj window rows and each MLA layer's latent/index/gate caches, then the ordinary keep
+    /// replays 0..n-1 (KDA state) and shifts the conv taps. The pooled keys are left as the window wrote them:
+    /// a tree round is gated to the dense window, where attention reads the latent rows.
+    pub fn keepPath(e: *Engine, path: []const u32) !void {
+        if (e.keep_desc.ptr == 0) return error.TreesNotBuilt;
+        const n = path.len;
+        const st = &e.cur.st;
+        if (n == 0 or n > 16 or n > st.pending) return error.BadCommit;
+        const heads: u32 = @intCast(st.heads);
+        const wr: usize = fw.window_rows;
+        const kvf: u32 = heads * 128 * 4; // save_k / save_g rows (fp32)
+        const kvb: u32 = heads * 128 * 2; // save_v rows (bf16)
+        const bf: u32 = heads * 4; // save_b rows (fp32)
+        const pr: u32 = @intCast(st.proj_row * 2);
+        const lat: u32 = if (std.c.getenv("TF_GLM_KV_NVFP4") != null) e.c.kv_lora / 2 + e.c.kv_lora / 16
+            else if (std.c.getenv("TF_GLM_KV_FP8") != null) e.c.kv_lora
+            else e.c.kv_lora * 2;
+        const idx: u32 = e.c.i_dim * 2;
+        var descs: [256]KeepDesc = undefined;
+        var nd: usize = 0;
+        for (0..st.kda_layers) |li| {
+            const off: u64 = @intCast(li * wr);
+            descs[nd] = .{ .base = st.save_k + off * kvf, .row_stride = kvf, .row_bytes = kvf, .base_row = 0 };
+            nd += 1;
+            descs[nd] = .{ .base = st.save_v + off * kvb, .row_stride = kvb, .row_bytes = kvb, .base_row = 0 };
+            nd += 1;
+            descs[nd] = .{ .base = st.save_g + off * kvf, .row_stride = kvf, .row_bytes = kvf, .base_row = 0 };
+            nd += 1;
+            descs[nd] = .{ .base = st.save_b + off * bf, .row_stride = bf, .row_bytes = bf, .base_row = 0 };
+            nd += 1;
+            descs[nd] = .{ .base = st.proj + off * st.proj_layer * 2, .row_stride = pr, .row_bytes = pr, .base_row = 0 };
+            nd += 1;
+        }
+        for (st.caches) |ch| {
+            descs[nd] = .{ .base = ch.lc, .row_stride = lat, .row_bytes = lat, .base_row = @intCast(st.pos) };
+            nd += 1;
+            descs[nd] = .{ .base = ch.ik, .row_stride = idx, .row_bytes = idx, .base_row = @intCast(st.pos) };
+            nd += 1;
+            descs[nd] = .{ .base = ch.ig, .row_stride = idx, .row_bytes = idx, .base_row = @intCast(st.pos) };
+            nd += 1;
+        }
+        if (nd > descs.len) return error.TreesNotBuilt;
+        var par: [16]i32 = undefined;
+        for (path, 0..) |r, i| par[i] = @intCast(r);
+        try e.d.check(e.d.api.cuMemcpyHtoDAsync_v2(e.keep_path.ptr, &par, 4 * n, e.stream.handle), "keep path");
+        try e.d.check(e.d.api.cuMemcpyHtoDAsync_v2(e.keep_desc.ptr, &descs, nd * @sizeOf(KeepDesc), e.stream.handle), "keep descs");
+        var a: cuda.Args = .{};
+        a.add(e.keep_path.ptr);
+        a.add(@as(c_int, @intCast(n)));
+        a.add(e.keep_desc.ptr);
+        a.add(@as(c_int, @intCast(nd)));
+        try cuda.launch.launch(e.m.glue.keep_rows, .{ .grid = .{ .x = @intCast(nd) }, .block = .{ .x = 128 } }, e.stream, &a);
+        try e.keep(n);
+    }
+
     pub fn keep(e: *Engine, n: usize) !void {
         var one: [1]fw.Rank = undefined;
         const f = e.view(&e.bd, &one);
@@ -878,6 +945,14 @@ pub const Engine = struct {
     }
 
     /// decode.draft: the MTP head absorbs the kept rows (committed first) with `follow`, then chains `depth` drafts.
+    /// The tree draft's per-step runners-up (draft_alt[2j+1]) for `depth` steps.
+    pub fn draftAlts(e: *Engine, depth: usize, out: []i32) !void {
+        if (e.draft_alt.ptr == 0 or depth > max_drafts or out.len < depth) return error.NoDraftHead;
+        var v: [2 * max_drafts]i32 = undefined;
+        try e.d.check(e.d.api.cuMemcpyDtoH_v2(&v, e.draft_alt.ptr, depth * 8), "draft alts");
+        for (0..depth) |j| out[j] = v[2 * j + 1];
+    }
+
     /// The sibling draft candidate from the last tree draft (draft_alt[1]); errors when no tree round ran.
     pub fn draftSibling(e: *Engine) !u32 {
         if (e.draft_alt.ptr == 0) return error.NoDraftHead;
@@ -924,10 +999,10 @@ pub const Engine = struct {
             }
             const tree_draft = e.tree_draft or std.c.getenv("TF_GLM_TREE_DRAFT") != null;
             for (0..depth) |j| {
-                if (tree_draft and j == 0 and sampled == null) {
-                    try e.pickTop2(e.bm.logits, e.bm.ids, e.draft_alt.ptr, 0);
-                    // the chain's step-0 token is the winner: copy it where the chain reads it
-                    try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(e.draft_tokens.ptr, e.draft_alt.ptr, 4, e.stream.handle), "draft token 0");
+                if (tree_draft and sampled == null) {
+                    try e.pickTop2(e.bm.logits, e.bm.ids, e.draft_alt.ptr + j * 8, 0);
+                    // the chain's step-j token is the winner: copy it where the chain reads it
+                    try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(e.draft_tokens.ptr + j * 4, e.draft_alt.ptr + j * 8, 4, e.stream.handle), "draft token");
                 } else if (sampled) |sm| {
                     try e.smp.drawDev(e.stream, e.exchange(), e.spans, &.{.{ .rank = e.share.rank, .logits = e.bm.logits }}, 1, e.cur.st.pos + 1 + j, sampler.rule(sm), e.bm.ids, e.draft_tokens.ptr + j * 4);
                 } else {

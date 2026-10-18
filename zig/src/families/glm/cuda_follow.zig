@@ -287,6 +287,13 @@ pub const Leader = struct {
         try x.e.keep(n);
     }
 
+    /// A tree round's accepted path: both ranks move the same rows into slots 0..n-1.
+    pub fn keepPath(x: Leader, path: []const u32) !void {
+        try x.flush();
+        try x.send(.{ .kind = @backingInt(Kind.keep), .a = path.len }, path);
+        try x.e.keepPath(path);
+    }
+
     pub fn draft(x: Leader, from_prompt: bool, follow_ids: []const u32, depth: usize, out: []u32) !void {
         try x.flush();
         try x.send(.{ .kind = @backingInt(Kind.draft), .depth = @intCast(depth), .flags = @intFromBool(from_prompt) }, follow_ids);
@@ -345,7 +352,7 @@ pub fn follow(e: *Engine, link: *Link) !void {
                 }
                 try e.verifyShared(parts[0..k]);
             },
-            .keep => try e.keep(@intCast(h.a)),
+            .keep => if (step.ids.len > 0) try e.keepPath(step.ids) else try e.keep(@intCast(h.a)),
             .draft => {
                 const ids = try e.gpa.dupe(u32, step.ids);
                 defer e.gpa.free(ids);

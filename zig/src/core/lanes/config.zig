@@ -32,6 +32,7 @@ pub const Model = struct {
     draft_probabilities: bool = false, // the head gives each drafted node's chance of landing
     draft_streams: bool = false, // the head drafts every stream of a shared round in one batch
     head_trees: bool = false, // the head drafts trees of lanes (DraftRequest.lanes) and holds them
+    head_lanes: u32 = 0, // a lone stream's lanes at most (0: the depth rule's chain)
     lane_costs: []const Cost = &.{}, // a lone stream's window ms by rows, up to its widest tree (timed at load)
     lone_copies: bool = true, // a lone stream proposes copies (false: only streams in shared rounds do)
 };
@@ -115,6 +116,7 @@ pub const Config = struct {
             .node_probabilities = m.draft_probabilities,
             .draft_streams = m.draft_streams,
             .head_trees = m.head_trees,
+            .head_lanes = m.head_lanes,
             .depth_prior = depth_prior,
             .family_costs = family_costs,
             .shared_costs = try alloc.extendCosts(gpa, timed.items, batch_rows),

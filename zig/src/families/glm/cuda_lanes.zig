@@ -8,6 +8,8 @@ const fw = @import("cuda_forward.zig");
 
 const be = lanes.backend;
 
+var tree_logs: u32 = 0; // TF_GLM_TREE diagnostics: the first rounds' shapes and kept paths
+
 /// First tokens a handle names.
 const ring = 1024;
 
@@ -87,6 +89,8 @@ pub const Lanes = struct {
             .max_streams = if (sharing) engine.max_shared else 1,
             .plain_guard = drafting, // a draft row rides the same weights-bound round a plain row does
             .head_trees = std.c.getenv("TF_GLM_TREE") != null,
+            .head_lanes = if (std.c.getenv("TF_GLM_LANES")) |v| (std.fmt.parseInt(u32, std.mem.span(v), 10) catch 0) else 0,
+            .lane_costs = if (drafting) &window_costs else &.{},
             .window_costs = if (drafting) &window_costs else &.{},
             .shared_costs = if (drafting) &window_costs else &.{},
             .mtp_step_ms = if (drafting) 0.6 else 0.0,
@@ -224,8 +228,9 @@ pub const Lanes = struct {
         const self = of(ptr);
         if (windows.len > 1) return self.verifyShared(windows, out);
         for (windows, out) |w, *o| {
-            if (w.parents != null and w.held != 0) return error.TreesNotBuilt; // tree rows are host tokens
             const l = try self.bind(w.stream, null);
+            // a tree round's lanes are HELD in tree order (draftFn filled them lane for lane)
+            if (w.parents != null and w.held > l.tree_n) return error.TreesNotBuilt;
             const rows = w.rows();
             if (rows > max_rows) return error.WindowTooWide;
             if (w.held > l.held_n) return error.NoHeldDrafts;
@@ -279,8 +284,23 @@ pub const Lanes = struct {
         const self = of(ptr);
         for (windows, paths) |w, path| {
             if (path.len == 0) return error.EmptyPath;
-            for (path, 0..) |r, i| if (r != i) return error.TreesNotBuilt;
-            _ = try self.bind(w.stream, path.len);
+            const l = self.lanes.getPtr(w.stream) orelse return error.UnknownStream;
+            try self.x.bind(l.slot);
+            var prefix = true;
+            for (path, 0..) |r, i| if (r != i) {
+                prefix = false;
+                break;
+            };
+            if (prefix) {
+                try self.x.keep(path.len);
+            } else {
+                if (tree_logs < 12) {
+                    tree_logs += 1;
+                    std.log.info("glm tree: keep path {any} of rows {d}", .{ path, w.rows() });
+                }
+                try self.x.keepPath(path);
+            }
+            l.pending_rows = null;
         }
     }
 
@@ -303,8 +323,11 @@ pub const Lanes = struct {
             const l = try self.bind(r.stream, if (r.rows) |rows| rows.len else null);
             if (r.position != self.x.e.pos() + 1) return error.PositionMismatch;
             const tree = r.lanes != null;
-            if (tree and r.rows != null) return error.TreesNotBuilt; // a tree is drafted from its first token
-            const depth = if (tree) @max(2, @min(r.depth, engine.max_drafts)) else @min(r.depth, engine.max_drafts);
+            var need: usize = 0;
+            if (tree) {
+                for (r.lanes.?.depths) |d| need = @max(need, @as(usize, d) + 1);
+            }
+            const depth = if (tree) @min(@max(2, @max(@as(usize, r.depth), need)), engine.max_drafts) else @min(r.depth, engine.max_drafts);
             if (r.rows) |rows| {
                 for (rows, 0..) |row, i| if (row != i) return error.TreesNotBuilt;
                 try self.x.draft(false, r.follow[0..rows.len], depth, &l.held);
@@ -314,13 +337,56 @@ pub const Lanes = struct {
             }
             l.held_n = depth;
             if (tree) {
-                self.x.e.tree_draft = true;
-                defer self.x.e.tree_draft = false;
-                const sib = self.x.e.draftSibling() catch return error.TreesNotBuilt;
-                l.tree_tokens = .{ l.held[0], sib, l.held[1] };
-                l.tree_parents = .{ 0, 0, 1 };
-                l.tree_n = 3;
-                l.held_n = 3;
+                const sh = r.lanes.?;
+                const n = sh.parents.len;
+                if (n == 0 or n > engine.max_drafts) {
+                    std.log.err("glm tree: lanes {d} outside 1..{d}", .{ n, engine.max_drafts });
+                    return error.TreesNotBuilt;
+                }
+                var sib: [engine.max_drafts]i32 = undefined;
+                self.x.e.draftAlts(depth, sib[0..depth]) catch {
+                    std.log.err("glm tree: no runner-up buffer for depth {d}", .{depth});
+                    return error.TreesNotBuilt;
+                };
+                // a lane's rank-0 token is the chain's at its depth; rank 1 is that step's runner-up
+                // (under the chain lane one level up). Lanes under a rank-1 parent are not producible.
+                var hold: [engine.max_drafts]u32 = undefined;
+                for (0..n) |i| {
+                    const d: usize = sh.depths[i];
+                    const par = sh.parents[i];
+                    if (d >= depth) {
+                        std.log.err("glm tree: lane {d} depth {d} beyond the chain {d}", .{ i, d, depth });
+                        return error.TreesNotBuilt;
+                    }
+                    if (par >= 0) {
+                        const up: usize = @intCast(par);
+                        if (up >= i or sh.ranks[up] != 0) {
+                            std.log.err("glm tree: lane {d} under parent {d} (rank {d})", .{ i, par, sh.ranks[up] });
+                            return error.TreesNotBuilt;
+                        }
+                    }
+                    hold[i] = switch (sh.ranks[i]) {
+                        0 => l.held[d],
+                        1 => if (sib[d] >= 0) @intCast(sib[d]) else {
+                            std.log.err("glm tree: lane {d} rank 1 at depth {d} has no runner-up", .{ i, d });
+                            return error.TreesNotBuilt;
+                        },
+                        else => {
+                            std.log.err("glm tree: lane {d} rank {d} unsupported", .{ i, sh.ranks[i] });
+                            return error.TreesNotBuilt;
+                        },
+                    };
+                }
+                @memcpy(l.held[0..n], hold[0..n]);
+                l.held_n = n;
+                // the backend's own tree view (used only when the core asks without a shape)
+                l.tree_tokens = .{ hold[0], if (n > 1) hold[1] else hold[0], if (n > 2) hold[2] else hold[0] };
+                l.tree_parents = .{ 0, 0, 0 };
+                l.tree_n = @intCast(n);
+                if (tree_logs < 6) {
+                    tree_logs += 1;
+                    std.log.info("glm tree: lanes={d} depth={d} ranks={any} depths={any} parents={any} hold={any}", .{ n, depth, sh.ranks, sh.depths, sh.parents, hold[0..n] });
+                }
             } else l.tree_n = 0;
         }
     }

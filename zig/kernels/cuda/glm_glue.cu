@@ -447,3 +447,28 @@ extern "C" __global__ void __launch_bounds__(256) tf_glm_l2pf(const long long* _
 #endif
     }
 }
+
+// -- a tree round's accepted path -------------------------------------------------------------------------------
+// rows path[k] of every buffer's window move into row k of the same buffer (base_row positions in), so the
+// chain's commit (replay 0..keep-1 + the conv shift) settles the KDA state and the caches present the kept
+// sequence. One block a buffer; the descriptors are the window's KDA saves/proj rows and each MLA layer's
+// latent/index/gate rows.
+struct TfKeepDesc {
+    unsigned long long base;
+    unsigned int row_stride, row_bytes, base_row, pad;
+};
+extern "C" __global__ void tf_glm_keep_rows(const int* __restrict__ path, int n,
+                                            const TfKeepDesc* __restrict__ descs, int nd) {
+    const int d = blockIdx.x;
+    if (d >= nd) return;
+    const TfKeepDesc q = descs[d];
+    for (int k = 0; k < n; ++k) {
+        const int src = path[k];
+        if (src == k || src < 0) continue;
+        const unsigned char* s = reinterpret_cast<const unsigned char*>(q.base) +
+                                 (unsigned long long)(q.base_row + (unsigned)src) * q.row_stride;
+        unsigned char* t = reinterpret_cast<unsigned char*>(q.base) +
+                           (unsigned long long)(q.base_row + (unsigned)k) * q.row_stride;
+        for (unsigned int i = threadIdx.x; i < q.row_bytes; i += blockDim.x) t[i] = s[i];
+    }
+}

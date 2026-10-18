@@ -103,6 +103,7 @@ pub const Set = struct { glue: *const Kernels, linear: cuda.qlinear.Linear = .{}
 /// Our glm_glue.cu's functions.
 pub const Kernels = struct {
     tree_mask: u64 = 0,
+    keep_rows: cuda.Function,
     mm: Mm16 = undefined,
     rmsnorm_4096: cuda.Function,
     rmsnorm_1536: cuda.Function,
