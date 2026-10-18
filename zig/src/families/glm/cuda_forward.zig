@@ -224,6 +224,7 @@ pub const Rank = struct {
 pub const Seg = struct { st: *State, row0: usize, rows: usize };
 
 pub const Forward = struct {
+    kda_parents: u64 = 0, // this round tree parents for the KDA chain (0: a chain)
     d: *const cuda.Driver,
     m: *const Modules,
     stream: cuda.Stream,
@@ -332,7 +333,7 @@ pub const Forward = struct {
                     s.saves.b = st.save_b + li * window_rows * st.heads * 4;
                 }
                 const conv = st.conv + li * 3 * st.conv_c * 2;
-                try kda_block.body(f.set(), &f.m.kda, f.stream, k, s, b.normed, c.hidden, rows, conv, st.recAt(cur, li), !b.prefill and f.kda_wide, b.prefill);
+                try kda_block.body(f.set(), &f.m.kda, f.stream, k, s, b.normed, c.hidden, rows, conv, st.recAt(cur, li), !b.prefill and f.kda_wide, b.prefill, f.kda_parents);
                 if (out) |o| try kda_block.fill(f.set(), f.stream, k, s, 0, rows, o);
                 if (b.prefill) st.cur[li] = 1 - cur; // a prompt chunk keeps every row: the layer commits now
             },

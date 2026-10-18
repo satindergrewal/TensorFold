@@ -51,7 +51,7 @@ pub fn mixer(f: *const fw.Forward, r: fw.Rank, l: weights.Layer, li: usize, di: 
                 v.saves.v = st.save_v + kv * 2;
                 v.saves.g = st.save_g + kv * 4;
                 v.saves.b = st.save_b + li * fw.window_rows * st.heads * 4;
-                try kda_block.chainRows(&f.m.kda, f.stream, k, v, g.rows, st.conv + li * 3 * st.conv_c * 2, st.recAt(cur, li), f.kda_wide);
+                try kda_block.chainRows(&f.m.kda, f.stream, k, v, g.rows, st.conv + li * 3 * st.conv_c * 2, st.recAt(cur, li), f.kda_wide, 0);
             }
             try kda_block.fill(f.set(), f.stream, k, s, 0, rows, out);
         },

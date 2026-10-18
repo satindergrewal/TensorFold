@@ -77,6 +77,8 @@ pub const Engine = struct {
     tree_mask_ptr: u64 = 0, // g_tree_mask[16]
     tree_pos_ptr: u64 = 0, // g_tree_pos[16]
     tree_active: bool = false, // the current round verified a draft tree
+    kda_parents: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
+    kda_parents_on: bool = false, // the KDA chain takes the parents buffer this round
     settings: ranks.Settings,
     m: fw.Modules,
     stream: cuda.Stream,
@@ -179,6 +181,7 @@ pub const Engine = struct {
         e.draft_tokens = try cuda.DeviceBuffer.alloc(d, 4 * max_drafts);
         e.pairs2 = try cuda.DeviceBuffer.alloc(d, e.share.world * 16);
         e.draft_alt = try cuda.DeviceBuffer.alloc(d, 8);
+        if (std.c.getenv("TF_GLM_TREE") != null) e.kda_parents = try cuda.DeviceBuffer.alloc(d, 64);
         e.draft_idx = try cuda.DeviceBuffer.alloc(d, 4);
         errdefer e.pairs.free();
         e.smp = try sampler.Sampler.init(d, c.vocab, fw.window_rows);
@@ -374,6 +377,18 @@ pub const Engine = struct {
         std.log.info("glm: tree test globals {x}/{x}/{x}/{x} (chain-equivalence gate)", .{ on_ptr, mask_ptr, pos_ptr, base_ptr });
     }
 
+    /// The round's tree parents (i32[16], a device copy) for the KDA chain: row r's parent row, -1 for a
+    /// root. Allocated once under TF_GLM_TREE; a chain round writes all -1 and passes 0 to the kernel.
+    pub fn setKdaParents(e: *Engine, parents: ?[]const i32) !void {
+        if (e.kda_parents.ptr == 0) return;
+        var arr: [16]i32 = @splat(-1);
+        if (parents) |p2| for (p2[0..@min(p2.len, 16)], 0..) |v, i| {
+            arr[i] = v;
+        };
+        try e.d.check(e.d.api.cuMemcpyHtoDAsync_v2(e.kda_parents.ptr, &arr, 64, e.stream.handle), "kda parents");
+        e.kda_parents_on = parents != null;
+    }
+
     /// A verify window's tree: row r's mask word holds the ancestor rows (parents chain) as bits, and
     /// the decodes read it through the module globals. A null `parents` turns the mask off for the round.
     pub fn setTreeRound(e: *Engine, parents: ?[]const i32) !void {
@@ -382,6 +397,7 @@ pub const Engine = struct {
             if (e.tree_active) {
                 const off: u32 = 0;
                 try e.d.check(e.d.api.cuMemcpyHtoDAsync_v2(e.tree_on_ptr, &off, 4, e.stream.handle), "tree off");
+                try e.setKdaParents(null);
                 e.tree_active = false;
             }
             return;
@@ -397,6 +413,7 @@ pub const Engine = struct {
             masks[r] = w;
             slots[r] = @intCast(r);
         }
+        try e.setKdaParents(par);
         const on: u32 = 1;
         try e.d.check(e.d.api.cuMemcpyHtoDAsync_v2(e.tree_on_ptr, &on, 4, e.stream.handle), "tree on");
         try e.d.check(e.d.api.cuMemcpyHtoDAsync_v2(e.tree_mask_ptr, &masks, 64, e.stream.handle), "tree mask");
@@ -528,7 +545,7 @@ pub const Engine = struct {
 
     fn view(e: *Engine, b: *fw.Buffers, out: *[1]fw.Rank) fw.Forward {
         out.* = .{.{ .w = &e.w, .st = &e.cur.st, .b = b }};
-        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = if (b == &e.bp) &e.pieces else null, .split = e.settings.split, .kda_wide = e.settings.kda_wide, .wave = if (b == &e.bd and e.wave != null) &e.wave.? else null, .l2pf = if (b == &e.bd and e.l2pf != null) &e.l2pf.? else null };
+        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = if (b == &e.bp) &e.pieces else null, .split = e.settings.split, .kda_wide = e.settings.kda_wide, .kda_parents = if (e.kda_parents_on) e.kda_parents.ptr else 0, .wave = if (b == &e.bd and e.wave != null) &e.wave.? else null, .l2pf = if (b == &e.bd and e.l2pf != null) &e.l2pf.? else null };
     }
 
     /// Binds slot `slot`'s sequence for the steps that follow, making it (a zeroed state) on first use.
