@@ -326,12 +326,24 @@ pub const Engine = struct {
     }
 
 
-    /// TF_GLM_TREE_TEST: publishes the sentinel mask pointer (1), and the attention synthesizes the
-    /// triangular chain mask in-register - the chain-equivalence gate for the tree port.
-    pub fn setTreeTest(e: *Engine) void {
+    /// TF_GLM_TREE_TEST: writes the triangular chain mask into the attention module's device globals
+    /// (g_tree_on, g_tree_mask) - the chain-equivalence gate for the tree port. Real tree rounds fill
+    /// the same words with their ancestry; zero keeps today's causal window.
+    pub fn setTreeTest(e: *Engine) !void {
         if (std.c.getenv("TF_GLM_TREE_TEST") == null) return;
-        e.m.glue.tree_mask = 1;
-        std.log.info("glm: tree test sentinel mask on (chain-equivalence gate)", .{});
+        var on_ptr: u64 = 0;
+        var on_len: usize = 0;
+        var mask_ptr: u64 = 0;
+        var mask_len: usize = 0;
+        const mod = e.m.mods[6].handle;
+        try e.d.check(e.d.api.cuModuleGetGlobal_v2(&on_ptr, &on_len, mod, "g_tree_on"), "g_tree_on");
+        try e.d.check(e.d.api.cuModuleGetGlobal_v2(&mask_ptr, &mask_len, mod, "g_tree_mask"), "g_tree_mask");
+        var masks: [16]u32 = undefined;
+        for (&masks, 0..) |*m, r| m.* = (@as(u32, 1) << @intCast(r + 1)) - 1;
+        const one: u32 = 1;
+        try e.d.check(e.d.api.cuMemcpyHtoD_v2(on_ptr, &one, 4), "tree on");
+        try e.d.check(e.d.api.cuMemcpyHtoD_v2(mask_ptr, &masks, masks.len * 4), "tree mask");
+        std.log.info("glm: tree test mask in globals {x}/{x} (chain-equivalence gate)", .{ on_ptr, mask_ptr });
     }
 
     /// TF_GLM_L2PF: the pieces table (i64 [n][2]) and per-(layer, site) ranges. Site 'a' (the mixer gather)
