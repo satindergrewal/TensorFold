@@ -86,6 +86,9 @@ pub const Engine = struct {
     pairs: cuda.DeviceBuffer, // every rank's (value, id) of a greedy draw (the send slices)
     pairs_all: cuda.DeviceBuffer, // the all-gather's destination: a separate buffer, out-of-place on every rank
     draft_tokens: cuda.DeviceBuffer, // the device-resident draft chain's picked tokens (TF_GLM_DRAFT_DEV)
+    pairs2: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
+    draft_alt: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
+    tree_rounds: u32 = 0,
     draft_idx: cuda.DeviceBuffer, // the chain step's slot counter (device; reset each round)
     smp: sampler.Sampler,
     seqs: std.ArrayList(?*Seq) = .empty, // every stream's sequence by slot (the lane backend's), slot 0 made at init
@@ -170,6 +173,8 @@ pub const Engine = struct {
         e.pairs = try cuda.DeviceBuffer.alloc(d, 8 * world * fw.window_rows);
         e.pairs_all = try cuda.DeviceBuffer.alloc(d, 8 * world * fw.window_rows);
         e.draft_tokens = try cuda.DeviceBuffer.alloc(d, 4 * max_drafts);
+        e.pairs2 = try cuda.DeviceBuffer.alloc(d, e.share.world * 16);
+        e.draft_alt = try cuda.DeviceBuffer.alloc(d, 8);
         e.draft_idx = try cuda.DeviceBuffer.alloc(d, 4);
         errdefer e.pairs.free();
         e.smp = try sampler.Sampler.init(d, c.vocab, fw.window_rows);
@@ -850,8 +855,13 @@ pub const Engine = struct {
                     return;
                 } else |_| {} // capture failed: the eager chain below runs instead
             }
+            const tree_draft = std.c.getenv("TF_GLM_TREE_DRAFT") != null;
             for (0..depth) |j| {
-                if (sampled) |sm| {
+                if (tree_draft and j == 0 and sampled == null) {
+                    try e.pickTop2(e.bm.logits, e.bm.ids, e.draft_alt.ptr, 0);
+                    // the chain's step-0 token is the winner: copy it where the chain reads it
+                    try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(e.draft_tokens.ptr, e.draft_alt.ptr, 4, e.stream.handle), "draft token 0");
+                } else if (sampled) |sm| {
                     try e.smp.drawDev(e.stream, e.exchange(), e.spans, &.{.{ .rank = e.share.rank, .logits = e.bm.logits }}, 1, e.cur.st.pos + 1 + j, sampler.rule(sm), e.bm.ids, e.draft_tokens.ptr + j * 4);
                 } else {
                     try e.pickDev(e.bm.logits, e.bm.ids, e.draft_tokens.ptr + j * 4, 0);
@@ -864,6 +874,13 @@ pub const Engine = struct {
             }
             try e.stream.synchronize();
             try e.d.check(e.d.api.cuMemcpyDtoH_v2(out.ptr, e.draft_tokens.ptr, depth * 4), "cuMemcpyDtoH");
+            if (tree_draft) {
+                var alt: [2]i32 = undefined;
+                try e.d.check(e.d.api.cuMemcpyDtoH_v2(&alt, e.draft_alt.ptr, 8), "cuMemcpyDtoH");
+                e.tree_rounds +%= 1;
+                if (e.tree_rounds % 128 == 1)
+                    std.log.info("glm: tree draft candidates {d} and {d}", .{ alt[0], alt[1] });
+            }
             return;
         }
         for (0..depth) |j| {
@@ -939,6 +956,26 @@ pub const Engine = struct {
 
     /// One greedy pick that never returns to the host: top-1 into this rank's pairs slot, one count-2
     /// all-gather, then tf_glm_pick_greedy writes the winner to the head's ids slot and the token log.
+    /// The lane tree's branch point: the global top-2 of a row's logits. ids[0] continues the chain
+    /// exactly as pickDev's winner would (same tie rule); ids[1] is the sibling candidate.
+    fn pickTop2(e: *Engine, logits: u64, ids_slot: u64, alt_out: u64, slot_idx: c_int) !void {
+        const world = e.share.world;
+        var a: cuda.Args = .{};
+        a.add(logits);
+        a.add(@as(i64, @intCast(e.share.vocab.len())));
+        a.add(@as(u32, @intCast(e.share.vocab.lo)));
+        a.add(e.pairs2.ptr + e.share.rank * 16);
+        try cuda.launch.launch(e.m.glue.top2, .{ .grid = .{ .x = 1 }, .block = .{ .x = 1024 } }, e.stream, &a);
+        try e.lib.check(e.lib.api.ncclAllGather(e.pairs2.ptr + e.share.rank * 16, e.pairs_all.ptr, 4, .u32, e.comm, e.stream.handle), "ncclAllGather");
+        var p: cuda.Args = .{};
+        p.add(e.pairs_all.ptr);
+        p.add(@as(c_int, @intCast(world)));
+        p.add(if (slot_idx != 0) e.draft_idx.ptr else 0);
+        p.add(ids_slot);
+        p.add(alt_out);
+        try cuda.launch.launch(e.m.glue.pick_top2, .{ .grid = .{ .x = 1 }, .block = .{ .x = 32 } }, e.stream, &p);
+    }
+
     fn pickDev(e: *Engine, logits: u64, ids_slot: u64, token_out: u64, slot_idx: c_int) !void {
         const world = e.share.world;
         var a: cuda.Args = .{};

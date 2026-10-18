@@ -114,6 +114,8 @@ pub const Kernels = struct {
     combine: cuda.Function,
     slice_sum: cuda.Function,
     top1: cuda.Function,
+    top2: cuda.Function,
+    pick_top2: cuda.Function,
     top1_rows: cuda.Function,
     pick_greedy: cuda.Function,
     bell_wait: cuda.Function,

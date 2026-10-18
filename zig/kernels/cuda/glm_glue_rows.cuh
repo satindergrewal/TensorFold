@@ -218,6 +218,83 @@ extern "C" __global__ void __launch_bounds__(1024) tf_glm_top1(const unsigned sh
   }
 }
 
+// The best two candidates of a row's logits (a lane tree's branch point), same rule as top1: largest
+// value, ties to the lower id, the two ids distinct. out [4]: value bits, id, value bits, id.
+extern "C" __global__ void __launch_bounds__(1024) tf_glm_top2(const unsigned short* logits, int64_t n, unsigned lo,
+                                                                unsigned* out) {
+  __shared__ float sv0[1024], sv1[1024];
+  __shared__ unsigned si0[1024], si1[1024];
+  const int t = threadIdx.x;
+  const float ninf = -__int_as_float(0x7f800000);
+  float v0 = ninf, v1 = ninf;
+  unsigned i0 = 0xffffffffu, i1 = 0xffffffffu;
+  for (int64_t i = t; i < n; i += 1024) {
+    const float v = __int_as_float(static_cast<int>(static_cast<unsigned>(logits[i]) << 16));
+    const unsigned id = static_cast<unsigned>(i);
+    if (v > v0 || (v == v0 && id < i0)) {
+      if (id != i0) { v1 = v0; i1 = i0; }
+      v0 = v; i0 = id;
+    } else if (id != i0 && (v > v1 || (v == v1 && id < i1))) {
+      v1 = v; i1 = id;
+    }
+  }
+  sv0[t] = v0, si0[t] = i0, sv1[t] = v1, si1[t] = i1;
+  __syncthreads();
+  for (int h = 512; h > 0; h >>= 1) {
+    if (t < h) {
+      const float a0 = sv0[t], a1 = sv1[t], b0 = sv0[t + h], b1 = sv1[t + h];
+      const unsigned ja = si0[t], ka = si1[t], jb = si0[t + h], kb = si1[t + h];
+      float bestv; unsigned besti;
+      if (b0 > a0 || (b0 == a0 && jb < ja)) { bestv = b0; besti = jb; } else { bestv = a0; besti = ja; }
+      const bool a_used0 = besti == ja, b_used0 = besti == jb;
+      const float ac = a_used0 ? a1 : a0, bc = b_used0 ? b1 : b0;
+      const unsigned ai = a_used0 ? ka : ja, bi = b_used0 ? kb : jb;
+      const bool a_ok = ai != 0xffffffffu, b_ok = bi != 0xffffffffu;
+      float runv; unsigned runi;
+      if (!a_ok) { runv = bc; runi = bi; }
+      else if (!b_ok) { runv = ac; runi = ai; }
+      else if (bc > ac || (bc == ac && bi < ai)) { runv = bc; runi = bi; }
+      else { runv = ac; runi = ai; }
+      sv0[t] = bestv, si0[t] = besti, sv1[t] = runv, si1[t] = runi;
+    }
+    __syncthreads();
+  }
+  if (t == 0) {
+    out[0] = __float_as_uint(sv0[0]);
+    out[1] = lo + (si0[0] == 0xffffffffu ? 0u : si0[0]);
+    out[2] = __float_as_uint(sv1[0]);
+    out[3] = lo + (si1[0] == 0xffffffffu ? 0u : si1[0]);
+  }
+}
+
+// The global top-2 over `world` ranks' two candidates each (`all` [world][4]); ids[0] also continues the
+// chain exactly as pick_greedy's winner would.
+extern "C" __global__ void __launch_bounds__(32) tf_glm_pick_top2(const unsigned* all, int world, const int* slot_idx,
+                                                                   int* token_base, int* ids) {
+  __shared__ unsigned sh[64][2];
+  const int t = threadIdx.x;
+  if (t < world * 2) { sh[t][0] = all[4 * (t / 2) + 2 * (t % 2)]; sh[t][1] = all[4 * (t / 2) + 2 * (t % 2) + 1]; }
+  __syncthreads();
+  if (t != 0) return;
+  int b0 = 0;
+  for (int c = 1; c < world * 2; ++c) {
+    const float v = __int_as_float(static_cast<int>(sh[c][0]));
+    const float b = __int_as_float(static_cast<int>(sh[b0][0]));
+    if (v > b || (v == b && sh[c][1] < sh[b0][1])) b0 = c;
+  }
+  int b1 = -1;
+  for (int c = 0; c < world * 2; ++c) {
+    if (c == b0 || sh[c][1] == sh[b0][1]) continue;
+    if (b1 < 0) { b1 = c; continue; }
+    const float v = __int_as_float(static_cast<int>(sh[c][0]));
+    const float b = __int_as_float(static_cast<int>(sh[b1][0]));
+    if (v > b || (v == b && sh[c][1] < sh[b1][1])) b1 = c;
+  }
+  ids[0] = static_cast<int>(sh[b0][1]);
+  ids[1] = b1 < 0 ? -1 : static_cast<int>(sh[b1][1]);
+  token_base[slot_idx ? *slot_idx : 0] = ids[0];
+}
+
 // The same pick for every row of a verify window in ONE launch: a block a row, out [rows][2] (value bits, lo+id).
 // Credit: BobClawblaw's TensorFold PR #978 (q35-speed) - the per-row launch/collective/sync loop serialized the round.
 extern "C" __global__ void __launch_bounds__(1024) tf_glm_top1_rows(const unsigned short* logits, int64_t n, int64_t vocab,
