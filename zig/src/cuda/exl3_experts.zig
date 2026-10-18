@@ -134,21 +134,18 @@ pub const MmaTile = enum { mt16, mt32, mt64 };
     /// X rows -> the pairs' gate and up rotations, both mma passes, the gate/up epilogue with the down input
     /// rotation, and the down epilogue into the ey slot rows. SK K-splits a pass.
     pub fn mmaMixed(e: *const Experts, s: Stream, x: u64, x_stride: usize, rows: usize, slots: usize, pick: u64, suh_g: u64, suh_u: u64, svh_g: u64, svh_u: u64, suh_d: u64, svh_d: u64, mats_up: u64, mats_down: u64, plan: grouped.Plan, items: usize, z: u64, xg: u64, xu: u64, xd: u64, ey: u64, width: usize, dims: usize, limit: f32, book: c_uint, skip: i32, wide: MmaTile) !void {
-                // SK=8 measured best at ALL stream counts (adaptive-SK to 2 at multi-stream dropped
-        // aggregate 40-47%: the expert kernel needs the split parallelism even at high rows)
-        // measured end-to-end on the 2x RTX PRO 6000 box: gate/up SK=2 with the down pass whole (SK=1)
-        // runs ~101 tok/s vs 90 at the old SK=8-for-both (the python engine's split direction; our
-        // kernel shape prefers 2 for gate/up) - TF_GLM_MMA_SK still overrides
+                // SK=8 on BOTH passes. The 2026-10-17 retune to gate/up 2 + down 1 was measured against an
+        // already-broken baseline (+12% on 90 tok/s); it is not bit-exact (the expert sums change order,
+        // the greedy text diverges on the raw-id bench) and it collapses MTP draft acceptance from 74-91%
+        // to 28% - 185-200 tok/s vs 88-120. TF_GLM_MMA_SK / TF_GLM_MMA_SK_DOWN still override.
         const sk: usize = if (std.c.getenv("TF_GLM_MMA_SK") != null) blk: {
             const v = std.c.getenv("TF_GLM_MMA_SK").?;
-            break :blk std.fmt.parseInt(usize, std.mem.span(v), 10) catch 2;
-        } else 2;
-        // the python engine splits the gate/up pass but runs the down pass whole (its SK=1):
-        // TF_GLM_MMA_SK_DOWN overrides the down pass alone (default: the shared SK)
+            break :blk std.fmt.parseInt(usize, std.mem.span(v), 10) catch 8;
+        } else 8;
         const sk_down: usize = if (std.c.getenv("TF_GLM_MMA_SK_DOWN") != null) blk: {
             const v = std.c.getenv("TF_GLM_MMA_SK_DOWN").?;
-            break :blk std.fmt.parseInt(usize, std.mem.span(v), 10) catch 1;
-        } else 1;
+            break :blk std.fmt.parseInt(usize, std.mem.span(v), 10) catch 8;
+        } else 8;
         const p = rows * slots;
         // XROW (TF_GLM_MMA_XROW=1): the checkpoint's experts all share one gate/up suh (verified
         // byte-identical), so ONE rotation a row - 16x smaller than the per-pair pass - serves both mats
