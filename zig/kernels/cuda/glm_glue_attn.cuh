@@ -11,6 +11,7 @@ extern "C" {
 __device__ unsigned g_tree_on = 0;
 __device__ unsigned g_tree_mask[16];
 __device__ unsigned g_tree_pos[16];
+__device__ unsigned g_tree_base = 0;
 }
 
 namespace glm_attn {
@@ -99,7 +100,9 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
   const int64_t r = blockIdx.x, h0 = (int64_t)blockIdx.y * HB, c = blockIdx.z;
   const int64_t n = sparse ? cnt[r] : 0, limit = sparse ? 0 : (int64_t)pos[0] + r, start = c * CHW;
   const bool tree_on = !sparse && g_tree_on != 0 && rows <= 16;
-  const unsigned ancestry = tree_on ? g_tree_mask[r] : 0u;
+  const bool sparse_tree = sparse && g_tree_on != 0 && rows <= 16;
+  const unsigned ancestry = (tree_on || sparse_tree) ? g_tree_mask[r] : 0u;
+  const unsigned tree_base = g_tree_base;
   const bool live = sparse ? start < n : start <= limit;
   auto load_kv = [&](int tile) {
     __nv_bfloat16* dst = kvs + (tile & 1) * KT * LW;
@@ -116,7 +119,8 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
       for (int idx = t; idx < KT * PER_ROW; idx += blockDim.x) {
         const int key = idx / PER_ROW, chunk = idx % PER_ROW;
         const int64_t ki = first + key;
-        const bool ok = sparse ? ki < n : (ki < (int64_t)pos[0] || ((ki - (int64_t)pos[0]) <= r && (!tree_on || ((ancestry >> (ki - (int64_t)pos[0])) & 1u) != 0)));
+        const bool ok = sparse ? (ki < n && (!sparse_tree || ((int64_t)tok[r * w + ki] < (int64_t)tree_base || ((int64_t)tok[r * w + ki] - (int64_t)tree_base) <= 15 && ((ancestry >> ((int64_t)tok[r * w + ki] - (int64_t)tree_base)) & 1u) != 0)))
+                                : (ki < (int64_t)pos[0] || ((ki - (int64_t)pos[0]) <= r && (!tree_on || ((ancestry >> (ki - (int64_t)pos[0])) & 1u) != 0)));
         const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
         if (chunk < CHUNKS)
           cp16(stage + key * RB8 + chunk * 16, lc8 + src * RB + chunk * 16, ok);
@@ -127,7 +131,8 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
       for (int idx = t; idx < KT * (LW / 8); idx += blockDim.x) {
         const int key = idx / (LW / 8), u = idx % (LW / 8);
         const int64_t ki = first + key;
-        const bool ok = sparse ? ki < n : (ki < (int64_t)pos[0] || ((ki - (int64_t)pos[0]) <= r && (!tree_on || ((ancestry >> (ki - (int64_t)pos[0])) & 1u) != 0)));
+        const bool ok = sparse ? (ki < n && (!sparse_tree || ((int64_t)tok[r * w + ki] < (int64_t)tree_base || ((int64_t)tok[r * w + ki] - (int64_t)tree_base) <= 15 && ((ancestry >> ((int64_t)tok[r * w + ki] - (int64_t)tree_base)) & 1u) != 0)))
+                                : (ki < (int64_t)pos[0] || ((ki - (int64_t)pos[0]) <= r && (!tree_on || ((ancestry >> (ki - (int64_t)pos[0])) & 1u) != 0)));
         const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
         cp16(dst + wide(key, u), lc + src * LW + u * 8, ok);
       }
@@ -152,7 +157,8 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
           ? __nv_bfloat16(*reinterpret_cast<const __nv_fp8_e4m3*>(scales + key * 32 + (u >> 4)))
           : __nv_bfloat16([&] {
               const int64_t ki = cfirst + key;
-              const bool ok = sparse ? ki < n : (ki < (int64_t)pos[0] || ((ki - (int64_t)pos[0]) <= r && (!tree_on || ((ancestry >> (ki - (int64_t)pos[0])) & 1u) != 0)));
+              const bool ok = sparse ? (ki < n && (!sparse_tree || ((int64_t)tok[r * w + ki] < (int64_t)tree_base || ((int64_t)tok[r * w + ki] - (int64_t)tree_base) <= 15 && ((ancestry >> ((int64_t)tok[r * w + ki] - (int64_t)tree_base)) & 1u) != 0)))
+                                : (ki < (int64_t)pos[0] || ((ki - (int64_t)pos[0]) <= r && (!tree_on || ((ancestry >> (ki - (int64_t)pos[0])) & 1u) != 0)));
               const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
               __nv_fp8_e4m3 s8;
               *reinterpret_cast<unsigned char*>(&s8) = *(lc8 + src * RB + (LW >> 1) + (u >> 4));
@@ -206,7 +212,8 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
       }
       for (int e = 0; e < 2; ++e) {
         const int64_t ki = first + kg * 8 + q * 2 + e;
-        const bool ok = sparse ? ki < n : (ki < (int64_t)pos[0] || ((ki - (int64_t)pos[0]) <= r && (!tree_on || ((ancestry >> (ki - (int64_t)pos[0])) & 1u) != 0)));
+        const bool ok = sparse ? (ki < n && (!sparse_tree || ((int64_t)tok[r * w + ki] < (int64_t)tree_base || ((int64_t)tok[r * w + ki] - (int64_t)tree_base) <= 15 && ((ancestry >> ((int64_t)tok[r * w + ki] - (int64_t)tree_base)) & 1u) != 0)))
+                                : (ki < (int64_t)pos[0] || ((ki - (int64_t)pos[0]) <= r && (!tree_on || ((ancestry >> (ki - (int64_t)pos[0])) & 1u) != 0)));
         sc[e] = ok ? __fmul_rn(acc[e], scale) : -INFINITY;
         sc[e + 2] = ok ? __fmul_rn(acc[e + 2], scale) : -INFINITY;
       }
@@ -234,7 +241,8 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
           float p[2];
           for (int e = 0; e < 2; ++e) {
             const int64_t ki = first + kg * 8 + q * 2 + e;
-            const bool ok = sparse ? ki < n : (ki < (int64_t)pos[0] || ((ki - (int64_t)pos[0]) <= r && (!tree_on || ((ancestry >> (ki - (int64_t)pos[0])) & 1u) != 0)));
+            const bool ok = sparse ? (ki < n && (!sparse_tree || ((int64_t)tok[r * w + ki] < (int64_t)tree_base || ((int64_t)tok[r * w + ki] - (int64_t)tree_base) <= 15 && ((ancestry >> ((int64_t)tok[r * w + ki] - (int64_t)tree_base)) & 1u) != 0)))
+                                : (ki < (int64_t)pos[0] || ((ki - (int64_t)pos[0]) <= r && (!tree_on || ((ancestry >> (ki - (int64_t)pos[0])) & 1u) != 0)));
             p[e] = active && ok ? glm_triton::exp_approx(sc[hf * 2 + e] - nm) : 0.0f;
           }
           const int hr = i * 16 + hf * 8 + g, col = kg * 8 + q * 2;

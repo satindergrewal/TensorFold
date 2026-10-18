@@ -72,6 +72,7 @@ pub const Engine = struct {
     comm: cuda.nccl.Comm,
     shm: ?fw.Shm = null, // liumorrisclaw's host-staged gather arena (TF_GLM_SHM_GATHER=1)
     shm_seq: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0, .len = 0, .borrowed = true },
+    tree_base_ptr: u64 = 0, // TF_GLM_TREE_TEST: g_tree_base address, written per round
     settings: ranks.Settings,
     m: fw.Modules,
     stream: cuda.Stream,
@@ -351,7 +352,11 @@ pub const Engine = struct {
         try e.d.check(e.d.api.cuMemcpyHtoD_v2(on_ptr, &one, 4), "tree on");
         try e.d.check(e.d.api.cuMemcpyHtoD_v2(mask_ptr, &masks, masks.len * 4), "tree mask");
         try e.d.check(e.d.api.cuMemcpyHtoD_v2(pos_ptr, &slots, slots.len * 4), "tree positions");
-        std.log.info("glm: tree test globals {x}/{x}/{x} (chain-equivalence gate)", .{ on_ptr, mask_ptr, pos_ptr });
+        var base_ptr: u64 = 0;
+        var base_len: usize = 0;
+        try e.d.check(e.d.api.cuModuleGetGlobal_v2(&base_ptr, &base_len, mod, "g_tree_base"), "g_tree_base");
+        e.tree_base_ptr = base_ptr;
+        std.log.info("glm: tree test globals {x}/{x}/{x}/{x} (chain-equivalence gate)", .{ on_ptr, mask_ptr, pos_ptr, base_ptr });
     }
 
     /// TF_GLM_L2PF: the pieces table (i64 [n][2]) and per-(layer, site) ranges. Site 'a' (the mixer gather)
@@ -683,6 +688,10 @@ pub const Engine = struct {
 
     /// A verify window: `ids` (pending token, then drafts) at the committed position; `out[r]` drawn at pos + 1 + r.
     pub fn verify(e: *Engine, ids: []const u32, out: []u32) !void {
+        if (e.tree_base_ptr != 0) {
+            const base: u32 = @intCast(e.cur.st.pos);
+            try e.d.check(e.d.api.cuMemcpyHtoDAsync_v2(e.tree_base_ptr, &base, 4, e.stream.handle), "tree base");
+        }
         if (ids.len == 0 or ids.len > fw.window_rows) return error.WindowTooWide;
         const nch_now = @min(latent.chunksFor(e.cur.st.pos + ids.len), e.bd.nch);
         // graphs cover the dense window (pos + rows below the key width, static grids) and the
