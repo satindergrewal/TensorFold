@@ -320,6 +320,7 @@ constexpr uint32_t SHM_GAVE_UP = 0x80000000u;
 struct alignas(256) ShmLayout {
     volatile unsigned int arrival[SHM_STAGES][4][SHM_WORLD]; // [stage][block][rank] = generation tag
     volatile unsigned long long failure[SHM_WORLD];
+    volatile unsigned long long arena[SHM_WORLD]; // offset 80: each rank's state-arena base (P2P gather)
 };
 
 }  // namespace
@@ -381,6 +382,53 @@ extern "C" __global__ void __launch_bounds__(256, 1) tf_shm_gather_f32(const flo
     if (tid == 0) seq[b] = gen;
 }
 
+
+// TF_GLM_PEER_GATHER: the same one-shot gather with the data over PCIe peer stores instead of the host
+// arena - each rank writes its slice straight into the peer's device buffer, and only the arrival flag
+// crosses host memory. The peer's buffer address is the peer's published state-arena base plus this
+// rank's offset inside its own arena (the layouts are identical). TF_CUDA_PEER must have enabled access.
+extern "C" __global__ void __launch_bounds__(256, 1) tf_peer_gather_f32(const float* __restrict__ slice,
+        float* __restrict__ out, float* __restrict__ peer_out, unsigned char* __restrict__ base,
+        unsigned int* __restrict__ seq, int rank, long long nunits, unsigned long long budget) {
+    ShmLayout* lay = reinterpret_cast<ShmLayout*>(base);
+    const int b = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int nt = blockDim.x;
+    const unsigned int gen = seq[b] + 1u;
+    const int stage = static_cast<int>(gen & 1u);
+    const long long span = (nunits + gridDim.x - 1) / gridDim.x;
+    const long long first = static_cast<long long>(b) * span;
+    const long long last = (first + span) < nunits ? (first + span) : nunits;
+    float* const mine = out + static_cast<long long>(rank) * nunits;
+    float* const theirs = peer_out + static_cast<long long>(rank) * nunits;
+    for (long long i = first + tid; i < last; i += nt) {
+        const float v = slice[i];
+        mine[i] = v;    // this rank's half stays local
+        theirs[i] = v;  // and lands in the peer's buffer over PCIe
+    }
+    __threadfence_system();
+    __shared__ int gave_up;
+    if (tid == 0) lay->arrival[stage][b][rank] = gen;
+    if (tid == 0) gave_up = 0;
+    __syncthreads();
+    if (tid == SHM_WORLD - 1 - rank) {
+        volatile unsigned int* word = &lay->arrival[stage][b][tid];
+        const long long t0 = clock64();
+        while (*word != gen) {
+            if ((unsigned long long)(clock64() - t0) > budget) {
+                lay->arrival[stage][b][rank] = gen | SHM_GAVE_UP;
+                lay->failure[rank] = ((unsigned long long)gen << 1) | 1ULL;
+                gave_up = 1;
+                break;
+            }
+#if __CUDA_ARCH__ >= 700
+            __nanosleep(32);
+#endif
+        }
+    }
+    __syncthreads();
+    if (tid == 0) seq[b] = gen;
+}
 
 // -- L2 prefetch of the next kernels' weights in decode windows (TF_GLM_L2PF, off by default) ----------------------
 // A small kernel on a side stream asks the memory system for the weights the main stream reads next while it waits

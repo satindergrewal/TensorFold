@@ -290,15 +290,37 @@ pub const Engine = struct {
         var z: [16]u8 = @splat(0);
         try seq.upload(0, &z);
         const fnp = try e.m.mods[6].function("tf_shm_gather_f32");
+        const peer_fn: ?cuda.Function = e.m.mods[6].function("tf_peer_gather_f32") catch null;
         e.shm = .{
             .base = dev_ptr,
+            .host = @intFromPtr(mapped.ptr),
             .seq = seq.ptr,
             .gather_fn = fnp,
+            .peer_fn = peer_fn,
             .rank = @intCast(e.share.rank),
             .slot_units = slot_units,
             .lib = e.lib,
             .comm = e.comm,
         };
+        // TF_GLM_PEER_GATHER: publish this rank's state-arena base at the arena header's +80 slot and
+        // pick up the peer's (a boot-time rendezvous: both ranks reach it before serving).
+        if (peer_fn != null and std.c.getenv("TF_GLM_PEER_GATHER") != null and e.seqs.items.len > 0) {
+            if (e.seqs.items[0]) |q| {
+                const base = q.st.arena.buf.ptr;
+                const words: [*]volatile u64 = @ptrCast(@alignCast(mapped.ptr + 80));
+                words[e.share.rank] = base;
+                e.shm.?.mine_arena = base;
+                e.shm.?.arena_len = q.st.arena.buf.len;
+                const peer = 1 - e.share.rank;
+                const t0 = profNow2();
+                while (words[peer] == 0) {
+                    if (profNow2() -| t0 > 3_000_000_000) break;
+                    std.atomic.spinLoopHint();
+                }
+                if (words[peer] != 0) e.shm.?.peer_arena = words[peer];
+                std.log.info("glm: peer gather {s} (arena {x} peer {x})", .{ if (e.shm.?.peer_arena != 0) "on" else "off", base, e.shm.?.peer_arena });
+            }
+        }
         e.shm_seq = seq;
         std.log.info("glm: shm gather arena ready (slot {d} units, dev {x})", .{ slot_units, dev_ptr });
     }

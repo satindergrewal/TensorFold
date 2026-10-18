@@ -154,8 +154,13 @@ const rows_one_stream: usize = 8 * 4096;
 
 pub const Shm = struct {
     base: u64, // the device view of the shared, host-registered arena
+    host: u64 = 0, // its host view (the arena bases sit at +80, P2P gather)
     seq: u64, // per-block generation counters (device u32[4], the kernel advances them)
     gather_fn: cuda.Function,
+    peer_fn: ?cuda.Function = null, // TF_GLM_PEER_GATHER's peer-store variant
+    mine_arena: u64 = 0, // this rank's state-arena base
+    peer_arena: u64 = 0, // the peer's, once published
+    arena_len: usize = 0,
     rank: u32,
     slot_units: usize, // one rank's stage slot in fp32 units
     lib: *const cuda.nccl.Library, // the NCCL fallback above the slot
@@ -257,7 +262,22 @@ pub const Forward = struct {
             .shm => |sh| {
                 const r = f.ranks[0];
                 const count = rows * c.hidden;
-                if (count <= sh.slot_units) { // any decode-sized payload: the old solo-corruption was the split-exchange bug (fixed), not this kernel
+                const mine = r.b.gathered;
+                const peering = sh.peer_fn != null and sh.peer_arena != 0 and
+                    mine >= sh.mine_arena and mine + bytes <= sh.mine_arena + sh.arena_len;
+                if (count <= sh.slot_units and peering) {
+                    // data straight into the peer's buffer; only the arrival flag is host memory
+                    var a: cuda.Args = .{};
+                    a.add(mine + r.w.share.rank * bytes);
+                    a.add(mine);
+                    a.add(sh.peer_arena + (mine - sh.mine_arena));
+                    a.add(sh.base);
+                    a.add(sh.seq);
+                    a.add(@as(c_int, @intCast(sh.rank)));
+                    a.add(@as(i64, @intCast(count)));
+                    a.add(@as(c_longlong, 2_000_000_000));
+                    try cuda.launch.launch(sh.peer_fn.?, .{ .grid = .{ .x = 4 }, .block = .{ .x = 256 } }, f.stream, &a);
+                } else if (count <= sh.slot_units) { // any decode-sized payload: the old solo-corruption was the split-exchange bug (fixed), not this kernel
                     // multi-stream only: the engine's single-stream shm path corrupts (deterministic;
                     // the standalone kernel + graph test passes, so it's the engine integration)
                     var a: cuda.Args = .{};
