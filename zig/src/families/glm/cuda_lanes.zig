@@ -286,19 +286,22 @@ pub const Lanes = struct {
             if (path.len == 0) return error.EmptyPath;
             const l = self.lanes.getPtr(w.stream) orelse return error.UnknownStream;
             try self.x.bind(l.slot);
-            var prefix = true;
-            for (path, 0..) |r, i| if (r != i) {
-                prefix = false;
-                break;
-            };
-            if (prefix) {
-                try self.x.keep(path.len);
-            } else {
-                if (tree_logs < 12) {
-                    tree_logs += 1;
-                    std.log.info("glm tree: keep path {any} of rows {d}", .{ path, w.rows() });
+            // only a window still uncommitted settles here; a shared round may already have done it
+            if (l.pending_rows != null) {
+                var prefix = true;
+                for (path, 0..) |r, i| if (r != i) {
+                    prefix = false;
+                    break;
+                };
+                if (prefix) {
+                    try self.x.keep(path.len);
+                } else {
+                    if (tree_logs < 12) {
+                        tree_logs += 1;
+                        std.log.info("glm tree: keep path {any} of rows {d}", .{ path, w.rows() });
+                    }
+                    try self.x.keepPath(path);
                 }
-                try self.x.keepPath(path);
             }
             l.pending_rows = null;
         }
