@@ -93,7 +93,15 @@ pub fn extendCosts(gpa: Allocator, costs: []const Cost, rows: u32) !Table {
         if (find(measured, total)) |ms| {
             value = ms;
         } else if (total > widest.width) {
-            value = widest.ms * @as(f64, @floatFromInt(total)) / @as(f64, @floatFromInt(widest.width));
+            // a round's cost grows by its measured per-row slope past the timed widths (weight-bound:
+            // ~0.12 ms a row), NOT proportionally through the origin - that read 1.2 ms a row and priced
+            // a shared round's drafts out (the allocator granted 1-2 streams a draft where the curve paid)
+            const n = measured.len;
+            const slope: f64 = if (n >= 2)
+                (widest.ms - measured[n - 2].ms) / @as(f64, @floatFromInt(widest.width - measured[n - 2].width))
+            else
+                widest.ms / @as(f64, @floatFromInt(widest.width));
+            value = widest.ms + slope * @as(f64, @floatFromInt(total - widest.width));
         } else {
             var above: Cost = undefined;
             for (measured) |c| {

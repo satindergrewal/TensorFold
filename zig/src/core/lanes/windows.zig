@@ -165,6 +165,8 @@ pub fn anySampled(plans: []const Plan) bool {
 }
 
 /// Trim draft prefixes by landing probability to the shared width with the most expected tokens a ms.
+var alloc_logs: u32 = 0;
+
 pub fn allocate(e: *Engine, plans: []Plan) !void {
     const a = e.arena.allocator();
     const fixed = try a.alloc(u32, plans.len);
@@ -183,6 +185,12 @@ pub fn allocate(e: *Engine, plans: []Plan) !void {
         }
     }
     const counts = try alloc.allocate(a, fixed, probs, &e.cfg.shared_costs, e.rule.overheadMs(plans.len, anySampled(plans)), @max(plans.len, e.cfg.batch_rows));
+    if (std.c.getenv("TF_GLM_ALLOC_LOG") != null and alloc_logs < 16) {
+        alloc_logs += 1;
+        std.debug.print("ALLOC streams={d} batch={d}:", .{ plans.len, @max(plans.len, e.cfg.batch_rows) });
+        for (plans, counts) |p, c| std.debug.print(" [{s} n={d} grant={d}]", .{ @tagName(p.kind), p.count(), c });
+        std.debug.print("\n", .{});
+    }
     for (plans, probs, counts) |*p, chances, c| {
         if (p.kind == .head) p.stream.granted = c;
         if (chances.len == 0 or c == chances.len) continue;

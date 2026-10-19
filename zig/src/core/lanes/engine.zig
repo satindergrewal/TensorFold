@@ -437,9 +437,14 @@ pub const Engine = struct {
     }
 
     /// Read the kept rows with their following tokens and ask the head for the next round's drafts.
+    var draft_logs: u32 = 0;
     fn draftLate(e: *Engine, s: *Stream, start: u64, follow: []const u32, path: []const u32, budget: ?i64) !void {
         var w = win.who(s);
         const d: u32 = @intCast(try e.rule.headDepth(&w, budget, win.probe(e)));
+        if (std.c.getenv("TF_GLM_ALLOC_LOG") != null and draft_logs < 16) {
+            draft_logs += 1;
+            std.debug.print("DRAFT depth={d} room={d}\n", .{ d, w.draft_room });
+        }
         try e.askDrafts(&.{.{ .stream = s, .follow = follow, .rows = path, .start = start, .position = s.cache_len + 1, .depth = d }});
     }
 

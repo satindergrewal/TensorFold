@@ -54,6 +54,8 @@ fn forcedDepth() ?i64 {
     return if (n >= 1) n else null;
 }
 
+var budget_logs: u32 = 0;
+
 pub const Rule = struct {
     gpa: Allocator,
     k: Constants = .{},
@@ -233,6 +235,14 @@ pub const Rule = struct {
         // drafts priced by their head steps: an overhead that held them would favour the depths it was measured at
         const head: alloc.HeadCost = .{ .step_ms = r.mtp_step_ms, .batched = r.batched_heads };
         const counts = try alloc.allocateDrafts(r.gpa, ones, probs, r.shared_costs, r.fixedMs(whos.len, sampled), @max(whos.len, r.batch_rows), head);
+        if (std.c.getenv("TF_GLM_ALLOC_LOG") != null and budget_logs < 10) {
+            budget_logs += 1;
+            for (probs, counts, 0..) |pr, c, i| {
+                std.debug.print("BUDGET s={d} len={d} grant={d} p=", .{ i, pr.len, c });
+                for (pr) |x| std.debug.print("{d:.2} ", .{x});
+                std.debug.print("\n", .{});
+            }
+        }
         defer r.gpa.free(counts);
         if (r.plain_guard) {
             // no draft where none pays; a probe after a growing run of plain rounds

@@ -88,6 +88,10 @@ pub const Lanes = struct {
             .batch_rows = if (sharing) engine.shared_rows else 0,
             .max_streams = if (sharing) engine.max_shared else 1,
             .plain_guard = drafting, // a draft row rides the same weights-bound round a plain row does
+            // the acceptance the per-8 NVFP4 cache actually shows (solo: 6.9 tokens a round at depth 7 ~ 0.93 a
+            // step); the default prior (0.85, 0.75, 0.70...) priced shared drafts to ~1.7 a stream and the
+            // streams never drafted deep enough to measure it
+            .draft_prior = &.{ 0.95, 0.93, 0.90, 0.87, 0.84, 0.80, 0.75 },
             .head_trees = std.c.getenv("TF_GLM_TREE") != null,
             .head_lanes = if (std.c.getenv("TF_GLM_LANES")) |v| (std.fmt.parseInt(u32, std.mem.span(v), 10) catch 0) else 0,
             .lane_costs = if (drafting) &window_costs else &.{},
