@@ -98,7 +98,7 @@ pub fn mm16On() bool {
 
 var mm16_on: ?bool = null;
 
-pub const Set = struct { glue: *const Kernels, linear: cuda.qlinear.Linear = .{}, copy_rows: ?cuda.Function = null };
+pub const Set = struct { glue: *const Kernels, linear: cuda.qlinear.Linear = .{}, copy_rows: ?cuda.Function = null, bf16_kv: bool = false };
 
 /// Our glm_glue.cu's functions.
 pub const Kernels = struct {

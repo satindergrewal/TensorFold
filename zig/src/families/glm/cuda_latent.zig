@@ -50,7 +50,7 @@ pub fn expandV(set: glue.Set, stream: cuda.Stream, ol: u64, wv: u64, out: u64, r
 pub fn latentWrite(set: glue.Set, stream: cuda.Stream, lat: u64, lat_stride: usize, cache: u64, pos: u64, rows: usize, lw: usize) !void {
     var a: cuda.Args = .{};
     inline for (.{ lat, @as(i64, @intCast(lat_stride)), cache, pos, @as(i64, @intCast(lw)) }) |v| a.add(v);
-    if (set.glue.lat_write_nvfp4) |fnv| {
+    if (!set.bf16_kv) if (set.glue.lat_write_nvfp4) |fnv| {
         var c: cuda.Args = .{};
         c.add(lat);
         c.add(@as(i64, @intCast(lat_stride)));
@@ -59,8 +59,8 @@ pub fn latentWrite(set: glue.Set, stream: cuda.Stream, lat: u64, lat_stride: usi
         c.add(@as(i64, @intCast(lw)));
         try cuda.launch.launch(fnv, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 32 } }, stream, &c);
         return;
-    }
-    if (set.glue.lat_write_fp8) |f8| {
+    };
+    if (!set.bf16_kv) if (set.glue.lat_write_fp8) |f8| {
         var b: cuda.Args = .{};
         b.add(lat);
         b.add(@as(i64, @intCast(lat_stride)));
@@ -69,7 +69,7 @@ pub fn latentWrite(set: glue.Set, stream: cuda.Stream, lat: u64, lat_stride: usi
         b.add(@as(i64, @intCast(lw)));
         try cuda.launch.launch(f8, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 128 } }, stream, &b);
         return;
-    }
+    };
     try cuda.launch.launch(set.glue.lat_write, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 128 } }, stream, &a);
 }
 
@@ -86,6 +86,7 @@ var lat_driver: ?*const cuda.Driver = null;
 pub fn setDriver(d: *const cuda.Driver) void { lat_driver = d; }
 
 fn dequantFor(set: glue.Set, stream: cuda.Stream, cache_fp8: u64, start: usize, count: usize, lw: usize) !u64 {
+    if (set.bf16_kv) return cache_fp8;
     if (set.glue.lat_dequant_nvfp4) |dnv| {
         if (lat_scratch == null or scratch_units < count * lw) {
             if (lat_scratch) |*b| b.free();
@@ -139,17 +140,38 @@ fn launchBf16(f: cuda.Function, stream: cuda.Stream, qa: u64, cache: u64, pos: u
 }
 
 pub fn attention(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, pos: u64, p: Partials, out: u64, dummy: u64, rows: usize, heads: usize, lw: usize, nch: usize, scale: f32, hb: usize) !void {
+    if (set.bf16_kv) {
+        // a bf16 cache (the MTP head's own plane): the plain bf16 kernels, as the BF16 engine runs them
+        if (rows <= 8) {
+            const nch32 = nch * 16;
+            const f = set.glue.chunks_16_s32 orelse return error.NoSlicedKernel;
+            try launchBf16(f, stream, qa, cache, pos, 0, 0, p, rows, heads, lw, nch32, 0, scale, heads_tile, false);
+            try merge(set, stream, p, out, dummy, rows, heads, lw, nch32, false);
+        } else {
+            try chunks(set, stream, qa, cache, pos, 0, set.glue.tree_mask, p, rows, heads, lw, nch, 0, scale, hb, false);
+            try merge(set, stream, p, out, dummy, rows, heads, lw, nch, false);
+        }
+        return;
+    }
     // fp8: dequantize the dense range into a bf16 scratch the original kernel reads
     // direct NVFP4 attention: no dequant, the chunks kernel reads e2m1 + scales inline
     if (rows <= 8) { // a solo decode window: one 32-row tile a block instead of a 16-tile serial chain
         const nch32 = nch * 16; // over-covers the last chunk; empty slices merge as -inf
         if (set.glue.chunks16_nvfp4_s32) |f| {
             try launchNvfp4(f, stream, qa, cache, pos, 0, set.glue.tree_mask, p, rows, heads, lw, nch32, 0, scale, heads_tile, false, true);
-        } else if (set.glue.chunks_16_s32) |f| {
-            try launchBf16(f, stream, qa, cache, pos, 0, 0, p, rows, heads, lw, nch32, 0, scale, heads_tile, false);
-        } else return error.NoSlicedKernel;
-        try merge(set, stream, p, out, dummy, rows, heads, lw, nch32, false);
-        return;
+            try merge(set, stream, p, out, dummy, rows, heads, lw, nch32, false);
+            return;
+        }
+        // the sliced kernel reads the cache as bf16: a quantized cache (FP8) must dequantize first,
+        // so it falls through to the general path (the sliced path here read FP8 bytes as bf16)
+        if (set.glue.lat_dequant == null and set.glue.lat_dequant_nvfp4 == null) {
+            if (set.glue.chunks_16_s32) |f| {
+                try launchBf16(f, stream, qa, cache, pos, 0, 0, p, rows, heads, lw, nch32, 0, scale, heads_tile, false);
+                try merge(set, stream, p, out, dummy, rows, heads, lw, nch32, false);
+                return;
+            }
+            return error.NoSlicedKernel;
+        }
     }
     if (set.glue.chunks16_nvfp4) |f16v| {
         if (hb == heads_tile_wide and set.glue.chunks32_nvfp4 != null) {
@@ -161,7 +183,8 @@ pub fn attention(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, pos: u
         return;
     }
     var cache_bf16 = cache;
-    if (set.glue.lat_dequant != null or set.glue.lat_dequant_nvfp4 != null) cache_bf16 = try dequantFor(set, stream, cache, 0, nch * 128 + rows, lw);
+    // the chunks kernel walks 512-key chunks (CHW), not 128: the scratch must cover every key the grid reads
+    if (set.glue.lat_dequant != null or set.glue.lat_dequant_nvfp4 != null) cache_bf16 = try dequantFor(set, stream, cache, 0, nch * 512 + rows, lw);
     try chunks(set, stream, qa, cache_bf16, pos, 0, set.glue.tree_mask, p, rows, heads, lw, nch, 0, scale, hb, false);
     try merge(set, stream, p, out, dummy, rows, heads, lw, nch, false);
 }
@@ -183,17 +206,35 @@ fn chunks(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, pos: u64, tok
 /// latent.sparse_attention: rows with counts > 0 over their selected tokens (i32 [rows][w]); others left alone.
 pub fn sparseAttention(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, tokens: u64, counts: u64, w: usize, p: Partials, out: u64, rows: usize, heads: usize, lw: usize, scale: f32) !void {
     const nch = chunksFor(w);
+    if (set.bf16_kv) {
+        if (rows <= 8) {
+            const nch32 = (w + 31) / 32;
+            const f = set.glue.chunks_16_s32 orelse return error.NoSlicedKernel;
+            try launchBf16(f, stream, qa, cache, 0, tokens, counts, p, rows, heads, lw, nch32, w, scale, heads_tile, true);
+            try merge(set, stream, p, out, counts, rows, heads, lw, nch32, true);
+        } else {
+            try chunks(set, stream, qa, cache, 0, tokens, counts, p, rows, heads, lw, nch, w, scale, headBlock(rows), true);
+            try merge(set, stream, p, out, counts, rows, heads, lw, nch, true);
+        }
+        return;
+    }
     // fp8: dequantize the whole cache range the sparse tokens may select from
     // direct NVFP4 attention (sparse)
     if (rows <= 8) { // a solo decode window: one 32-row tile a block
         const nch32 = (w + 31) / 32;
         if (set.glue.chunks16_nvfp4_s32) |f| {
             try launchNvfp4(f, stream, qa, cache, 0, tokens, counts, p, rows, heads, lw, nch32, w, scale, heads_tile, true, true);
-        } else if (set.glue.chunks_16_s32) |f| {
-            try launchBf16(f, stream, qa, cache, 0, tokens, counts, p, rows, heads, lw, nch32, w, scale, heads_tile, true);
-        } else return error.NoSlicedKernel;
-        try merge(set, stream, p, out, counts, rows, heads, lw, nch32, true);
-        return;
+            try merge(set, stream, p, out, counts, rows, heads, lw, nch32, true);
+            return;
+        }
+        if (set.glue.lat_dequant == null and set.glue.lat_dequant_nvfp4 == null) {
+            if (set.glue.chunks_16_s32) |f| {
+                try launchBf16(f, stream, qa, cache, 0, tokens, counts, p, rows, heads, lw, nch32, w, scale, heads_tile, true);
+                try merge(set, stream, p, out, counts, rows, heads, lw, nch32, true);
+                return;
+            }
+            return error.NoSlicedKernel;
+        }
     }
     if (set.glue.chunks16_nvfp4) |f16v| {
         if (headBlock(rows) == heads_tile_wide and set.glue.chunks32_nvfp4 != null) {

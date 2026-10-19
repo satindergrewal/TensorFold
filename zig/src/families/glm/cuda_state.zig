@@ -281,7 +281,10 @@ pub const State = struct {
             if (std.c.getenv("TF_GLM_KV_FP8") != null) break :blk capacity * c.kv_lora; // 512 B/row
             break :blk capacity * c.kv_lora * 2; // 1024 B/row (bf16)
         };
-        for (0..nd + 1) |_| try sizes.appendSlice(gpa, &.{ lat_bytes, capacity * c.i_dim * 2, capacity * c.i_dim * 2, pk_rows * c.i_dim * 2 });
+        for (0..nd) |_| try sizes.appendSlice(gpa, &.{ lat_bytes, capacity * c.i_dim * 2, capacity * c.i_dim * 2, pk_rows * c.i_dim * 2 });
+        // the MTP head's own plane stays bf16: its drafts must track the target's distribution, and a
+        // quantized draft KV collapsed acceptance (92% -> 56% under TF_GLM_KV_NVFP4) and with it the round
+        try sizes.appendSlice(gpa, &.{ capacity * c.kv_lora * 2, capacity * c.i_dim * 2, capacity * c.i_dim * 2, pk_rows * c.i_dim * 2 });
         try sizes.append(gpa, 4); // the MTP head's position
         const p = try gpa.alloc(u64, sizes.items.len);
         defer gpa.free(p);

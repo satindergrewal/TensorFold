@@ -978,7 +978,9 @@ pub const Forward = struct {
             try b16.proj(f.set(), f.stream, b.mcat, 2 * D, m.eh, b.mx, b.kda.mm_part, n, D, 2 * D, false);
             try glue.rmsnorm(f.set(), f.stream, b.mx, D, m.layer.in_norm, b.normed, D, b.xs, c.eps, n, D);
             const nch = @min(latent.chunksFor(r.st.mtp_len + n), b.nch);
-            try dsa_block.block(.{ .set = f.set(), .ops = f.m.ops() }, f.stream, m.layer.mixer.mla, r.st.mtp_caches, b.dsa, b.normed, D, n, r.st.mtp_pos_dev, r.st.mtp_len, nch, b.part_rows, slot(r, n));
+            var mset = f.set();
+            mset.bf16_kv = true; // the draft head's plane is bf16 even when the target's KV is NVFP4/FP8
+            try dsa_block.block(.{ .set = mset, .ops = f.m.ops() }, f.stream, m.layer.mixer.mla, r.st.mtp_caches, b.dsa, b.normed, D, n, r.st.mtp_pos_dev, r.st.mtp_len, nch, b.part_rows, slot(r, n));
         }
         try f.gather(n);
         for (f.ranks) |r| {
@@ -1023,7 +1025,9 @@ pub const Forward = struct {
             try b16.proj(f.set(), f.stream, b.mcat, 2 * D, m.eh, b.mx, b.kda.mm_part, n, D, 2 * D, false);
             try glue.rmsnorm(f.set(), f.stream, b.mx, D, m.layer.in_norm, b.normed, D, b.xs, c.eps, n, D);
             const nch = @min(latent.chunksFor(r.st.mtp_len + n), b.nch);
-            try dsa_block.block(.{ .set = f.set(), .ops = f.m.ops() }, f.stream, m.layer.mixer.mla, r.st.mtp_caches, b.dsa, b.normed, D, n, r.st.mtp_pos_dev, r.st.mtp_len, nch, b.part_rows, slot(r, n));
+            var mset = f.set();
+            mset.bf16_kv = true; // the draft head's plane is bf16 even when the target's KV is NVFP4/FP8
+            try dsa_block.block(.{ .set = mset, .ops = f.m.ops() }, f.stream, m.layer.mixer.mla, r.st.mtp_caches, b.dsa, b.normed, D, n, r.st.mtp_pos_dev, r.st.mtp_len, nch, b.part_rows, slot(r, n));
         }
         try f.gather(n);
         for (f.ranks) |r| {
