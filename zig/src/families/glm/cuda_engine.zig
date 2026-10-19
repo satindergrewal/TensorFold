@@ -854,8 +854,21 @@ pub const Engine = struct {
     }
 
     /// Several streams' windows in one forward: shared row ops, per-part attention and KDA.
+    /// Free every captured verify graph (a server that shares rounds keeps none).
+    pub fn dropVerifyGraphs(e: *Engine) void {
+        if (e.graphs.count() == 0) return;
+        var it = e.graphs.valueIterator();
+        while (it.next()) |g| g.exec.deinit();
+        e.graphs.clearRetainingCapacity();
+    }
+
     pub fn verifyShared(e: *Engine, parts: []const Part) !void {
         const b = if (e.bs) |*x| x else return error.NoSharedWindows;
+        // a shared round interleaves the streams' KDA states; a solo graph captured before it bakes
+        // key state (parity/nch) that no longer describes the device state afterwards - the last
+        // streams of an 8-stream request faulted at token 1018 their first solo round (CUDA_ERROR_
+        // ILLEGAL_ADDRESS, reproduced with graphs alone). A sharing server runs eager.
+        e.dropVerifyGraphs();
         if (parts.len == 0 or parts.len > max_shared) return error.WindowTooWide;
         var segs: [max_shared]fw.Seg = undefined;
         var ids: [shared_rows]u32 = undefined;
