@@ -43,7 +43,7 @@ pub const LinkLayout = struct {
     n: u32, // ids count
     _pad: u32,
     hdr: [64]u8, // the Header bytes
-    ids: [1024]u32,
+    ids: [2049]u32, // a prefill chunk (2,048 rows) plus the chunk command lookahead; 1024 refused every prompt past ~1k tokens (TooManyIds)
 };
 
 const Arena = struct {
