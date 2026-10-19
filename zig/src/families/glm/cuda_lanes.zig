@@ -20,7 +20,7 @@ pub const max_rows = 1 + engine.max_drafts;
 /// NCCL SHM). Depth-rule seeds only - observeCost replaces them with measured round times as depths are tried.
 const window_costs: [max_rows]lanes.config.Cost = blk: {
     var c: [max_rows]lanes.config.Cost = undefined;
-    for (&c, 0..) |*x, i| x.* = .{ .width = i + 1, .ms = 17.0 + 0.4 * @as(f64, @floatFromInt(i)) };
+    for (&c, 0..) |*x, i| x.* = .{ .width = i + 1, .ms = 17.0 + 0.12 * @as(f64, @floatFromInt(i)) }; // rows are near-free (weight-bound round): 0.4 priced shared drafts to ~1.6 a stream
     break :blk c;
 };
 
