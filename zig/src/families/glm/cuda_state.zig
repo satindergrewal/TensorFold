@@ -277,7 +277,7 @@ pub const State = struct {
         try sizes.appendSlice(gpa, &.{ 4, nk * 3 * 3 * n * 2, 2 * nk * s.kda.len() * kda.dk * kda.dv * 4, nk * window_rows * kw * 2 });
         try sizes.appendSlice(gpa, &.{ nk * window_rows * n * 4, nk * window_rows * n * 2, nk * window_rows * n * 4, nk * window_rows * s.kda.len() * 4 });
         const lat_bytes: usize = blk: {
-            if (std.c.getenv("TF_GLM_KV_NVFP4") != null) break :blk capacity * (c.kv_lora / 2 + c.kv_lora / 16); // 288 B/row
+            if (std.c.getenv("TF_GLM_KV_NVFP4") != null) break :blk capacity * (c.kv_lora / 2 + c.kv_lora / 8); // 320 B/row (per-8 scales)
             if (std.c.getenv("TF_GLM_KV_FP8") != null) break :blk capacity * c.kv_lora; // 512 B/row
             break :blk capacity * c.kv_lora * 2; // 1024 B/row (bf16)
         };

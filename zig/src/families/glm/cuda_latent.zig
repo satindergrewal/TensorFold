@@ -140,6 +140,9 @@ fn launchBf16(f: cuda.Function, stream: cuda.Stream, qa: u64, cache: u64, pos: u
 }
 
 pub fn attention(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, pos: u64, p: Partials, out: u64, dummy: u64, rows: usize, heads: usize, lw: usize, nch: usize, scale: f32, hb: usize) !void {
+    // TF_GLM_KV_NVFP4_DEQ: read the quantized cache through the dequant + bf16 kernels (a parity check
+    // for the direct e2m1 attention layout)
+    const force_deq = std.c.getenv("TF_GLM_KV_NVFP4_DEQ") != null;
     if (set.bf16_kv) {
         // a bf16 cache (the MTP head's own plane): the plain bf16 kernels, as the BF16 engine runs them
         if (rows <= 8) {
@@ -155,7 +158,7 @@ pub fn attention(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, pos: u
     }
     // fp8: dequantize the dense range into a bf16 scratch the original kernel reads
     // direct NVFP4 attention: no dequant, the chunks kernel reads e2m1 + scales inline
-    if (rows <= 8) { // a solo decode window: one 32-row tile a block instead of a 16-tile serial chain
+    if (rows <= 8 and !force_deq) { // a solo decode window: one 32-row tile a block instead of a 16-tile serial chain
         const nch32 = nch * 16; // over-covers the last chunk; empty slices merge as -inf
         if (set.glue.chunks16_nvfp4_s32) |f| {
             try launchNvfp4(f, stream, qa, cache, pos, 0, set.glue.tree_mask, p, rows, heads, lw, nch32, 0, scale, heads_tile, false, true);
@@ -174,6 +177,7 @@ pub fn attention(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, pos: u
         }
     }
     if (set.glue.chunks16_nvfp4) |f16v| {
+        if (!force_deq) {
         if (hb == heads_tile_wide and set.glue.chunks32_nvfp4 != null) {
             try launchNvfp4(set.glue.chunks32_nvfp4.?, stream, qa, cache, pos, 0, set.glue.tree_mask, p, rows, heads, lw, nch, 0, scale, hb, false, false);
         } else {
@@ -181,6 +185,7 @@ pub fn attention(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, pos: u
         }
         try merge(set, stream, p, out, dummy, rows, heads, lw, nch, false);
         return;
+        }
     }
     var cache_bf16 = cache;
     // the chunks kernel walks 512-key chunks (CHW), not 128: the scratch must cover every key the grid reads

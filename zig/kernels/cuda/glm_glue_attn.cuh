@@ -93,8 +93,8 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
   constexpr bool SLICED = (CHW != CH);
   constexpr int STAGES = SLICED ? 1 : 2;  // a one-tile block never double-buffers
   unsigned char* staging = reinterpret_cast<unsigned char*>(stat + 2 * HB);  // e2m1 tiles, 16B-aligned end
-  // staging: [STAGES x KT x 256 packed e2m1][SLICED: KT x 32 e4m3 scales][16-entry bf16 LUT]
-  __nv_bfloat16* lut = reinterpret_cast<__nv_bfloat16*>(staging + STAGES * KT * (LW / 2) + (SLICED ? KT * 32 : 0));
+  // staging: [STAGES x KT x 256 packed e2m1][SLICED: KT x 64 e4m3 scales][16-entry bf16 LUT]
+  __nv_bfloat16* lut = reinterpret_cast<__nv_bfloat16*>(staging + STAGES * KT * (LW / 2) + (SLICED ? KT * 64 : 0));
   const int t = threadIdx.x, lane = t & 31, warp = t >> 5, g = lane >> 2, q = lane & 3;
   const int kg = warp & 3, hh = warp >> 2;
   const int64_t r = blockIdx.x, h0 = (int64_t)blockIdx.y * HB, c = blockIdx.z;
@@ -110,12 +110,12 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
     if (NVFP4) {
       // Stage 1: cp.async the packed e2m1 halves (256B per row) into staging; the pipeline overlaps
       // them with the previous tile's attention math. Source stride is the full 288-B cache row.
-      constexpr int RB = LW / 2 + LW / 16;  // cache row stride: 256 packed + 32 scale bytes
+      constexpr int RB = LW / 2 + LW / 8;   // cache row stride: 256 packed + 64 scale bytes (one an 8-value group)
       constexpr int RB8 = LW / 2;           // staged span: the packed bytes only
       constexpr int CHUNKS = RB8 / 16;      // 16 x 16B per row
       unsigned char* stage = staging + (tile % STAGES) * KT * RB8;
       const unsigned char* lc8 = reinterpret_cast<const unsigned char*>(lc);
-      constexpr int PER_ROW = CHUNKS + (SLICED ? 2 : 0);  // the sliced form also stages the row's scales
+      constexpr int PER_ROW = CHUNKS + (SLICED ? 4 : 0);  // the sliced form also stages the row's 64 scale bytes
       for (int idx = t; idx < KT * PER_ROW; idx += blockDim.x) {
         const int key = idx / PER_ROW, chunk = idx % PER_ROW;
         const int64_t ki = first + key;
@@ -125,7 +125,7 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
         if (chunk < CHUNKS)
           cp16(stage + key * RB8 + chunk * 16, lc8 + src * RB + chunk * 16, ok);
         else
-          cp16(stage + KT * RB8 + key * 32 + (chunk - CHUNKS) * 16, lc8 + src * RB + (LW >> 1) + (chunk - CHUNKS) * 16, ok);
+          cp16(stage + KT * RB8 + key * 64 + (chunk - CHUNKS) * 16, lc8 + src * RB + (LW >> 1) + (chunk - CHUNKS) * 16, ok);
       }
     } else {
       for (int idx = t; idx < KT * (LW / 8); idx += blockDim.x) {
@@ -140,7 +140,7 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
   };
   // NVFP4 stage 2: after the cp.async wait, convert staged e2m1+scales to bf16 in the swizzled layout.
   auto convert_kv = [&](int tile) {
-    constexpr int RB = LW / 2 + LW / 16;  // cache row stride
+    constexpr int RB = LW / 2 + LW / 8;   // cache row stride
     constexpr int RB8 = LW / 2;           // staged span
     __nv_bfloat16* dst = kvs + (tile & 1) * KT * LW;
     const unsigned char* stage = staging + (tile % STAGES) * KT * RB8;
@@ -154,14 +154,14 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
       const int key = idx / RB8, u = (idx % RB8) * 2;
       const unsigned char packed = stage[idx];
       const __nv_bfloat16 sc = SLICED
-          ? __nv_bfloat16(*reinterpret_cast<const __nv_fp8_e4m3*>(scales + key * 32 + (u >> 4)))
+          ? __nv_bfloat16(*reinterpret_cast<const __nv_fp8_e4m3*>(scales + key * 64 + (u >> 3)))
           : __nv_bfloat16([&] {
               const int64_t ki = cfirst + key;
               const bool ok = sparse ? (ki < n && (!sparse_tree || ((int64_t)tok[r * w + ki] < (int64_t)tree_base || ((int64_t)tok[r * w + ki] - (int64_t)tree_base) <= 15 && ((ancestry >> ((int64_t)tok[r * w + ki] - (int64_t)tree_base)) & 1u) != 0)))
                                 : (ki < (int64_t)pos[0] || ((ki - (int64_t)pos[0]) <= r && (!tree_on || ((ancestry >> (ki - (int64_t)pos[0])) & 1u) != 0)));
               const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
               __nv_fp8_e4m3 s8;
-              *reinterpret_cast<unsigned char*>(&s8) = *(lc8 + src * RB + (LW >> 1) + (u >> 4));
+              *reinterpret_cast<unsigned char*>(&s8) = *(lc8 + src * RB + (LW >> 1) + (u >> 3));
               return s8;
             }());
       dst[wide(key, u >> 3) + (u & 7)] = __hmul(lut[packed & 0xF], sc);

@@ -143,19 +143,19 @@ __device__ __forceinline__ unsigned char nvfp4_code(float v) {
 extern "C" __global__ void tf_glm_lat_write_nvfp4(const __nv_bfloat16* lat, int64_t lat_stride,
                                                     unsigned char* cache, const int* pos, int64_t lw) {
   const int64_t r = blockIdx.x, at = (int64_t)pos[0] + r;
-  const int64_t packed = lw / 2, scales = lw / 16;
+  const int64_t packed = lw / 2, scales = lw / 8;
   unsigned char* row_cache = cache + at * (packed + scales);
   unsigned char* codes = row_cache;
   unsigned char* sc = row_cache + packed;
   const __nv_bfloat16* src = lat + r * lat_stride;
-  // each thread handles one 16-value block: computes amax, scale, quantizes
+  // each thread handles one 8-value block: computes amax, scale, quantizes (64 scales a 512-value row)
   const int nblocks = (int)scales;
   for (int b = threadIdx.x; b < nblocks; b += blockDim.x) {
-    float vals[16];
+    float vals[8];
     float amax = 0.0f;
     #pragma unroll
-    for (int j = 0; j < 16; ++j) {
-      vals[j] = __bfloat162float(src[b * 16 + j]);
+    for (int j = 0; j < 8; ++j) {
+      vals[j] = __bfloat162float(src[b * 8 + j]);
       amax = fmaxf(amax, fabsf(vals[j]));
     }
     // e4m3 scale: amax / 6.0 (the max e2m1 magnitude), stored as a raw byte
@@ -165,12 +165,12 @@ extern "C" __global__ void tf_glm_lat_write_nvfp4(const __nv_bfloat16* lat, int6
     __half s_h = __float2half_rn(scale);
     __nv_fp8_e4m3 s_f8(s_h); // fp8 constructor from half
     sc[b] = *reinterpret_cast<const unsigned char*>(&s_f8);
-    // quantize 16 values to 8 packed bytes (2 codes per byte)
+    // quantize 8 values to 4 packed bytes (2 codes per byte)
     #pragma unroll
-    for (int j = 0; j < 8; ++j) {
+    for (int j = 0; j < 4; ++j) {
       unsigned char c0 = nvfp4_code(vals[2 * j] * inv);
       unsigned char c1 = nvfp4_code(vals[2 * j + 1] * inv);
-      codes[b * 8 + j] = (c0 & 0xF) | ((c1 & 0xF) << 4);
+      codes[b * 4 + j] = (c0 & 0xF) | ((c1 & 0xF) << 4);
     }
   }
 }
@@ -178,7 +178,7 @@ extern "C" __global__ void tf_glm_lat_write_nvfp4(const __nv_bfloat16* lat, int6
 // Dequant: nvfp4 rows [start, start + count) -> bf16 scratch [count][lw].
 extern "C" __global__ void tf_glm_lat_dequant_nvfp4(const unsigned char* cache, __nv_bfloat16* out,
                                                        int64_t start, int64_t count, int64_t lw) {
-  const int64_t packed = lw / 2, scales = lw / 16;
+  const int64_t packed = lw / 2, scales = lw / 8;
   const int64_t row = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (row >= count) return;
   const unsigned char* row_cache = cache + (start + row) * (packed + scales);
@@ -191,10 +191,10 @@ extern "C" __global__ void tf_glm_lat_dequant_nvfp4(const unsigned char* cache, 
     *reinterpret_cast<unsigned char*>(&s_f8) = sc[b];
     const float scale = __half2float(__half(s_f8));
     #pragma unroll
-    for (int j = 0; j < 8; ++j) {
-      unsigned char byte = codes[b * 8 + j];
-      dst[b * 16 + 2 * j] = __float2bfloat16_rn(nvfp4_val(byte & 0xF) * scale);
-      dst[b * 16 + 2 * j + 1] = __float2bfloat16_rn(nvfp4_val((byte >> 4) & 0xF) * scale);
+    for (int j = 0; j < 4; ++j) {
+      unsigned char byte = codes[b * 4 + j];
+      dst[b * 8 + 2 * j] = __float2bfloat16_rn(nvfp4_val(byte & 0xF) * scale);
+      dst[b * 8 + 2 * j + 1] = __float2bfloat16_rn(nvfp4_val((byte >> 4) & 0xF) * scale);
     }
   }
 }

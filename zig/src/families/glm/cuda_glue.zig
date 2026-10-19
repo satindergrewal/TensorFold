@@ -300,7 +300,7 @@ pub fn chunksSmemNvfp4(comptime hb: u32) u32 {
 
 /// The 32-row sliced form stages one tile: the packed e2m1 halves, the 32 B/row of e4m3 scales, the LUT.
 pub fn chunksSmemNvfp4Slice() u32 {
-    return chunksSmem(16) + 32 * 256 + 32 * 32 + 32;
+    return chunksSmem(16) + 32 * 256 + 32 * 64 + 32;
 }
 
 /// K slices of the router's dot (glue.ROUTER_KS): fixed by the shape, as the sliced and the single pass differ in bits.

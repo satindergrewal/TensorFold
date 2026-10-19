@@ -897,7 +897,7 @@ pub const Engine = struct {
         const kvb: u32 = heads * 128 * 2; // save_v rows (bf16)
         const bf: u32 = heads * 4; // save_b rows (fp32)
         const pr: u32 = @intCast(st.proj_row * 2);
-        const lat: u32 = if (std.c.getenv("TF_GLM_KV_NVFP4") != null) e.c.kv_lora / 2 + e.c.kv_lora / 16
+        const lat: u32 = if (std.c.getenv("TF_GLM_KV_NVFP4") != null) e.c.kv_lora / 2 + e.c.kv_lora / 8
             else if (std.c.getenv("TF_GLM_KV_FP8") != null) e.c.kv_lora
             else e.c.kv_lora * 2;
         const idx: u32 = e.c.i_dim * 2;
