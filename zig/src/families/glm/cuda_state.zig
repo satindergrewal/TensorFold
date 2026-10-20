@@ -259,6 +259,10 @@ pub const State = struct {
     rec_layer: usize,
     proj_layer: usize,
     proj_row: usize,
+    lc_row: usize = 0, // the pooled latent's bytes a row
+    idx_row: usize = 0, // index keys/gates bytes a row
+    kpool: usize = 0, // tokens a pooled-key row covers
+    nmla: usize = 0, // MLA layers in caches (the MTP plane follows them)
 
     /// One MLA/MTP cache arena every stream leases a contiguous region of (the Metal pool's design on
     /// CUDA): planes at the pool's full token capacity; a region's state points `start` tokens into each.
@@ -361,6 +365,7 @@ pub const State = struct {
             .mtp_pos_dev = p[8], // the arena's last size: the MTP position, after the fixed parts
             .kda_layers = nk, .caches = caches, .conv_c = 3 * n,
             .rec_layer = s.kda.len() * kda.dk * kda.dv * 4, .proj_layer = window_rows * kw, .proj_row = kw,
+            .lc_row = lc_row, .idx_row = idx_row, .kpool = sparse.pool, .nmla = nmla,
         };
     }
 
@@ -399,7 +404,7 @@ pub const State = struct {
         @memset(cur, 0);
         const caches = try gpa.alloc(dsa_block.Caches, nd);
         for (caches, 0..) |*x, j| x.* = .{ .lc = p[8 + 4 * j], .ik = p[9 + 4 * j], .ig = p[10 + 4 * j], .pk = p[11 + 4 * j], .pk_rows = pk_rows };
-        return .{ .arena = a, .gpa = gpa, .capacity = capacity, .pos_dev = p[0], .conv = p[1], .rec = p[2], .proj = p[3], .save_k = p[4], .save_v = p[5], .save_g = p[6], .save_b = p[7], .cur = cur, .heads = s.kda.len(), .mtp_caches = .{ .lc = p[8 + 4 * nd], .ik = p[9 + 4 * nd], .ig = p[10 + 4 * nd], .pk = p[11 + 4 * nd], .pk_rows = pk_rows }, .mtp_pos_dev = p[12 + 4 * nd], .kda_layers = nk, .caches = caches, .conv_c = 3 * n, .rec_layer = s.kda.len() * kda.dk * kda.dv * 4, .proj_layer = window_rows * kw, .proj_row = kw };
+        return .{ .arena = a, .gpa = gpa, .capacity = capacity, .pos_dev = p[0], .conv = p[1], .rec = p[2], .proj = p[3], .save_k = p[4], .save_v = p[5], .save_g = p[6], .save_b = p[7], .cur = cur, .heads = s.kda.len(), .mtp_caches = .{ .lc = p[8 + 4 * nd], .ik = p[9 + 4 * nd], .ig = p[10 + 4 * nd], .pk = p[11 + 4 * nd], .pk_rows = pk_rows }, .mtp_pos_dev = p[12 + 4 * nd], .kda_layers = nk, .caches = caches, .conv_c = 3 * n, .rec_layer = s.kda.len() * kda.dk * kda.dv * 4, .proj_layer = window_rows * kw, .proj_row = kw, .lc_row = lat_bytes / capacity, .idx_row = c.i_dim * 2, .kpool = sparse.pool, .nmla = nd };
     }
 
     pub fn deinit(st: *State) void {

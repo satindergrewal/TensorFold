@@ -53,7 +53,7 @@ const DraftKey = struct { slot: u32, nch: u16, dense: u8 }; // no parity: the MT
 const VerifyGraph = struct { exec: cuda.graph.Exec, nch: usize };
 
 /// One rank's copy of a kept prompt state: the state arena's bytes and the host fields beside them.
-const Snap = struct { buf: cuda.DeviceBuffer, pos: usize, mtp_len: usize, cur: []u1 };
+const Snap = struct { buf: cuda.DeviceBuffer, kv: ?cuda.DeviceBuffer = null, pos: usize, mtp_len: usize, cur: []u1 };
 
 pub const Region = struct { start: u32, blocks: u32 };
 pub const pool_block: u32 = 256; // a multiple of the indexer's pooling width
@@ -750,7 +750,10 @@ pub const Engine = struct {
 
     /// Bytes one kept state takes on this rank: the whole state arena (its caches are sized for the window, not `at`).
     pub fn stateBytes(e: *const Engine) u64 {
-        return e.cur.st.arena.buf.len;
+        // the prompt cache asks before any stream is bound on a pooled engine (e.cur undefined then)
+        if (e.seqs.items.len > 0) if (e.seqs.items[e.slot]) |q| return q.st.arena.buf.len;
+        for (e.seqs.items) |q| if (q) |x| return x.st.arena.buf.len;
+        return 0;
     }
 
     /// Rank 0, at a mark in a prompt pass: a copy of the state under a new id, named to the other ranks at the gate.
@@ -767,16 +770,103 @@ pub const Engine = struct {
         var buf = try cuda.DeviceBuffer.alloc(e.d, e.cur.st.arena.buf.len);
         errdefer buf.free();
         try e.copy(buf.ptr, e.cur.st.arena.buf.ptr, buf.len);
+        // a pooled state's KV lives in its lease, not its arena: a kept prompt needs those rows copied
+        // (the cache stays reusable; a restore copies them into the resuming stream's own region)
+        var kv: ?cuda.DeviceBuffer = null;
+        errdefer if (kv) |*b| b.free();
+        if (e.pool != null) {
+            const n = e.kvBytes(e.cur.st.pos);
+            if (n > 0) {
+                const b = try cuda.DeviceBuffer.alloc(e.d, n);
+                try e.saveKv(b.ptr, e.cur.st.pos);
+                kv = b;
+            }
+        }
         try e.stream.synchronize();
         const cur = try e.gpa.dupe(u1, e.cur.st.cur);
         errdefer e.gpa.free(cur);
-        try e.snaps.put(e.gpa, id, .{ .buf = buf, .pos = e.cur.st.pos, .mtp_len = e.cur.st.mtp_len, .cur = cur });
+        try e.snaps.put(e.gpa, id, .{ .buf = buf, .kv = kv, .pos = e.cur.st.pos, .mtp_len = e.cur.st.mtp_len, .cur = cur });
+    }
+
+    /// Bytes a kept pooled state's KV rows [0, pos) take across every plane (0 for a per-slot arena).
+    pub fn kvBytes(e: *const Engine, rows: usize) usize {
+        if (e.pool == null) return 0;
+        // pure geometry: the prompt cache asks before any stream is bound (e.cur is undefined then)
+        var nd: usize = 0;
+        for (e.w.layers) |l| switch (l.mixer) {
+            .mla => nd += 1,
+            else => {},
+        };
+        const ix: usize = e.c.i_dim * 2;
+        const lc: usize = if (std.c.getenv("TF_GLM_KV_NVFP4") != null) e.c.kv_lora / 2 + e.c.kv_lora / 8 else if (std.c.getenv("TF_GLM_KV_FP8") != null) e.c.kv_lora else e.c.kv_lora * 2;
+        const pk = (rows / sparse.pool + 1) * ix;
+        const layer = rows * lc + 2 * rows * ix + pk;
+        return nd * layer + rows * e.c.kv_lora * 2 + 2 * rows * ix + pk;
+    }
+
+    /// The current state's KV rows [0, pos) to `buf` (a kept state's linear copy).
+    fn saveKv(e: *Engine, buf: u64, rows: usize) !void {
+        const st = &e.cur.st;
+        var at: usize = 0;
+        for (st.caches) |c| {
+            const lc = rows * st.lc_row;
+            try e.copy(buf + at, c.lc, lc);
+            at += lc;
+            const ix = rows * st.idx_row;
+            try e.copy(buf + at, c.ik, ix);
+            at += ix;
+            try e.copy(buf + at, c.ig, ix);
+            at += ix;
+            const pk = (rows / st.kpool + 1) * st.idx_row;
+            try e.copy(buf + at, c.pk, pk);
+            at += pk;
+        }
+        const ml = rows * e.c.kv_lora * 2;
+        try e.copy(buf + at, st.mtp_caches.lc, ml);
+        at += ml;
+        const mi = rows * st.idx_row;
+        try e.copy(buf + at, st.mtp_caches.ik, mi);
+        at += mi;
+        try e.copy(buf + at, st.mtp_caches.ig, mi);
+        at += mi;
+        const mpk = (rows / st.kpool + 1) * st.idx_row;
+        try e.copy(buf + at, st.mtp_caches.pk, mpk);
+    }
+
+    /// `buf`'s KV rows [0, pos) into the current state's planes (the resuming stream's region).
+    fn loadKv(e: *Engine, buf: u64, rows: usize) !void {
+        const st = &e.cur.st;
+        var at: usize = 0;
+        for (st.caches) |c| {
+            const lc = rows * st.lc_row;
+            try e.copy(c.lc, buf + at, lc);
+            at += lc;
+            const ix = rows * st.idx_row;
+            try e.copy(c.ik, buf + at, ix);
+            at += ix;
+            try e.copy(c.ig, buf + at, ix);
+            at += ix;
+            const pk = (rows / st.kpool + 1) * st.idx_row;
+            try e.copy(c.pk, buf + at, pk);
+            at += pk;
+        }
+        const ml = rows * e.c.kv_lora * 2;
+        try e.copy(st.mtp_caches.lc, buf + at, ml);
+        at += ml;
+        const mi = rows * st.idx_row;
+        try e.copy(st.mtp_caches.ik, buf + at, mi);
+        at += mi;
+        try e.copy(st.mtp_caches.ig, buf + at, mi);
+        at += mi;
+        const mpk = (rows / st.kpool + 1) * st.idx_row;
+        try e.copy(st.mtp_caches.pk, buf + at, mpk);
     }
 
     /// The live state made kept state `id`'s; a rank without it refuses rather than prefill from another position.
     fn restoreState(e: *Engine, id: u64) !void {
         const s = e.snaps.getPtr(id) orelse return error.NoKeptState;
         try e.copy(e.cur.st.arena.buf.ptr, s.buf.ptr, s.buf.len);
+        if (s.kv) |b| try e.loadKv(b.ptr, s.pos);
         try e.cur.st.restoreHost(e.stream, s.pos, s.mtp_len, s.cur);
         e.cur.in_head = 0;
         try e.stream.synchronize();
@@ -796,6 +886,7 @@ pub const Engine = struct {
 
     fn freeSnap(e: *Engine, s: *Snap) void {
         s.buf.free();
+        if (s.kv) |*b| b.free();
         e.gpa.free(s.cur);
     }
 

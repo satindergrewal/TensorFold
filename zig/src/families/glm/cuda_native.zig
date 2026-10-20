@@ -128,9 +128,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
 
 /// Bytes a state takes at any position: the whole state arena on each rank.
 pub fn snap_bytes(ptr: *anyopaque, at: u32) u64 {
-    _ = at;
     const e: *engine.Engine = @ptrCast(@alignCast(ptr));
-    return e.stateBytes();
+    return e.stateBytes() + e.kvBytes(at);
 }
 
 /// The prompt pass stands at `at` (a mark at a chunk start): copy the state there under a new id.
