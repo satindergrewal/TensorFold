@@ -13,6 +13,10 @@ pub const pool = @import("pool.zig");
 pub const backend = @import("backend.zig");
 pub const mirror = @import("mirror.zig");
 pub const timing = @import("timing.zig");
+pub const vision_config = @import("vision_config.zig"); // upstream v1.1.1's checkpoint vision config
+pub const image_core = @import("image_core.zig"); // the image row maths over core.picture
+pub const cuda_vision = @import("cuda_vision.zig"); // the image tower (upstream v1.1.1)
+pub const cuda_load_owner = @import("cuda_load_owner.zig"); // a CUDA module's owner
 
 test {
     _ = config;
@@ -31,4 +35,8 @@ test {
     _ = @import("kept.zig");
     _ = mirror;
     _ = timing;
+    _ = vision_config;
+    _ = image_core;
+    _ = cuda_vision;
+    _ = cuda_load_owner;
 }

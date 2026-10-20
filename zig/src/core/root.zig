@@ -21,6 +21,7 @@ pub const act_ref = @import("act_ref.zig");
 pub const nvfp4 = @import("nvfp4.zig");
 pub const modelopt = @import("modelopt.zig");
 pub const picture = @import("picture/picture.zig"); // image/video decoders for the vision path
+pub const rows_image = @import("rows_image.zig"); // image rows spliced into prompt rows (upstream v1.1.1)
 
 test {
     _ = safetensors;
@@ -43,4 +44,6 @@ test {
     _ = nvfp4;
     _ = modelopt;
     _ = @import("nvfp4_fixture_test.zig");
+    _ = picture;
+    _ = rows_image;
 }
