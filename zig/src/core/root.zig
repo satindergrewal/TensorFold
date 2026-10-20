@@ -22,6 +22,7 @@ pub const nvfp4 = @import("nvfp4.zig");
 pub const modelopt = @import("modelopt.zig");
 pub const picture = @import("picture/picture.zig"); // image/video decoders for the vision path
 pub const rows_image = @import("rows_image.zig"); // image rows spliced into prompt rows (upstream v1.1.1)
+pub const engine_vision = @import("engine_vision.zig"); // image/video input types and --vision's limits (upstream v1.1.1)
 
 test {
     _ = safetensors;
@@ -46,4 +47,5 @@ test {
     _ = @import("nvfp4_fixture_test.zig");
     _ = picture;
     _ = rows_image;
+    _ = engine_vision;
 }

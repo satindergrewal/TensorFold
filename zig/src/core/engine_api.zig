@@ -47,6 +47,15 @@ pub const Structure = struct {
 pub const grammar = lanes.grammar;
 
 /// A reply to decode. The request and every slice in it stay valid until its ``finished`` event.
+/// One image of a request (``Request.images``): the tower's input and the placeholder rows its output replaces.
+pub const Image = lanes.stream.Image;
+
+/// Image and video input an engine serves, and --vision's limits (engine_vision.zig).
+const vision_types = @import("core").engine_vision; // one copy of the file, in the core module
+pub const PreparedImage = vision_types.PreparedImage;
+pub const Piece = vision_types.Piece;
+pub const Vision = vision_types.Vision;
+
 pub const Request = struct {
     prompt: []const u32,
     max_tokens: u32,
@@ -67,6 +76,8 @@ pub const Request = struct {
     chunks: []const u32 = &.{},
     /// Decoded intervals [start,end), sorted, nonempty and strictly separated; an empty list uses prompt arithmetic.
     decode_spans: []const [2]u32 = &.{},
+    /// Images whose rows replace placeholder tokens of ``prompt``, in order; only when ``Info.vision`` is set.
+    images: []const Image = &.{},
     /// Most reply tokens inside a think block before the engine writes ``think_close`` (0: no limit).
     think_budget: u32 = 0,
     think_close: []const u32 = &.{},
@@ -129,6 +140,8 @@ pub const Sink = struct {
 /// What the engine serves, fixed once it has loaded.
 pub const Info = struct {
     name: []const u8 = "lanes",
+    /// Image input the engine serves (null: text only; the server refuses media parts).
+    vision: ?Vision = null,
     lanes: u32 = 1,
     /// Prompt plus reply tokens one request may use (0: no limit).
     context_window: u32 = 0,

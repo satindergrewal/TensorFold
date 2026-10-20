@@ -97,6 +97,17 @@ pub const Held = struct {
     parents: ?[]i32 = null,
 };
 
+/// One image of a request: its tower input (patches), the grid, the prompt row its placeholder sits at, and
+/// the tokens its placeholder expands to. ``core/engine_vision.zig`` prepares it; the backend's tower fills rows.
+pub const Image = struct {
+    pixels: []const f32,
+    gh: u32,
+    gw: u32,
+    at: u32,
+    tokens: u32,
+    hash: u64 = 0, // the bytes and the grid, as the prompt cache's key names the image
+};
+
 pub const Spec = struct {
     id: []const u8,
     prompt: []const u32,
@@ -123,6 +134,8 @@ pub const Spec = struct {
     prompt_logprobs: ?u8 = null, // and for each prompt token after the first, with ranks (the prompt pass starts at 0)
     grammar: ?*grammar.Constraint = null, // structured output: the reply stays in it (the creator frees it)
     decode_spans: []const [2]u32 = &.{}, // prompt rows an earlier reply decoded (Request.decode_spans), for backends that keep their bits
+    images: []const Image = &.{}, // in prompt order; the backend's tower fills their rows
+    key: []const u32 = &.{}, // the prompt as the cache matches it (image rows by their image); empty: the prompt
 };
 
 pub const Stream = struct {
@@ -153,6 +166,8 @@ pub const Stream = struct {
     prompt_rows: std.ArrayList(Row) = .empty, // with `prompt_logprobs`: one a prompt token after the first, in order
     reuse: Reuse = .{},
     decode_spans: []const [2]u32 = &.{},
+    images: []const Image = &.{},
+    key: []const u32 = &.{},
     decide: ?u32 = null,
     untaught: bool = false,
     cached: u32 = 0, // prompt tokens the backend restored from `reuse` (its prompt pass started there)
@@ -216,6 +231,8 @@ pub const Stream = struct {
             .prompt_logprobs = spec.prompt_logprobs,
             .grammar = spec.grammar,
             .decode_spans = spec.decode_spans,
+            .images = spec.images,
+            .key = spec.key,
         };
         // under a grammar a forced close ends at the think end: the grammar takes the reply from the next token
         if (spec.grammar) |g| if (g.after) |end| if (std.mem.indexOfScalar(u32, s.think_close, end)) |at| {
