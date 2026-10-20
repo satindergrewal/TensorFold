@@ -296,8 +296,8 @@ pub const Tower = struct {
         const oh = take(&at, q_rows * HD * 4);
         const sums = take(&at, q_rows * 4);
         const dpos = take(&at, N * 8);
-        try cuda.copy_source.enqueue(d, dpos, std.mem.sliceAsBytes(pos), ru.stream);
-        try cuda.copy_source.enqueue(d, p32, std.mem.sliceAsBytes(patches), ru.stream);
+        try cuda.copy_source.enqueue(d, dpos, std.mem.sliceAsBytes(pos), ru.stream.handle);
+        try cuda.copy_source.enqueue(d, p32, std.mem.sliceAsBytes(patches), ru.stream.handle);
         { // the patch embedding: the patches as bf16, then the conv as a linear (with its bias) into the fp32 stream
             var a: cuda.Args = .{};
             a.add(p32);

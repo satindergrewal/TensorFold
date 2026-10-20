@@ -49,11 +49,11 @@ pub const flags = [_]Flag{
     .{ .name = "--api-key-file", .native = true },
     .{ .name = "--metrics-open", .kind = .store_true, .native = true },
     .{ .name = "--dashboard", .kind = .store_true, .native = true },
-    .{ .name = "--vision", .kind = .store_true },
-    .{ .name = "--vision-urls", .kind = .store_true },
+    .{ .name = "--vision", .kind = .store_true, .native = true },
+    .{ .name = "--vision-urls", .kind = .store_true, .native = true },
     .{ .name = "--vision-offload", .kind = .store_true },
-    .{ .name = "--vision-max-images" },
-    .{ .name = "--vision-image-tokens" },
+    .{ .name = "--vision-max-images", .native = true },
+    .{ .name = "--vision-image-tokens", .native = true },
     .{ .name = "--context", .native = true },
     .{ .name = "--speed-up", .native = !cuda_build },
     .{ .name = "--max-tokens", .native = true },
@@ -132,6 +132,10 @@ pub const Args = struct {
     dashboard: bool = false,
     context: ?i64 = null,
     speed_up: ?[]const u8 = null, // speed-up mode: this Mac's settings for the two-Mac link (Flash Next and the GLMs)
+    vision: bool = false, // --vision: a family with an image tower reads image parts
+    vision_urls: bool = false, // image parts may name public HTTPS URLs
+    vision_max_images: u32 = 4, // images one request may hold
+    vision_image_tokens: ?u32 = null, // visual tokens one request may hold (null: the family's default)
     prompt_cache_gib: ?f64 = null, // kept prompt states' budget (0: none; null: what 70% of RAM leaves past the loaded server)
     prompt_cache_over_cap: bool = false, // a --prompt-cache-gib past that is kept, not refused
     learn: bool = false, // keep shared prompt states on disk (--learn-dir: where; it implies --learn)
@@ -257,7 +261,13 @@ fn apply(a: Allocator, out: *Args, name: []const u8, value: ?[]const u8, u: *Usa
         const p = try int(u, a, name, v);
         if (p < 0 or p > 65535) return fail(u, a, "argument --port: invalid port: '{s}'", .{v});
         out.port = @intCast(p);
-    } else if (is(name, "--name")) out.name = v else if (is(name, "--alias")) try alias.append(a, v) else if (is(name, "--api-key")) try keys.append(a, v) else if (is(name, "--api-key-file")) out.api_key_file = v else if (is(name, "--metrics-open")) out.metrics_open = true else if (is(name, "--dashboard")) out.dashboard = true else if (is(name, "--context")) out.context = try int(u, a, name, v) else if (is(name, "--speed-up")) out.speed_up = v else if (is(name, "--prompt-cache-gib")) out.prompt_cache_gib = try gib(u, a, name, v) else if (is(name, "--prompt-cache-over-cap")) out.prompt_cache_over_cap = true else if (is(name, "--learn")) out.learn = true else if (is(name, "--learn-dir")) {
+    } else if (is(name, "--name")) out.name = v else if (is(name, "--alias")) try alias.append(a, v) else if (is(name, "--api-key")) try keys.append(a, v) else if (is(name, "--api-key-file")) out.api_key_file = v else if (is(name, "--metrics-open")) out.metrics_open = true else if (is(name, "--dashboard")) out.dashboard = true else if (is(name, "--vision")) out.vision = true else if (is(name, "--vision-urls")) out.vision_urls = true else if (is(name, "--vision-max-images")) {
+        const n = try int(u, a, name, v);
+        out.vision_max_images = if (n >= 1) @intCast(@min(n, std.math.maxInt(u32))) else return fail(u, a, "argument --vision-max-images: a count from 1: '{s}'", .{v});
+    } else if (is(name, "--vision-image-tokens")) {
+        const n = try int(u, a, name, v);
+        out.vision_image_tokens = if (n >= 1) @intCast(@min(n, std.math.maxInt(u32))) else return fail(u, a, "argument --vision-image-tokens: a count from 1: '{s}'", .{v});
+    } else if (is(name, "--context")) out.context = try int(u, a, name, v) else if (is(name, "--speed-up")) out.speed_up = v else if (is(name, "--prompt-cache-gib")) out.prompt_cache_gib = try gib(u, a, name, v) else if (is(name, "--prompt-cache-over-cap")) out.prompt_cache_over_cap = true else if (is(name, "--learn")) out.learn = true else if (is(name, "--learn-dir")) {
         out.learn = true;
         out.learn_dir = v;
     } else if (is(name, "--learn-min-free-gib")) {
@@ -347,6 +357,7 @@ pub fn request(a: Allocator, dir: []const u8, model_type: []const u8, args: Args
         .context = args.context,
         .lanes = parallel(args.parallel) orelse 8,
         .lanes_fixed = parallelFixed(args.parallel),
+        .vision = if (args.vision) .{ .image_tokens = args.vision_image_tokens orelse @max(4096, args.vision_max_images * 256), .image_tokens_set = args.vision_image_tokens != null, .max_images = args.vision_max_images } else null,
         .drafts = !args.no_drafts,
         .drafter = args.drafter,
         .drafter_bits = args.drafter_bits,

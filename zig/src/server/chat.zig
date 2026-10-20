@@ -129,6 +129,8 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
     const drafts = srv.config.use_drafts and !(draft_field != null and draft_field.? == .bool and !draft_field.?.bool);
     var request: api.Request = .{
         .prompt = rendered.ids,
+        .images = rendered.images,
+        .cache_key = rendered.cache_key,
         .max_tokens = @intCast(@min(limit, std.math.maxInt(u32))),
         .sampling = sampling,
         .eos = if (stops_opt.ignore_eos) &.{} else srv.eos,

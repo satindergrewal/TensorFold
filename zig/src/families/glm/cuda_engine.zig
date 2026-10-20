@@ -7,7 +7,6 @@ comptime {
     // force the vision files into the compiled graph (their pub decls are otherwise unanalysed)
     _ = @import("cuda_vision.zig");
     _ = @import("cuda_load_owner.zig");
-    _ = @import("cuda_images.zig");
     _ = @import("video_core.zig");
 }
 const latent = @import("cuda_latent.zig");
@@ -20,6 +19,7 @@ const ranks = @import("cuda_ranks.zig");
 const sampler = @import("cuda_sampler.zig");
 const sparse = @import("cuda_sparse.zig");
 const heat = @import("heat");
+const images_mod = @import("cuda_images.zig");
 
 pub const Options = struct {
     capacity: usize, // tokens a sequence holds
@@ -142,6 +142,7 @@ pub const Engine = struct {
     ids_stage: cuda.HostBuffer = undefined, // pinned: a captured H2D from pageable memory snapshots
     // the driver staging at capture time (every replay would copy the first round's ids)
     slot: u32 = 0,
+    images: ?*images_mod.Images = null, // --vision: a prompt pass's image rows (rank 0 encodes, the others receive)
     capacity: usize,
     mtp: bool,
     heat_gate: heat.Gate, // upstream's bands (off unless set), read before each prompt chunk on the gathered maximum
@@ -578,7 +579,8 @@ pub const Engine = struct {
 
     fn view(e: *Engine, b: *fw.Buffers, out: *[1]fw.Rank) fw.Forward {
         out.* = .{.{ .w = &e.w, .st = &e.cur.st, .b = b }};
-        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = if (b == &e.bp) &e.pieces else null, .split = e.settings.split, .kda_wide = e.settings.kda_wide, .kda_parents = if (e.kda_parents_on) e.kda_parents.ptr else 0, .wave = if (b == &e.bd and e.wave != null) &e.wave.? else null, .l2pf = if (b == &e.bd and e.l2pf != null) &e.l2pf.? else null };
+        const im: ?fw.ImageRows = if (e.images) |v| .{ .v = v, .slot = e.slot } else null;
+        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = if (b == &e.bp) &e.pieces else null, .split = e.settings.split, .kda_wide = e.settings.kda_wide, .kda_parents = if (e.kda_parents_on) e.kda_parents.ptr else 0, .wave = if (b == &e.bd and e.wave != null) &e.wave.? else null, .l2pf = if (b == &e.bd and e.l2pf != null) &e.l2pf.? else null, .images = im };
     }
 
     /// Binds slot `slot`'s sequence for the steps that follow, making it (a zeroed state) on first use.
@@ -597,6 +599,7 @@ pub const Engine = struct {
         }
         e.cur = e.seqs.items[slot].?;
         e.slot = slot;
+        if (e.images) |v| try v.activate(slot);
     }
 
     /// The blocks a stream of `tokens` takes (256 a block; its last keeps the cache's extra pooled entry).
@@ -653,6 +656,7 @@ pub const Engine = struct {
 
     /// Frees slot `slot`'s sequence (slot 0 stays: the first stream's, made at init) and binds slot 0.
     pub fn release(e: *Engine, slot: u32) void {
+        if (e.images) |v| v.release(slot);
         if (e.pool != null) {
             // a pooled slot's region returns to the pool; slot 0 is rebuilt on the next admission
             e.releaseRegion(slot);
@@ -691,6 +695,7 @@ pub const Engine = struct {
     pub fn begin(e: *Engine, sampling: ?sampler.Sampling) !void {
         e.cur.sampling = sampler.check(sampling);
         e.cur.in_head = 0;
+        if (e.images) |v| v.clear(); // no earlier request's rows splice into this one
         try e.cur.st.reset(e.stream);
     }
 

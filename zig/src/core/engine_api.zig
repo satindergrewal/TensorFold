@@ -55,6 +55,7 @@ const vision_types = @import("core").engine_vision; // one copy of the file, in 
 pub const PreparedImage = vision_types.PreparedImage;
 pub const Piece = vision_types.Piece;
 pub const Vision = vision_types.Vision;
+pub const VisionOpen = vision_types.VisionOpen;
 
 pub const Request = struct {
     prompt: []const u32,
@@ -78,6 +79,8 @@ pub const Request = struct {
     decode_spans: []const [2]u32 = &.{},
     /// Images whose rows replace placeholder tokens of ``prompt``, in order; only when ``Info.vision`` is set.
     images: []const Image = &.{},
+    /// The prompt as the prompt cache matches it (each image's placeholders by its content); empty: ``prompt``.
+    cache_key: []const u32 = &.{},
     /// Most reply tokens inside a think block before the engine writes ``think_close`` (0: no limit).
     think_budget: u32 = 0,
     think_close: []const u32 = &.{},
@@ -97,6 +100,11 @@ pub const Request = struct {
     logprobs: ?u8 = null,
     /// Rows for each prompt token after the first, with ranks and this many best tokens, when ``Info.prompt_logprobs``.
     prompt_logprobs: ?u8 = null,
+
+    /// The prompt as the prompt cache matches it: an image request's placeholders stand for their images.
+    pub fn cacheKey(r: *const Request) []const u32 {
+        return if (r.cache_key.len > 0) r.cache_key else r.prompt;
+    }
 };
 
 pub const Reason = enum { stop, length, cancelled, failed };
@@ -205,6 +213,8 @@ pub const Open = struct {
     lanes: u32 = 8,
     /// --parallel named a number: an engine whose memory fits fewer streams refuses instead of serving fewer.
     lanes_fixed: bool = false,
+    /// --vision: the family's image tower, when it serves one (null: text only).
+    vision: ?VisionOpen = null,
     drafts: bool = true,
     /// --drafter: a draft model's directory for families that load one (Qwen3.8-27B's DFlash2); null: none.
     drafter: ?[]const u8 = null,

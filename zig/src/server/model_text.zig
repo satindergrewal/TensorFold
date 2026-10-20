@@ -38,10 +38,18 @@ pub const Text = struct {
         special: ?*const fn (ctx: *anyopaque, id: u32) bool = null,
         /// A token's own bytes (a partial UTF-8 sequence kept whole) for logprob rows; null: the tokenizer can't say.
         token_bytes: ?*const fn (ctx: *anyopaque, a: Allocator, id: u32) Allocator.Error!?[]u8 = null,
+        /// ``encode`` with no added token matched: text that spells one is ordinary text; null: ``encode``.
+        encode_plain: ?*const fn (ctx: *anyopaque, a: Allocator, text: []const u8) Error![]u32 = null,
     };
 
     pub fn encode(t: Text, a: Allocator, text: []const u8, add_special: bool) Error![]u32 {
         return t.vtable.encode(t.ctx, a, text, add_special);
+    }
+
+    /// ``encode`` that never matches an added token: text spelling a special token stays ordinary text.
+    pub fn encodePlain(t: Text, a: Allocator, text: []const u8) Error![]u32 {
+        const f = t.vtable.encode_plain orelse return t.encode(a, text, false);
+        return f(t.ctx, a, text);
     }
 
     pub fn decode(t: Text, a: Allocator, ids: []const u32) Allocator.Error![]u8 {

@@ -8,6 +8,7 @@ const glue = @import("cuda_glue.zig");
 const kda = @import("cuda_kda.zig");
 const b16 = @import("cuda_b16.zig");
 const latent = @import("cuda_latent.zig");
+const images_mod = @import("cuda_images.zig");
 const sparse = @import("cuda_sparse.zig");
 const experts = @import("cuda_experts.zig");
 const kda_block = @import("cuda_kda_block.zig");
@@ -223,6 +224,9 @@ pub const Rank = struct {
 /// One stream's rows of a shared window: rows row0..row0 + rows, on sequence `st` from its position.
 pub const Seg = struct { st: *State, row0: usize, rows: usize };
 
+/// The engine's image rows and the sequence the forward runs on (they splice into that sequence's rows only).
+pub const ImageRows = struct { v: *images_mod.Images, slot: u32 };
+
 pub const Forward = struct {
     kda_parents: u64 = 0, // this round tree parents for the KDA chain (0: a chain)
     d: *const cuda.Driver,
@@ -235,6 +239,7 @@ pub const Forward = struct {
     l2pf: ?*L2pf = null, // TF_GLM_L2PF=1: side-stream weight prefetch at the gather waits
     pieces: ?*const Pieces = null, // a prompt chunk's exchanges in row pieces on a second stream (null: whole)
     split: bool = true, // TF_GLM_PREFILL_REDUCE=split (the default with send/recv): each rank glues its own rows
+    images: ?ImageRows = null, // a prompt pass's image rows over their placeholders' embeddings (its sequence only)
 
     pub fn set(f: *const Forward) glue.Set {
         return .{ .glue = &f.m.glue, .linear = f.linear(), .copy_rows = f.m.copy_rows };
@@ -601,6 +606,7 @@ pub const Forward = struct {
         }
         const c = &f.ranks[0].w.config;
         for (f.ranks) |r| try glue.embedB16(f.set(), f.stream, r.b.ids, r.w.embed, r.b.x, R, c.hidden, c.hc);
+        if (f.images) |im| for (f.ranks) |r| try im.v.splice(f.stream, im.slot, r.st.pos, r.st.pos + R, r.b.x, c.hc);
         var cut: [max_pieces][2]usize = undefined;
         const pieces = if (f.pieces) |p| (if (f.ranks[0].b.prefill) ranges(R, p.count, &cut) else 0) else 0;
         f.ranks[0].st.last_wave = false;

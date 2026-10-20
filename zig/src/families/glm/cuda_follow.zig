@@ -4,9 +4,11 @@ const std = @import("std");
 const cuda = @import("cuda");
 const engine = @import("cuda_engine.zig");
 const sampler = @import("cuda_sampler.zig");
+const images_mod = @import("cuda_images.zig");
+const vcfg = @import("vision_config.zig");
 const Engine = engine.Engine;
 
-pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, bind };
+pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, bind, image };
 
 var step_logs: u32 = 0; // TF_GLM_STEP_LOG: the first steps each side handles (deadlock diagnosis)
 
@@ -160,6 +162,13 @@ pub const Link = struct {
         if (l.wait) try l.stream.synchronize();
     }
 
+    /// Rank 0: `bytes` of device rows from `ptr` to the other ranks (the step's spans named them).
+    pub fn rows(l: *Link, ptr: u64, bytes: usize) !void {
+        if (bytes == 0) return;
+        try l.lib.check(l.lib.api.ncclBroadcast(ptr, ptr, bytes, .u8, 0, l.comm, l.stream.handle), "ncclBroadcast");
+        try l.stream.synchronize();
+    }
+
     /// Other ranks: the next step and its ids (valid until the next receive).
     pub fn receive(l: *Link) !struct { h: Header, ids: []const u32 } {
         if (l.arena) |a| {
@@ -255,6 +264,15 @@ pub const Leader = struct {
         }
         try x.send(h, &.{});
         try x.e.begin(c);
+    }
+
+    /// The prompt pass's image rows (rank 0 encoded them for the bound slot) to every rank: spans, then the rows.
+    pub fn images(x: Leader, v: *const images_mod.Images) !void {
+        try x.flush();
+        const words = try spanWords(v.gpa, v.spans.items, x.link.ids.len);
+        defer v.gpa.free(words);
+        try x.send(.{ .kind = @backingInt(Kind.image) }, words);
+        try x.link.rows(v.rows.ptr, v.rowCount() * vcfg.out_hidden * 2);
     }
 
     /// `cancel` (rank 0's), asked before each chunk, decides for every rank; `from` every rank holds; `marks` rank 0's.
@@ -379,10 +397,23 @@ pub fn follow(e: *Engine, link: *Link) !void {
             },
             .drop => for (step.ids) |id| e.dropState(id),
             .bind => try e.bindRegion(h.slot, .{ .start = @intCast(h.a), .blocks = h.depth }),
+            .image => {
+                const v = e.images orelse return error.NoVision; // the ranks agreed on --vision
+                try v.take(h.slot, step.ids);
+                try link.rows(v.rows.ptr, v.rowCount() * vcfg.out_hidden * 2);
+            },
             .release => e.release(h.slot),
             .end => return,
         }
     }
+}
+
+// The production image-step serializer: spans as (at, n, row) words, bounded by the link's ids.
+pub fn spanWords(a: std.mem.Allocator, spans: []const images_mod.Span, max_words: usize) ![]u32 {
+    if (spans.len * 3 > max_words) return error.TooManyImages;
+    const words = try a.alloc(u32, spans.len * 3);
+    for (spans, 0..) |sp, i| words[3 * i ..][0..3].* = .{ sp.at, sp.n, sp.row };
+    return words;
 }
 
 test "a step's header is 64 bytes and keeps its fields" {

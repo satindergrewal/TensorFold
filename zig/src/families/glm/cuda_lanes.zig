@@ -150,7 +150,16 @@ pub const Lanes = struct {
     fn prefillFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
         const self = of(ptr);
         const from = try self.opening(s);
+        try self.images(s, from);
         _ = self.take(try self.x.prefill(s.prompt(), from, .{ .ptr = s, .check = cancelled }, marksOf(s)));
+    }
+
+    /// A prompt pass with images: rank 0's tower encodes those past `from`, then every rank holds their rows.
+    fn images(self: *Lanes, s: *lanes.Stream, from: ?engine.Resume) !void {
+        if (s.images.len == 0) return;
+        const v = self.x.e.images orelse return error.NoVision;
+        try v.begin(self.x.e.slot, s.images, if (from) |r| r.at else 0); // a refusal here leaves every rank as it was
+        try self.x.images(v);
     }
 
     /// One chunk of the stream's prompt pass (fillOne runs other rounds between); true once the first token is drawn.
@@ -158,6 +167,7 @@ pub const Lanes = struct {
         const self = of(ptr);
         const going: ?usize = if (self.lanes.getPtr(s)) |l| l.fill else null;
         const from = if (going == null) try self.opening(s) else null;
+        if (going == null) try self.images(s, from);
         const l = self.lanes.getPtr(s).?;
         if (going != null) try self.x.bind(l.slot);
         const at = going orelse if (from) |r| r.at else 0;

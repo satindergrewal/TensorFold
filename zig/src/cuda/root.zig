@@ -38,6 +38,7 @@ pub const embed_rows = @import("embed_rows.zig");
 pub const experts = @import("experts.zig");
 pub const sample = @import("sample.zig");
 pub const rank_scatter = @import("rank_scatter.zig");
+pub const copy_source = @import("copy_source.zig");
 pub const modelopt = @import("modelopt.zig");
 
 test {
