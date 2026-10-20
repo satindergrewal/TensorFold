@@ -8,6 +8,8 @@ const Engine = engine.Engine;
 
 pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, bind };
 
+var step_logs: u32 = 0; // TF_GLM_STEP_LOG: the first steps each side handles (deadlock diagnosis)
+
 /// One step as it crosses: 64 bytes, then `n` u32 ids.
 pub const Header = extern struct {
     kind: u32,
@@ -200,6 +202,10 @@ pub const Leader = struct {
     fn send(x: Leader, h: Header, ids: []const u32) !void {
         var hh = h;
         hh.slot = x.e.slot;
+        if (std.c.getenv("TF_GLM_STEP_LOG") != null and step_logs < 400) {
+            step_logs += 1;
+            std.debug.print("STEP> kind={d} slot={d} n={d} seq={d}\n", .{ hh.kind, hh.slot, ids.len, x.link.sent + 1 });
+        }
         try x.link.send(x.e.m.glue.put_words, hh, ids);
     }
 
@@ -210,9 +216,11 @@ pub const Leader = struct {
 
     /// The pool's bind: rank 0's lease travels so every rank addresses the same region.
     pub fn bindRegion(x: Leader, slot: u32, start: u32, blocks: u32) !void {
-        try x.flush();
-        try x.send(.{ .kind = @backingInt(Kind.bind), .a = start, .depth = blocks, .slot = slot }, &.{});
+        // bind locally first: send() tags every step with the engine's CURRENT slot, so a bind sent
+        // first went out tagged with the previous stream's slot (the 8-stream deadlock)
         try x.e.bindRegion(slot, .{ .start = start, .blocks = blocks });
+        try x.flush();
+        try x.send(.{ .kind = @backingInt(Kind.bind), .a = start, .depth = blocks }, &.{});
     }
 
     /// Frees a stream's sequence on every rank.
@@ -321,6 +329,10 @@ pub fn follow(e: *Engine, link: *Link) !void {
         const step = try link.receive();
         const h = step.h;
         const kind: Kind = @fromBackingInt(@intCast(h.kind));
+        if (std.c.getenv("TF_GLM_STEP_LOG") != null and step_logs < 400) {
+            step_logs += 1;
+            std.debug.print("STEP< kind={d} slot={d} n={d} seq={d}\n", .{ h.kind, h.slot, h.n, link.seen });
+        }
         if (kind != .end and kind != .drop and kind != .shared and kind != .bind) try e.bind(h.slot);
         switch (kind) {
             .begin => try e.begin(if (h.flags & 1 != 0) .{ .seed = h.seed, .temperature = h.temperature, .top_p = h.top_p, .min_p = h.min_p, .top_k = h.top_k } else null),

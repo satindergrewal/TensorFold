@@ -622,6 +622,7 @@ pub const Engine = struct {
 
     /// Drops `slot`'s lease and sequence (the next bind over that slot rebuilds it).
     pub fn releaseRegion(e: *Engine, slot: u32) void {
+        e.dropVerifyGraphs(); // the released state's cache addresses are about to change hands
         if (slot < e.seqs.items.len and e.seqs.items[slot] != null) e.free(slot);
         if (e.regions.fetchRemove(slot)) |kv| e.freeRegion(kv.value);
     }
@@ -629,6 +630,8 @@ pub const Engine = struct {
     /// Admits a stream to `slot` over `r`: rebuilds the sequence if the slot's lease differs.
     pub fn bindRegion(e: *Engine, slot: u32, r: Region) !void {
         if (e.pool == null) return error.NoPool;
+        // a captured verify graph bakes the state's cache addresses: a region change makes it stale
+        e.dropVerifyGraphs();
         if (e.regions.get(slot)) |old| if (old.start == r.start and old.blocks == r.blocks) {
             try e.bind(slot);
             return;
@@ -854,16 +857,19 @@ pub const Engine = struct {
         const dense_phase = e.cur.st.pos + ids.len < e.c.keyWidth();
         const sparse_phase = e.cur.st.pos >= e.c.keyWidth();
         const np_bucket: usize = if (sparse_phase) sparse.poolBucket(e.cur.st.pos, ids.len, e.cur.st.capacity / sparse.pool) else 0;
+        // a leased region smaller than the bucket unit has no power-of-two bucket (log2 of 0 would be
+        // unreachable); such a sparse window runs eager, so no graph key is formed for it
+        const sparse_bucket_ok = sparse_phase and np_bucket >= 2 * sparse.pool_min;
         const key: GraphKey = .{
             .slot = e.slot,
             .rows = @intCast(ids.len),
             .parity = @as(u8, e.cur.st.cur[0]),
-            .bucket = if (sparse_phase) @intCast(1 + std.math.log2_int(usize, np_bucket / sparse.pool_min)) else 0,
+            .bucket = if (sparse_bucket_ok) @intCast(1 + std.math.log2_int(usize, np_bucket / sparse.pool_min)) else 0,
         };
         // Opt-in while the replay still diverges from eager by one input (deterministic since the
         // pinned staging + exact-nch keying; 161.8 tok/s vs 91.6 eager when running - the remaining
         // baked input is the next session's instrumented eager-vs-graph logits diff).
-        if (std.c.getenv("TF_GLM_GRAPHS") != null and (dense_phase or sparse_phase) and e.wave == null) {
+        if (std.c.getenv("TF_GLM_GRAPHS") != null and (dense_phase or sparse_bucket_ok) and e.wave == null) {
             if (e.graphs.getPtr(key)) |g| {
                 if (g.nch == nch_now) { // exact: the indexer score path reads garbage for chunks past
                     // its own range, so a replay may only cover exactly the nch this round needs

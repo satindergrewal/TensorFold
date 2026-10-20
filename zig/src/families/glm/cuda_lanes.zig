@@ -5,6 +5,7 @@ const lanes = @import("lanes");
 const engine = @import("cuda_engine.zig");
 const follow = @import("cuda_follow.zig");
 const fw = @import("cuda_forward.zig");
+const sparse = @import("cuda_sparse.zig");
 
 const be = lanes.backend;
 
@@ -180,8 +181,12 @@ pub const Lanes = struct {
         gop.value_ptr.held_n = 0;
         gop.value_ptr.fill = null;
         if (self.x.e.pool != null) {
-            // the stream leases prompt + reply + one verify window from the shared pool
-            const r = self.x.e.reserveRegion(ids.len + s.max_new + max_rows) catch |err| switch (err) {
+            // the stream leases prompt + reply + one verify window from the shared pool; a window that
+            // will pass the dense limit reserves the graph bucket floor too (2 x pool_min pooled entries),
+            // or its sparse windows run eager and lose ~6% (the 1M solo reference is 277.9)
+            const need = ids.len + s.max_new + max_rows;
+            const lease = if (need > self.x.e.c.keyWidth()) @max(need, 2 * sparse.pool_min * sparse.pool) else need;
+            const r = self.x.e.reserveRegion(lease) catch |err| switch (err) {
                 error.PoolFull => return error.ContextFull,
                 else => return err,
             };
