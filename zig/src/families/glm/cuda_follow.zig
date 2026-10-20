@@ -6,7 +6,7 @@ const engine = @import("cuda_engine.zig");
 const sampler = @import("cuda_sampler.zig");
 const Engine = engine.Engine;
 
-pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared };
+pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, bind };
 
 /// One step as it crosses: 64 bytes, then `n` u32 ids.
 pub const Header = extern struct {
@@ -208,6 +208,13 @@ pub const Leader = struct {
         try x.e.bind(slot);
     }
 
+    /// The pool's bind: rank 0's lease travels so every rank addresses the same region.
+    pub fn bindRegion(x: Leader, slot: u32, start: u32, blocks: u32) !void {
+        try x.flush();
+        try x.send(.{ .kind = @backingInt(Kind.bind), .a = start, .depth = blocks, .slot = slot }, &.{});
+        try x.e.bindRegion(slot, .{ .start = start, .blocks = blocks });
+    }
+
     /// Frees a stream's sequence on every rank.
     pub fn release(x: Leader, slot: u32) !void {
         try x.flush();
@@ -314,7 +321,7 @@ pub fn follow(e: *Engine, link: *Link) !void {
         const step = try link.receive();
         const h = step.h;
         const kind: Kind = @fromBackingInt(@intCast(h.kind));
-        if (kind != .end and kind != .drop and kind != .shared) try e.bind(h.slot);
+        if (kind != .end and kind != .drop and kind != .shared and kind != .bind) try e.bind(h.slot);
         switch (kind) {
             .begin => try e.begin(if (h.flags & 1 != 0) .{ .seed = h.seed, .temperature = h.temperature, .top_p = h.top_p, .min_p = h.min_p, .top_k = h.top_k } else null),
             .prefill => {
@@ -359,6 +366,7 @@ pub fn follow(e: *Engine, link: *Link) !void {
                 try e.draft(h.flags & 1 != 0, ids, h.depth, &drafts);
             },
             .drop => for (step.ids) |id| e.dropState(id),
+            .bind => try e.bindRegion(h.slot, .{ .start = @intCast(h.a), .blocks = h.depth }),
             .release => e.release(h.slot),
             .end => return,
         }

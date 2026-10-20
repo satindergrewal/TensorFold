@@ -179,7 +179,14 @@ pub const Lanes = struct {
         gop.value_ptr.pending_rows = null;
         gop.value_ptr.held_n = 0;
         gop.value_ptr.fill = null;
-        try self.x.bind(gop.value_ptr.slot);
+        if (self.x.e.pool != null) {
+            // the stream leases prompt + reply + one verify window from the shared pool
+            const r = self.x.e.reserveRegion(ids.len + s.max_new + max_rows) catch |err| switch (err) {
+                error.PoolFull => return error.ContextFull,
+                else => return err,
+            };
+            try self.x.bindRegion(gop.value_ptr.slot, r.start, r.blocks);
+        } else try self.x.bind(gop.value_ptr.slot);
         try self.x.begin(s.sampling);
         s.cached = 0;
         return self.resumeFrom(s, ids.len);

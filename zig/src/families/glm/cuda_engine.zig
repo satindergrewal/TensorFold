@@ -55,6 +55,9 @@ const VerifyGraph = struct { exec: cuda.graph.Exec, nch: usize };
 /// One rank's copy of a kept prompt state: the state arena's bytes and the host fields beside them.
 const Snap = struct { buf: cuda.DeviceBuffer, pos: usize, mtp_len: usize, cur: []u1 };
 
+pub const Region = struct { start: u32, blocks: u32 };
+pub const pool_block: u32 = 256; // a multiple of the indexer's pooling width
+
 /// Where a prompt pass resumes: a kept state (every rank holds `id`) at `at`, a multiple of the chunk rows.
 pub const Resume = struct { id: u64, at: usize };
 
@@ -102,6 +105,8 @@ pub const Engine = struct {
     smp: sampler.Sampler,
     seqs: std.ArrayList(?*Seq) = .empty, // every stream's sequence by slot (the lane backend's), slot 0 made at init
     pool: ?fw.State.Pooled = null, // TF_GLM_POOL: every stream leases a region of one MLA/MTP cache arena
+    pool_used: []u1 = &.{}, // TF_GLM_POOL: the pool's block map (256-token blocks)
+    regions: std.AutoHashMapUnmanaged(u32, Region) = .empty, // slot -> its leased region
     cur: *Seq = undefined, // the bound slot's: every step below runs on it
     // Solo verify rounds as CUDA graphs (TF_GLM_NO_GRAPHS=1 keeps them eager): keyed by slot and
     // row count, recaptured when the dense attention's chunk count grows past what a graph covers
@@ -168,8 +173,11 @@ pub const Engine = struct {
         if (std.c.getenv("TF_GLM_POOL") != null) {
             e.pool = try fw.State.Pooled.init(gpa, d, &e.w, o.capacity);
             errdefer e.pool.?.deinit(gpa);
+            e.pool_used = try gpa.alloc(u1, @max(1, o.capacity / pool_block));
+            @memset(e.pool_used, 0);
         }
-        try e.bind(0);
+        // a pooled engine has no pre-bound sequence: the first admitted request leases slot 0's region
+        if (e.pool == null) try e.bind(0);
         errdefer {
             e.free(0);
             e.seqs.deinit(gpa);
@@ -258,6 +266,8 @@ pub const Engine = struct {
         e.draft_idx.free();
         if (e.keep_desc.ptr != 0) e.keep_desc.free();
         if (e.keep_path.ptr != 0) e.keep_path.free();
+        if (e.pool_used.len > 0) e.gpa.free(e.pool_used);
+        e.regions.deinit(e.gpa);
         if (e.pool) |*p| p.deinit(e.gpa);
         var dg_it = e.draft_graphs.iterator();
         while (dg_it.next()) |kv| kv.value_ptr.deinit();
@@ -570,10 +580,10 @@ pub const Engine = struct {
             const q = try e.gpa.create(Seq);
             errdefer e.gpa.destroy(q);
             if (e.pool) |*pl| {
-                // one stream leases the whole pool until region admission lands; a second refuses rather
-                // than sharing the region (TF_GLM_POOL gate; the default path below is untouched)
-                if (slot != 0) return error.PoolNotWired;
-                q.* = .{ .st = try fw.State.initIn(e.gpa, e.d, &e.w, pl, 0, e.capacity) };
+                // the stream's lease: admission reserved it before binding (bindRegion)
+                const r = e.regions.get(slot) orelse return error.PoolNotWired;
+                const tokens: usize = @as(usize, r.blocks) * pool_block - e.c.kpool;
+                q.* = .{ .st = try fw.State.initIn(e.gpa, e.d, &e.w, pl, @as(usize, r.start) * pool_block, tokens) };
             } else q.* = .{ .st = try fw.State.init(e.gpa, e.d, &e.w, e.capacity) };
             e.seqs.items[slot] = q;
         }
@@ -581,8 +591,66 @@ pub const Engine = struct {
         e.slot = slot;
     }
 
+    /// The blocks a stream of `tokens` takes (256 a block; its last keeps the cache's extra pooled entry).
+    pub fn regionBlocks(e: *const Engine, tokens: usize) u32 {
+        return @intCast((tokens + e.c.kpool + pool_block - 1) / pool_block);
+    }
+
+    /// Reserves a contiguous region for a stream needing `tokens` (first fit). PoolFull: no room now.
+    pub fn reserveRegion(e: *Engine, tokens: usize) !Region {
+        if (e.pool == null or e.pool_used.len == 0) return error.NoPool;
+        const need = e.regionBlocks(tokens);
+        if (need == 0 or need > e.pool_used.len) return error.PoolFull;
+        var run: u32 = 0;
+        for (e.pool_used, 0..) |u, i| {
+            if (u == 0) {
+                run += 1;
+                if (run == need) {
+                    const start: u32 = @intCast(i + 1 - need);
+                    @memset(e.pool_used[start..][0..need], 1);
+                    return .{ .start = start, .blocks = need };
+                }
+            } else run = 0;
+        }
+        return error.PoolFull;
+    }
+
+    fn freeRegion(e: *Engine, r: Region) void {
+        if (r.blocks == 0 or r.start >= e.pool_used.len or r.start + r.blocks > e.pool_used.len) return;
+        @memset(e.pool_used[r.start..][0..r.blocks], 0);
+    }
+
+    /// Drops `slot`'s lease and sequence (the next bind over that slot rebuilds it).
+    pub fn releaseRegion(e: *Engine, slot: u32) void {
+        if (slot < e.seqs.items.len and e.seqs.items[slot] != null) e.free(slot);
+        if (e.regions.fetchRemove(slot)) |kv| e.freeRegion(kv.value);
+    }
+
+    /// Admits a stream to `slot` over `r`: rebuilds the sequence if the slot's lease differs.
+    pub fn bindRegion(e: *Engine, slot: u32, r: Region) !void {
+        if (e.pool == null) return error.NoPool;
+        if (e.regions.get(slot)) |old| if (old.start == r.start and old.blocks == r.blocks) {
+            try e.bind(slot);
+            return;
+        };
+        if (slot < e.seqs.items.len and e.seqs.items[slot] != null) e.free(slot);
+        const prev = e.regions.fetchRemove(slot);
+        if (prev) |kv| e.freeRegion(kv.value);
+        try e.regions.put(e.gpa, slot, r);
+        try e.bind(slot);
+    }
+
     /// Frees slot `slot`'s sequence (slot 0 stays: the first stream's, made at init) and binds slot 0.
     pub fn release(e: *Engine, slot: u32) void {
+        if (e.pool != null) {
+            // a pooled slot's region returns to the pool; slot 0 is rebuilt on the next admission
+            e.releaseRegion(slot);
+            if (e.seqs.items.len > 0) if (e.seqs.items[0]) |q| {
+                e.cur = q;
+                e.slot = 0;
+            };
+            return;
+        }
         if (slot != 0) e.free(slot);
         e.cur = e.seqs.items[0].?;
         e.slot = 0;
@@ -598,7 +666,9 @@ pub const Engine = struct {
 
     /// Bytes one more stream's sequence takes on this rank (its state arena).
     pub fn seqBytes(e: *const Engine) u64 {
-        return e.seqs.items[0].?.st.arena.buf.len;
+        if (e.seqs.items.len == 0) return 0;
+        const q = e.seqs.items[0] orelse return 0;
+        return q.st.arena.buf.len;
     }
 
     /// The committed length: the pending token sits at this position, a window's row r draws position pos + 1 + r.
