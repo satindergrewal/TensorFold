@@ -20,6 +20,7 @@ pub const norms_ref = @import("norms_ref.zig");
 pub const act_ref = @import("act_ref.zig");
 pub const nvfp4 = @import("nvfp4.zig");
 pub const modelopt = @import("modelopt.zig");
+pub const picture = @import("picture/picture.zig"); // image/video decoders for the vision path
 
 test {
     _ = safetensors;
