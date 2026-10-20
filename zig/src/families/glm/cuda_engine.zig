@@ -2,6 +2,12 @@
 
 const std = @import("std");
 const cuda = @import("cuda");
+
+comptime {
+    // force the vision files into the compiled graph (their pub decls are otherwise unanalysed)
+    _ = @import("cuda_vision.zig");
+    _ = @import("cuda_load_owner.zig");
+}
 const latent = @import("cuda_latent.zig");
 const lanes = @import("lanes");
 const config = @import("config.zig");
