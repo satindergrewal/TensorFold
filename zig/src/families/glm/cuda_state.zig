@@ -260,6 +260,110 @@ pub const State = struct {
     proj_layer: usize,
     proj_row: usize,
 
+    /// One MLA/MTP cache arena every stream leases a contiguous region of (the Metal pool's design on
+    /// CUDA): planes at the pool's full token capacity; a region's state points `start` tokens into each.
+    pub const Pooled = struct {
+        buf: cuda.DeviceBuffer,
+        capacity: usize, // tokens the pool spans (the KV budget)
+        block: u32 = 256, // region granularity: a multiple of the indexer's pooling width
+        mla: []Plane, // one an MLA layer, then the MTP plane (the last)
+        pk_rows: usize, // the pool's pooled keys (`sparse.pool` tokens a row)
+
+        pub const Plane = struct { lc: u64, ik: u64, ig: u64, pk: u64 };
+
+        /// The pool's planes at `capacity` tokens: the same table `init` builds, once for every stream.
+        pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, capacity: usize) !Pooled {
+            const c = &w.config;
+            var nd: usize = 0;
+            for (w.layers) |l| switch (l.mixer) {
+                .kda => {},
+                .mla => nd += 1,
+            };
+            const lat_bytes: usize = blk: {
+                if (std.c.getenv("TF_GLM_KV_NVFP4") != null) break :blk capacity * (c.kv_lora / 2 + c.kv_lora / 8);
+                if (std.c.getenv("TF_GLM_KV_FP8") != null) break :blk capacity * c.kv_lora;
+                break :blk capacity * c.kv_lora * 2;
+            };
+            const pk_rows = capacity / sparse.pool + 2;
+            var sizes: std.ArrayList(usize) = .empty;
+            defer sizes.deinit(gpa);
+            for (0..nd) |_| try sizes.appendSlice(gpa, &.{ lat_bytes, capacity * c.i_dim * 2, capacity * c.i_dim * 2, pk_rows * c.i_dim * 2 });
+            try sizes.appendSlice(gpa, &.{ capacity * c.kv_lora * 2, capacity * c.i_dim * 2, capacity * c.i_dim * 2, pk_rows * c.i_dim * 2 });
+            const p = try gpa.alloc(u64, sizes.items.len);
+            defer gpa.free(p);
+            var a = try arena(d, sizes.items, p);
+            errdefer a.buf.free();
+            const planes = try gpa.alloc(Plane, nd + 1);
+            for (planes, 0..) |*x, j| x.* = .{ .lc = p[4 * j], .ik = p[4 * j + 1], .ig = p[4 * j + 2], .pk = p[4 * j + 3] };
+            return .{ .buf = a.buf, .capacity = capacity, .mla = planes, .pk_rows = pk_rows };
+        }
+
+        pub fn deinit(p: *Pooled, gpa: std.mem.Allocator) void {
+            p.buf.free();
+            gpa.free(p.mla);
+        }
+    };
+
+    /// A stream's state over `shared`'s region [start, start + tokens): the fixed per-stream parts (KDA
+    /// window state, saves, positions) allocate here; every MLA and MTP cache plane points `start` tokens
+    /// into the pool. Positions stay stream-local, so the kernels below need no change.
+    pub fn initIn(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, shared: *const Pooled, start: usize, tokens: usize) !State {
+        const c = &w.config;
+        const s = &w.share;
+        var nk: usize = 0;
+        for (w.layers) |l| switch (l.mixer) {
+            .kda => nk += 1,
+            else => {},
+        };
+        const n = s.kda.len() * c.kda_dim;
+        const kw = 3 * n + 2 * c.kda_dim + s.kda.len();
+        var sizes: std.ArrayList(usize) = .empty;
+        defer sizes.deinit(gpa);
+        try sizes.appendSlice(gpa, &.{ 4, nk * 3 * 3 * n * 2, 2 * nk * s.kda.len() * kda.dk * kda.dv * 4, nk * window_rows * kw * 2 });
+        try sizes.appendSlice(gpa, &.{ nk * window_rows * n * 4, nk * window_rows * n * 2, nk * window_rows * n * 4, nk * window_rows * s.kda.len() * 4 });
+        try sizes.append(gpa, 4); // the MTP head's position
+        const p = try gpa.alloc(u64, sizes.items.len);
+        defer gpa.free(p);
+        var a = try arena(d, sizes.items, p);
+        errdefer a.buf.free();
+        const cur = try gpa.alloc(u1, nk);
+        errdefer gpa.free(cur);
+        @memset(cur, 0);
+        const lc_row: usize = blk: {
+            if (std.c.getenv("TF_GLM_KV_NVFP4") != null) break :blk c.kv_lora / 2 + c.kv_lora / 8;
+            if (std.c.getenv("TF_GLM_KV_FP8") != null) break :blk c.kv_lora;
+            break :blk c.kv_lora * 2;
+        };
+        const idx_row: usize = c.i_dim * 2;
+        const nmla = shared.mla.len - 1;
+        const caches = try gpa.alloc(dsa_block.Caches, nmla);
+        for (caches, 0..) |*x, j| {
+            const pl = shared.mla[j];
+            x.* = .{
+                .lc = pl.lc + start * lc_row,
+                .ik = pl.ik + start * idx_row,
+                .ig = pl.ig + start * idx_row,
+                .pk = pl.pk + (start / sparse.pool) * idx_row,
+                .pk_rows = tokens / sparse.pool + 2,
+            };
+        }
+        const mp = shared.mla[nmla];
+        return .{
+            .arena = a, .gpa = gpa, .capacity = tokens, .pos_dev = p[0], .conv = p[1], .rec = p[2], .proj = p[3],
+            .save_k = p[4], .save_v = p[5], .save_g = p[6], .save_b = p[7], .cur = cur, .heads = s.kda.len(),
+            .mtp_caches = .{
+                .lc = mp.lc + start * c.kv_lora * 2,
+                .ik = mp.ik + start * idx_row,
+                .ig = mp.ig + start * idx_row,
+                .pk = mp.pk + (start / sparse.pool) * idx_row,
+                .pk_rows = tokens / sparse.pool + 2,
+            },
+            .mtp_pos_dev = p[8], // the arena's last size: the MTP position, after the fixed parts
+            .kda_layers = nk, .caches = caches, .conv_c = 3 * n,
+            .rec_layer = s.kda.len() * kda.dk * kda.dv * 4, .proj_layer = window_rows * kw, .proj_row = kw,
+        };
+    }
+
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, capacity: usize) !State {
         const c = &w.config;
         const s = &w.share;
