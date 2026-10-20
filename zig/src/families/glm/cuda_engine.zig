@@ -101,6 +101,7 @@ pub const Engine = struct {
     draft_idx: cuda.DeviceBuffer, // the chain step's slot counter (device; reset each round)
     smp: sampler.Sampler,
     seqs: std.ArrayList(?*Seq) = .empty, // every stream's sequence by slot (the lane backend's), slot 0 made at init
+    pool: ?fw.State.Pooled = null, // TF_GLM_POOL: every stream leases a region of one MLA/MTP cache arena
     cur: *Seq = undefined, // the bound slot's: every step below runs on it
     // Solo verify rounds as CUDA graphs (TF_GLM_NO_GRAPHS=1 keeps them eager): keyed by slot and
     // row count, recaptured when the dense attention's chunk count grows past what a graph covers
@@ -164,6 +165,10 @@ pub const Engine = struct {
         e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = o.settings.heat, .root = heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .settings = o.settings, .m = m, .stream = stream, .pieces = pieces, .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .bm = undefined, .hold = undefined, .pairs = undefined, .pairs_all = undefined, .draft_tokens = undefined, .draft_idx = undefined, .smp = undefined, .mtp = o.mtp };
         e.w = try weights.load(gpa, io, d, stream, e.m.tools(), checkpoint, c, share, layers, o.mtp);
         errdefer e.w.deinit();
+        if (std.c.getenv("TF_GLM_POOL") != null) {
+            e.pool = try fw.State.Pooled.init(gpa, d, &e.w, o.capacity);
+            errdefer e.pool.?.deinit(gpa);
+        }
         try e.bind(0);
         errdefer {
             e.free(0);
@@ -253,6 +258,7 @@ pub const Engine = struct {
         e.draft_idx.free();
         if (e.keep_desc.ptr != 0) e.keep_desc.free();
         if (e.keep_path.ptr != 0) e.keep_path.free();
+        if (e.pool) |*p| p.deinit(e.gpa);
         var dg_it = e.draft_graphs.iterator();
         while (dg_it.next()) |kv| kv.value_ptr.deinit();
         e.draft_graphs.deinit(e.gpa);
@@ -563,7 +569,12 @@ pub const Engine = struct {
         if (e.seqs.items[slot] == null) {
             const q = try e.gpa.create(Seq);
             errdefer e.gpa.destroy(q);
-            q.* = .{ .st = try fw.State.init(e.gpa, e.d, &e.w, e.capacity) };
+            if (e.pool) |*pl| {
+                // one stream leases the whole pool until region admission lands; a second refuses rather
+                // than sharing the region (TF_GLM_POOL gate; the default path below is untouched)
+                if (slot != 0) return error.PoolNotWired;
+                q.* = .{ .st = try fw.State.initIn(e.gpa, e.d, &e.w, pl, 0, e.capacity) };
+            } else q.* = .{ .st = try fw.State.init(e.gpa, e.d, &e.w, e.capacity) };
             e.seqs.items[slot] = q;
         }
         e.cur = e.seqs.items[slot].?;
