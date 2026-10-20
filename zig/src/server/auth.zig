@@ -87,8 +87,8 @@ pub const Store = struct {
         const fd = posix.openatZ(posix.AT.FDCWD, pathz, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true, .NONBLOCK = true }, 0) catch return error.Unsafe;
         defer _ = posix.system.close(fd);
         const st = meta(fd, null) orelse return error.Unsafe;
-        if ((st.mode & posix.S.IFMT) != posix.S.IFREG or st.mode & 0o044 != 0) {
-            problem.* = "API key file must be a regular file unreadable by other users; use chmod 600";
+        if ((st.mode & posix.S.IFMT) != posix.S.IFREG or st.mode & 0o066 != 0) {
+            problem.* = "API key file must be a regular file unreadable and unwritable by other users; use chmod 600";
             return error.Invalid;
         }
         if (st.size > 1 << 20) {
@@ -234,13 +234,20 @@ fn isSpace(cp: u21) bool {
 }
 
 /// The paths only a key opens (``auth_http.gated``).
+/// Every route needs a key except the root, health, the fixed slide page and its assets, and
+/// explicitly opened metrics (upstream v1.1.1's policy: a route added later is gated by default).
 pub fn gated(raw_path: []const u8, metrics_open: bool) bool {
     const path = routePath(raw_path);
+    if (path.len == 0 or std.mem.eql(u8, path, "/health") or std.mem.eql(u8, path, "/slide") or publicAsset(path)) return false;
     if (metrics_open and (std.mem.eql(u8, path, "/metrics") or std.mem.eql(u8, path, "/v1/metrics"))) return false;
-    if (std.mem.eql(u8, path, "/v1") or std.mem.startsWith(u8, path, "/v1/")) return true;
-    for ([_][]const u8{ "/metrics", "/dashboard", "/stats", "/memory", "/tokenize", "/detokenize", "/models", "/messages", "/messages/count_tokens", "/chat/completions", "/completions", "/decisions", "/responses" }) |p| if (std.mem.eql(u8, path, p)) return true;
-    if (std.mem.startsWith(u8, path, "/responses/")) return true;
-    for ([_][]const u8{ "/chat/completions", "/completions", "/decisions", "/models" }) |end| if (std.mem.endsWith(u8, path, end)) return true;
+    return true;
+}
+
+/// The slide page's fixed scripts (public; the page itself needs no key).
+fn publicAsset(path: []const u8) bool {
+    for ([_][]const u8{ "data.js", "panel.js", "flat.js", "scene.js", "tower.js", "fx.js", "bloom.js", "layout.js" }) |name| {
+        if (std.mem.startsWith(u8, path, "/slide/") and std.mem.eql(u8, path[7..], name)) return true;
+    }
     return false;
 }
 
@@ -256,7 +263,8 @@ pub fn loopback(host: []const u8) bool {
     const ip = std.Io.net.IpAddress.parse(host, 0) catch return false;
     return switch (ip) {
         .ip4 => |v4| v4.bytes[0] == 127,
-        .ip6 => |v6| std.mem.eql(u8, &v6.bytes, &[16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }),
+        .ip6 => |v6| std.mem.eql(u8, &v6.bytes, &[16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }) or
+            (std.mem.eql(u8, v6.bytes[0..12], &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255 }) and v6.bytes[12] == 127),
     };
 }
 
