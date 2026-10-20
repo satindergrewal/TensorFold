@@ -7,6 +7,8 @@ comptime {
     // force the vision files into the compiled graph (their pub decls are otherwise unanalysed)
     _ = @import("cuda_vision.zig");
     _ = @import("cuda_load_owner.zig");
+    _ = @import("cuda_images.zig");
+    _ = @import("video_core.zig");
 }
 const latent = @import("cuda_latent.zig");
 const lanes = @import("lanes");
