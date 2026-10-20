@@ -65,7 +65,7 @@ pub const Images = struct {
         errdefer module.unload();
         v.* = .{ .gpa = gpa, .io = io, .d = d, .module = module, .run = .{ .stream = stream, .f = try vision.Funcs.load(module) }, .cfg = cfg, .rows = undefined, .map = undefined, .host_map = undefined, .limits = limits };
         v.video_ids = cfg.video;
-        v.rows = try cuda.DeviceBuffer.alloc(d, @as(usize, try v.rowLimit()) * vcfg.out_hidden * 2);
+        v.rows = try cuda.DeviceBuffer.alloc(d, 0); // sized by each request's images (ensureRows); --parallel does not pay their worst case
         errdefer v.rows.free();
         v.map = try cuda.DeviceBuffer.alloc(d, max_rows * 4);
         errdefer v.map.free();
@@ -109,7 +109,7 @@ pub const Images = struct {
         if (v.slot == slot) return;
         if (!v.saved.contains(slot)) try v.saved.ensureUnusedCapacity(v.gpa, 1);
         const next = if (v.saved.fetchRemove(slot)) |entry| entry.value else Saved{
-            .rows = try cuda.DeviceBuffer.alloc(v.d, @as(usize, try v.rowLimit()) * vcfg.out_hidden * 2),
+            .rows = try cuda.DeviceBuffer.alloc(v.d, 0),
         };
         v.saved.putAssumeCapacity(v.slot, .{ .rows = v.rows, .spans = v.spans });
         v.rows = next.rows;
@@ -140,7 +140,18 @@ pub const Images = struct {
     }
 
     pub fn streamBytes(v: *const Images) usize {
-        return @as(usize, v.rowLimit() catch unreachable) * vcfg.out_hidden * 2;
+        _ = v;
+        return 0; // rows are per request (ensureRows), charged when an image request actually arrives
+    }
+
+    /// Room for `tokens` image rows on this slot's buffer, grown to just what the request holds.
+    fn ensureRows(v: *Images, tokens: usize) !void {
+        const need = tokens * vcfg.out_hidden * 2;
+        if (v.rows.len >= need) return;
+        const grown = try cuda.DeviceBuffer.alloc(v.d, need);
+        v.run.stream.synchronize() catch {}; // the old buffer's last encode or splice is done before it is freed
+        v.rows.free();
+        v.rows = grown;
     }
 
     /// No rows splice into any pass until another begins (each request's prompt pass starts here).
@@ -158,7 +169,13 @@ pub const Images = struct {
         for (images) |img| {
             if (img.gh * img.gw != img.tokens * vcfg.patches_per_token) return error.ImageOutOfStep;
             if (img.at + img.tokens <= from) continue; // in the kept state already
-            if (img.tokens > (try v.rowLimit()) -| row) return error.ImageRows; // the server holds a request to its limits
+            row += img.tokens;
+        }
+        if (row > (try v.rowLimit())) return error.ImageRows; // the server holds a request to its limits
+        try v.ensureRows(row);
+        row = 0;
+        for (images) |img| {
+            if (img.at + img.tokens <= from) continue; // in the kept state already
             try t.encode(&v.run, img.pixels, .{ 1, img.gh, img.gw }, v.rows.ptr + @as(u64, row) * vcfg.out_hidden * 2);
             try v.spans.append(v.gpa, .{ .at = img.at, .n = img.tokens, .row = row });
             row += img.tokens;
@@ -173,10 +190,16 @@ pub const Images = struct {
         errdefer v.clear();
         if (words.len % 3 != 0) return error.BadStep;
         var i: usize = 0;
+        var rows: u32 = 0;
         while (i < words.len) : (i += 3) {
             const sp: Span = .{ .at = words[i], .n = words[i + 1], .row = words[i + 2] };
             if (sp.row > try v.rowLimit() or sp.n > (try v.rowLimit()) - sp.row) return error.ImageRows;
-            try v.spans.append(v.gpa, sp);
+            rows = @max(rows, sp.row + sp.n);
+        }
+        try v.ensureRows(rows);
+        i = 0;
+        while (i < words.len) : (i += 3) {
+            try v.spans.append(v.gpa, .{ .at = words[i], .n = words[i + 1], .row = words[i + 2] });
         }
         v.slot = slot;
     }
